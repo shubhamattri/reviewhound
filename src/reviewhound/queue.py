@@ -44,10 +44,12 @@ class Job:
     max_attempts: int
     last_error: str | None
     lease_token: str | None = None
+    installation_id: int | None = None
 
 
 class JobQueue(Protocol):
-    def enqueue(self, repo: str, pr: int, head_sha: str) -> tuple[int, bool]: ...
+    def enqueue(self, repo: str, pr: int, head_sha: str,
+                installation_id: int | None = None) -> tuple[int, bool]: ...
 
     def claim(self) -> Job | None: ...
 
@@ -76,6 +78,14 @@ class SQLiteQueue:
         self._clock = clock
         with self._conn() as c:
             c.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns newer than the DB file. BEGIN IMMEDIATE keeps two processes from racing."""
+        with self._tx() as c:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(jobs)")}
+            if "installation_id" not in cols:
+                c.execute("ALTER TABLE jobs ADD COLUMN installation_id INTEGER")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -103,9 +113,10 @@ class SQLiteQueue:
         return Job(id=row["id"], repo=row["repo"], pr=row["pr"], head_sha=row["head_sha"],
                    state=row["state"], attempts=row["attempts"],
                    max_attempts=row["max_attempts"], last_error=row["last_error"],
-                   lease_token=row["lease_token"])
+                   lease_token=row["lease_token"], installation_id=row["installation_id"])
 
-    def enqueue(self, repo: str, pr: int, head_sha: str) -> tuple[int, bool]:
+    def enqueue(self, repo: str, pr: int, head_sha: str,
+                installation_id: int | None = None) -> tuple[int, bool]:
         """Return (job id, created). Older queued jobs for the same PR are superseded."""
         repo = repo.lower()
         now = self._clock()
@@ -115,6 +126,9 @@ class SQLiteQueue:
                       "WHERE repo=? AND pr=? AND state='queued' AND key != ?",
                       (now, repo, pr, key))
             row = c.execute("SELECT id, state FROM jobs WHERE key = ?", (key,)).fetchone()
+            if row is not None and installation_id is not None:
+                c.execute("UPDATE jobs SET installation_id=? WHERE id=?",
+                          (installation_id, row["id"]))
             if row is not None:
                 if row["state"] != "superseded":
                     return int(row["id"]), False
@@ -124,8 +138,9 @@ class SQLiteQueue:
                 return int(row["id"]), True
             cur = c.execute(
                 "INSERT INTO jobs (key, repo, pr, head_sha, state, max_attempts, run_after, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
-                (key, repo, pr, head_sha, self.max_attempts, now, now, now))
+                "created_at, updated_at, installation_id) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                (key, repo, pr, head_sha, self.max_attempts, now, now, now, installation_id))
             return int(cur.lastrowid or 0), True
 
     def claim(self) -> Job | None:

@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Protocol
 
 import httpx
 import jwt
@@ -116,3 +117,15 @@ class GitHubApp:
         if not token:
             raise GitHubError(f"POST {url}: malformed installation token response")
         return token, expires
+
+
+class _HasInstallation(Protocol):
+    installation_id: int | None
+
+
+def token_for_job(app: GitHubApp | None, job: _HasInstallation,
+                  static_token: Callable[[], str]) -> str | Callable[[], str]:
+    """The job's installation token when an App is configured, else the static token."""
+    if app is not None and job.installation_id is not None:
+        return app.token_provider(job.installation_id)
+    return static_token()

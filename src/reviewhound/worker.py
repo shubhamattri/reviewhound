@@ -25,13 +25,16 @@ def is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, (TimeoutError, ConnectionError, OSError))
 
 
-def run_one(queue: SQLiteQueue, reviewer: Reviewer) -> Job | None:
+def run_one(queue: SQLiteQueue, reviewer: Reviewer | Callable[[Job], Reviewer]) -> Job | None:
+    """`reviewer` may be a factory, so each job can use its own installation's token."""
     job = queue.claim()
     if job is None:
         return None
     log.info("job claimed", extra={"job": job.id, "repo": job.repo, "pr": job.pr,
                                    "head": job.head_sha, "attempt": job.attempts})
     try:
+        if not isinstance(reviewer, Reviewer):
+            reviewer = reviewer(job)
         result = reviewer.review(job.repo, job.pr, dry_run=False, expected_head=job.head_sha)
     except Exception as exc:  # noqa: BLE001 - every failure must be classified, not lost
         retry = is_retryable(exc)
@@ -51,7 +54,8 @@ def run_one(queue: SQLiteQueue, reviewer: Reviewer) -> Job | None:
     return job
 
 
-def run_forever(queue: SQLiteQueue, reviewer: Reviewer, idle_sleep_s: float = 5.0,
+def run_forever(queue: SQLiteQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
+                idle_sleep_s: float = 5.0,
                 should_stop: Callable[[], bool] = lambda: False) -> None:
     while not should_stop():
         if run_one(queue, reviewer) is None:

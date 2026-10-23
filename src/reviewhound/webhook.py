@@ -43,9 +43,14 @@ def handle_event(queue: JobQueue, event: str, payload: dict[str, Any]) -> tuple[
         return 400, "malformed pull_request payload"
     if not repo:
         return 400, "missing repository"
-    job_id, created = queue.enqueue(repo, number, head)
+    installation = (payload.get("installation") or {}).get("id")
+    if installation is not None and (isinstance(installation, bool)
+                                     or not isinstance(installation, int)):
+        return 400, "malformed installation id"
+    job_id, created = queue.enqueue(repo, number, head, installation_id=installation)
     log.info("webhook enqueue", extra={"repo": repo, "pr": number, "head": head,
-                                       "job": job_id, "new_job": created})
+                                       "job": job_id, "new_job": created,
+                                       "installation": installation})
     return 202, f"job {job_id} {'queued' if created else 'already queued'}"
 
 
