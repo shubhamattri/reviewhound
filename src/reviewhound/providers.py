@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -40,8 +41,10 @@ Runner = Callable[[list[str], str, float, dict[str, str]], "subprocess.Completed
 
 def _run(cmd: list[str], stdin: str, timeout_s: float,
          env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout_s, check=False,
-                          env=env)
+    # An empty working directory keeps any project instructions on this machine out of the review.
+    with tempfile.TemporaryDirectory(prefix="reviewhound-") as cwd:
+        return subprocess.run(cmd, input=stdin, capture_output=True, text=True,
+                              timeout=timeout_s, check=False, env=env, cwd=cwd)
 
 
 class ClaudeCliProvider:
@@ -60,7 +63,8 @@ class ClaudeCliProvider:
 
     def complete(self, prompt: str, *, model: str, timeout_s: float) -> Completion:
         cmd = [self.binary, "-p", "--output-format", "json", "--model", model,
-               "--tools", "", "--no-session-persistence"]
+               "--tools", "", "--no-session-persistence", "--setting-sources", "local",
+               "--strict-mcp-config"]
         started = time.monotonic()
         try:
             res = self._run(cmd, prompt, timeout_s, self._env())

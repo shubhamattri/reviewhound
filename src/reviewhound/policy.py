@@ -24,10 +24,12 @@ def apply_policy(findings: list[Finding], policy: PolicyConfig,
     blocking = Severity.parse(policy.blocking_severity)
 
     seen: set[str] = set()
-    seen_lines: set[tuple[str, int, str]] = set()
+    seen_lines: set[tuple[str, int]] = set()
     candidates: list[Finding] = []
-    for f in sorted(findings, key=lambda x: (-x.severity, not x.verified, x.file, x.line)):
-        line_key = (f.file, f.line, f.category)
+    # One comment per line: a scanner and the model often report the same issue in their own words.
+    for f in sorted(findings, key=lambda x: (-x.severity, not x.verified,
+                                             not x.source.startswith("scanner:"), x.file, x.line)):
+        line_key = (f.file, f.line)
         if f.fingerprint in seen or line_key in seen_lines:
             decision.held.append((f, "duplicate"))
             continue

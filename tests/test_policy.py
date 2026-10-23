@@ -44,3 +44,13 @@ def test_fingerprint_is_stable_across_line_moves_but_not_content() -> None:
         fnd(40, Severity.MAJOR, quote="x = y").fingerprint
     assert fnd(1, Severity.MAJOR, quote="x = y").fingerprint != \
         fnd(1, Severity.MAJOR, quote="x = z").fingerprint
+
+
+def test_scanner_and_model_on_the_same_line_post_once_preferring_the_scanner() -> None:
+    model = fnd(4, Severity.MAJOR, quote="q = f'...'", cat="injection")
+    scanner = Finding(file="a.py", line=4, severity=Severity.MAJOR, category="sql-injection",
+                      title="SQL built by string joining", body="b", evidence_quote="q = f'...'",
+                      source="scanner:builtin", verified=True)
+    d = apply_policy([model, scanner], PolicyConfig())
+    assert [(f.source, f.line) for f in d.post] == [("scanner:builtin", 4)]
+    assert [(f.source, r) for f, r in d.held] == [("model:x", "duplicate")]

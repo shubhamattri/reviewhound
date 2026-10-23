@@ -27,7 +27,9 @@ def test_claude_cli_uses_subscription_not_api_key(monkeypatch: pytest.MonkeyPatc
     c = p.complete("PROMPT", model="sonnet", timeout_s=5)
     assert (c.text, c.model, c.cost_usd) == ('{"findings": []}', "sonnet", 0.01)
     cmd, stdin, sent_env = calls[0]
-    assert cmd[:6] == ["claude", "-p", "--output-format", "json", "--model", "sonnet"]
+    assert cmd == ["claude", "-p", "--output-format", "json", "--model", "sonnet", "--tools", "",
+                   "--no-session-persistence", "--setting-sources", "local",
+                   "--strict-mcp-config"]
     assert stdin == "PROMPT"
     assert "ANTHROPIC_API_KEY" not in sent_env
 
