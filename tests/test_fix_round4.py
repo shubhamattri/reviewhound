@@ -148,15 +148,17 @@ def test_only_this_accounts_review_of_this_head_with_our_summary_counts(
     assert (result.post_id, len(vcs.posted)) == (("r9", 0) if adopted else ("memory-review-1", 1))
 
 
-def test_an_account_the_token_cannot_name_matches_any_author(
+def test_an_unnamed_account_adopts_nothing_so_a_lookalike_review_cannot_silence_it(
         backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
     vcs, reviewer, _store = rig(backend, [answer(REAL)])
     vcs.viewer = ""
     monkeypatch.setattr(vcs, "list_reviews", lambda repo, number: [
-        PostedReview("r9", "app[bot]", H1, SUMMARY, "CHANGES_REQUESTED")])
+        PostedReview("r9", "pr-author", H1, SUMMARY, "COMMENTED")])
     monkeypatch.setattr(vcs, "review_comments", lambda repo, number, rid: [])
     result = reviewer.review(REPO, PR, dry_run=False)
-    assert (result.outcome, result.post_id, vcs.posted) == ("posted", "r9", [])
+    assert result.outcome == "posted"
+    assert result.post_id != "r9"
+    assert len(vcs.posted) == 1
 
 
 def test_remote_check_failure_frees_the_claim_posts_nothing_and_reraises(

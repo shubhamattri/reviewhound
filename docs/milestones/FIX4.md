@@ -17,7 +17,7 @@ claim job -> [not a dry run] record a landed-but-unrecorded post (before any mod
 
 The remote check lists the PR's reviews and looks for one by this account (`viewer_login`; an
 App gets `<slug>[bot]` from `GET /app`), on exactly this head, whose body starts with
-`SUMMARY_PREFIX` ("Reviewhound ("). When the token cannot name its account, any author counts.
+`SUMMARY_PREFIX` ("Reviewhound ("). When the token cannot name its account, nothing is adopted (a duplicate review is possible; a silenced one is not).
 Adopting a review means: `mark_posted` with its id and GitHub's verdict, read its comments back,
 record a `posted` row (error `adopted: ...`) where only findings GitHub shows are `posted`.
 
@@ -206,8 +206,8 @@ A fresh reviewer agent read the diff at a09abf7. Its findings and what happened:
    `post-uncertain` with its findings marked posted; if it never landed, that head has no review
    until the next push.
 2. GitHub is trusted as listed. A review accepted but not yet listed could be posted again by a run
-   that took over a stale claim. A token that cannot name its account (`GET /user` failed) matches
-   any author's review of the head with our prefix.
+   that took over a stale claim. A token that cannot name its account (`GET /user` failed) adopts
+   nothing, so a crash after a POST can produce a duplicate review on that head.
 3. A run that crashed after its POST and before `mark_posted`, followed by a push, leaves that
    review unrecorded: it is never linked or dismissed by us.
 4. `claim-busy` runs the whole review (model cost) and uses an attempt; with the default lease and

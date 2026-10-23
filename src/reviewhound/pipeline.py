@@ -354,11 +354,16 @@ class Reviewer:
 
     def _landed_review(self, pr: PullRequest) -> PostedReview | None:
         """This account's review of exactly this head, if one is on GitHub (the source of truth
-        for "did it land"). An account the token cannot name matches any author."""
+        for "did it land"). Anyone can write our summary prefix, so an unnamed account adopts
+        nothing: the worst case is a duplicate review, never a silenced one."""
         viewer = self.vcs.viewer_login()
+        if not viewer:
+            log.warning("cannot name this account; not adopting any existing review",
+                        extra={"repo": pr.repo, "pr": pr.number})
+            return None
         for r in self.vcs.list_reviews(pr.repo, pr.number):
             if r.commit_id == pr.head_sha and r.body.startswith(SUMMARY_PREFIX) and \
-                    (not viewer or r.author == viewer):
+                    r.author == viewer:
                 return r
         return None
 
