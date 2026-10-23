@@ -219,7 +219,7 @@ How one posting job ends:
 | 404 or another 4xx on the POST | (raised) | dead | freed |
 | 429, 5xx, timeout: it may have landed | `post-uncertain` | done | kept, never posted twice |
 | Anything raised before the POST (token lookup, head lookup) | (raised) | by error class | freed |
-| Posted, but recording it failed | (raised) | retried; the retry records it and runs the follow-ups without posting again | kept |
+| Posted, but recording it failed | (raised) | retried; before any model call the retry records the post with the verdict that was posted, then finishes the follow-ups (outcome `recovered`) without posting again | kept |
 
 Known limit: a resolve event redelivered byte for byte after an unresolve of the same thread is
 treated as already applied, so the finding stays `reopened`. GitHub sends a fresh body (new
