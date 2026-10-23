@@ -65,6 +65,7 @@ class ReviewResult:
     head_sources: Mapping[str, str] = field(default_factory=dict)  # the head index's files
     blockers: list[Blocker] = field(default_factory=list)  # as decided before any proof
     recovered_id: str = ""  # an earlier attempt's post of this head, recorded by this run
+    recovered_event: str = ""  # the verdict that post really carried
 
 
 @dataclass
@@ -190,7 +191,7 @@ class Reviewer:
         with t.stage("fetch"):
             pr = self.vcs.get_pull(repo, number)
         result = ReviewResult(pr=pr, outcome="")
-        result.recovered_id = self._record_landed(repo, number, expected_head or pr.head_sha)
+        result.recovered_id, result.recovered_event = self._record_landed(repo, number, expected_head or pr.head_sha)
         if pr.state != "open":
             result.outcome = "skipped"
             result.error = f"PR is {pr.state}"
@@ -276,14 +277,14 @@ class Reviewer:
             after_post(self.vcs, self.store, done, cfg.policy)
         return done
 
-    def _record_landed(self, repo: str, number: int, head: str) -> str:
+    def _record_landed(self, repo: str, number: int, head: str) -> tuple[str, str]:
         """Before any model call: record a post an earlier attempt landed but never recorded,
-        with the event and blockers saved when it landed. Returns its id, or ""."""
+        with the event and blockers saved when it landed. Returns (id, event), or empty."""
         if self.store is None:
-            return ""
+            return "", ""
         landed = self.store.unrecorded_post(repo, number, head)
         if landed is None:
-            return ""
+            return "", ""
         post_id, event = landed
         log.warning("recording a review an earlier attempt posted",
                     extra={"pr": number, "head": head, "post_id": post_id})
@@ -294,7 +295,7 @@ class Reviewer:
         except Exception as exc:
             raise RecordAfterPostError(f"review {post_id} posted but not recorded: "
                                        f"{type(exc).__name__}") from exc
-        return post_id
+        return post_id, event
 
     def _already_posted(self, pr: PullRequest, result: ReviewResult) -> None:
         """Another run holds this head. If it was this run that recorded that post, finish its
@@ -414,7 +415,8 @@ class Reviewer:
                          head_sha=result.pr.head_sha, outcome=result.outcome,
                          tier=rt.tier if rt else "", model=rt.model if rt else "",
                          providers=tuple(result.reviewers),
-                         event=result.review.event if result.review else "",
+                         event=result.recovered_event if result.outcome == "recovered" else
+                         result.review.event if result.review else "",
                          # An uncertain post may have landed: never risk posting it twice.
                          posted=result.outcome in ("posted", "post-uncertain", "recovered"),
                          post_id=result.post_id, cost_usd=result.cost_usd,

@@ -451,7 +451,7 @@ def test_recovery_records_what_was_posted_not_what_the_retry_decided(
     again = reviewer.review(REPO, PR, dry_run=False, expected_head=H1)
     assert (again.outcome, again.review.event) == ("recovered", "COMMENT")  # type: ignore
     assert [(r["outcome"], r["event"]) for r in store.reviews(REPO, PR)] == [
-        ("posted", "REQUEST_CHANGES"), ("recovered", "COMMENT")]
+        ("posted", "REQUEST_CHANGES"), ("recovered", "REQUEST_CHANGES")]
     assert [r["fingerprint"] for r in store.review_blockers(REPO, PR, "memory-review-1")] == [FP]
     push(vcs, "h2", FIXED)
     vcs.posted.append(ReviewPayload(head_sha="h2", event="COMMENT", body=""))  # id 2 is taken

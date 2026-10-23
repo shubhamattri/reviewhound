@@ -519,7 +519,7 @@ def test_lease_lost_after_a_refusal_skips_the_retry(backend: Backend,
                                                     monkeypatch: pytest.MonkeyPatch) -> None:
     vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
     calls = scripted_posts(vcs, monkeypatch, REJECTED, None)
-    answers = iter([True, False])
+    answers = iter([True, True, False])  # before the claim, before POST 1, before the retry
     result = reviewer.review("acme/shop", 7, dry_run=False, should_post=lambda: next(answers))
     assert (result.outcome, len(calls)) == ("lease-lost", 1)
     assert store.claim_post("acme/shop", 7, "h1") is True
