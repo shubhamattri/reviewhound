@@ -16,6 +16,7 @@ classifiers = [
 dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.14.1",
+    "pyjwt[crypto]>=2.15.1",
     "pyyaml>=6.0.3",
     "tree-sitter>=0.26.0",
     "tree-sitter-python>=0.25.0",
