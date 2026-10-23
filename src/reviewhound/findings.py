@@ -107,6 +107,8 @@ class Finding:
         """Stable identity across re-reviews: survives line shifts, not content changes."""
         anchor = self.identity or " ".join(self.evidence_quote.split()) or self.title.lower()
         raw = f"{self.file}\x00{self.category}\x00{anchor}"
+        if self.side == "LEFT":  # only LEFT adds the side, so RIGHT fingerprints stay as they were
+            raw += "\x00LEFT"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     @classmethod
