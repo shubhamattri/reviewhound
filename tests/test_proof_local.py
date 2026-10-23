@@ -1,8 +1,10 @@
 """LocalRunner end to end: real pytest subprocesses on tiny projects in a temp dir."""
 
+import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -78,4 +80,22 @@ def test_path_escaping_the_sandbox_is_refused_and_cleaned_up(sandbox_tmp: Path,
 def test_missing_python_is_inconclusive_and_cleans_up(sandbox_tmp: Path) -> None:
     res = LocalRunner(python="/nonexistent/python3").run({**BUGGY, TEST: PROOF}, TEST, 30)
     assert classify(res) == ("inconclusive", "could not start python: FileNotFoundError")
+    assert list(sandbox_tmp.iterdir()) == []
+
+
+def test_timed_out_process_is_killed_and_reaped(sandbox_tmp: Path,
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        proc = real_popen(*args, **kwargs)
+        started.append(proc)
+        return proc
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    sleeper = "import time\n\n\ndef test_sleep():\n    time.sleep(600)\n"
+    res = LocalRunner().run({"test_sleep.py": sleeper}, "test_sleep.py", 2)
+    assert classify(res) == ("inconclusive", "test run timed out")
+    [proc] = started
+    assert proc.returncode == -9
     assert list(sandbox_tmp.iterdir()) == []

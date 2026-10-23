@@ -1,6 +1,8 @@
+import json
+import shutil
 from pathlib import Path
 
-from reviewhound.evals import run_eval, score
+from reviewhound.evals import recorded_provider, run_case, run_eval, score
 
 CASES = Path(__file__).parent.parent / "evals" / "cases"
 
@@ -29,3 +31,13 @@ def test_proof_eval_cases_prove_the_real_bug_and_hold_the_unreproduced_blocker()
     assert (proven.reported, proven.true_positives, proven.proof_mismatches) == (1, 1, [])
     assert (held.reported, held.false_alarms, held.proof_mismatches) == (0, [], [])
     assert [c.proof_mismatches for c in report.cases if c.proof_mismatches] == []
+
+
+def test_a_wrong_proof_verdict_is_reported_as_a_mismatch(tmp_path: Path) -> None:
+    case = tmp_path / "13-copy"
+    shutil.copytree(CASES / "13-py-proof-proven-discount", case)
+    spec = json.loads((case / "case.json").read_text())
+    spec["expected_proofs"][0]["proof"] = "not_proven"
+    (case / "case.json").write_text(json.dumps(spec))
+    result = run_case(case, recorded_provider)
+    assert result.proof_mismatches == ["proof pricing.py:3 expected not_proven got proven"]

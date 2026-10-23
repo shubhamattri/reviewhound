@@ -216,6 +216,13 @@ def test_docker_timeout_kills_the_container_by_name() -> None:
     assert fake.calls[2] == ["docker", "kill", name]
 
 
+def test_oversized_junit_written_by_the_test_is_not_parsed(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("reviewhound.proof.MAX_JUNIT_BYTES", 100)
+    res = DockerRunner(command=FakeDocker()).run(FILES, "tests/test_p.py", 60)
+    assert classify(res) == ("inconclusive", "unexpected junit root <oversized-report>")
+
+
 def test_docker_own_failure_is_inconclusive_not_a_test_result() -> None:
     res = DockerRunner(command=FakeDocker(run_rc=125, junit=None)).run(FILES, "tests/test_p.py",
                                                                        60)
@@ -315,8 +322,10 @@ def test_eligibility_filters_and_caps() -> None:
     keep = [finding(), finding()]
     out = [finding(Severity.MAJOR), finding(file="src/a.ts"), finding(verified=False),
            finding(source="scanner:builtin")]
-    pc = ProofConfig(enabled=True, max_findings=1)
-    assert eligible(pc, keep + out) == keep[:1]
+    assert eligible(ProofConfig(enabled=True, max_findings=1), keep + out) == keep[:1]
+    assert eligible(ProofConfig(enabled=True, max_findings=20), out + keep) == keep
+    assert [eligible(ProofConfig(enabled=True, max_findings=20), [f]) for f in out] == \
+        [[], [], [], []]
     assert eligible(ProofConfig(enabled=True, min_severity="major"),
                     [out[0]]) == [out[0]]
 
