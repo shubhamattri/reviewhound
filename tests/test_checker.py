@@ -158,6 +158,15 @@ def test_dotted_symbol_must_match_its_qualified_definition(claim: Claim, verdict
     assert dotted(claim) == (verdict, reason)
 
 
+def test_dotted_field_named_inside_its_owner_is_unknown_not_false() -> None:
+    go_src = "package c\n\ntype Config struct {\n\tPort int\n}\n\nfunc Load() {}\n"
+    idx = CodeIndex.build({"c.go": go_src, "m.py": DOTTED_HEAD["m.py"]})
+    c = ClaimChecker(diff_file_maps({}, {"c.go": go_src}), idx)
+    verdicts = [c.check_claim(Claim(kind="symbol_exists", name=n), "c.go").verdict
+                for n in ("Config.Port", "Config.Host", "Cache.k", "Cache.save")]
+    assert verdicts == ["unknown", "false", "unknown", "false"]
+
+
 def test_dotted_names_with_braces_from_the_model_do_not_crash() -> None:
     assert dotted(Claim(kind="calls", caller="Cache.{x}", callee="get")) == (
         "false", "false claim: function Cache.{x} does not exist")
@@ -171,7 +180,8 @@ def test_dotted_symbol_matches_a_nested_qualified_suffix() -> None:
     c = ClaimChecker(diff_file_maps({}, {"n.py": idx.sources["n.py"]}), idx)
     assert c.check_claim(Claim(kind="symbol_exists", name="B.go"), "n.py").verdict == "true"
     assert c.check_claim(Claim(kind="symbol_exists", name="A.B.go"), "n.py").verdict == "true"
-    assert c.check_claim(Claim(kind="symbol_exists", name="A.go"), "n.py").verdict == "false"
+    assert c.check_claim(Claim(kind="symbol_exists", name="A.go"), "n.py").verdict == "unknown"
+    assert c.check_claim(Claim(kind="symbol_exists", name="A.run"), "n.py").verdict == "false"
 
 
 def test_quote_spanning_blank_lines_matches_and_locates_the_changed_line() -> None:

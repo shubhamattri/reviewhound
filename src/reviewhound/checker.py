@@ -7,6 +7,7 @@ wording-specific rules here: only general checks against the index and the PR he
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -110,10 +111,17 @@ class ClaimChecker:
         """Verdict for `Owner.member`, or None when a definition qualified that way exists."""
         if self.index.qualified_matches(dotted):
             return None
-        owner = dotted.rsplit(".", 1)[0]
-        if self.index.qualified_matches(owner):
-            return ClaimResult(claim, "false", missing)
-        return ClaimResult(claim, "unknown", f"{owner} is not defined in indexed code")
+        owner, member = dotted.rsplit(".", 1)
+        owners = self.index.qualified_matches(owner)
+        if not owners:
+            return ClaimResult(claim, "unknown", f"{owner} is not defined in indexed code")
+        word = re.compile(rf"\b{re.escape(member)}\b")
+        for d in owners:
+            body = self.index.sources.get(d.file, "").splitlines()[d.start_line - 1:d.end_line]
+            if any(word.search(ln) for ln in body):
+                # Fields and attributes are not indexed as definitions, so this cannot be judged.
+                return ClaimResult(claim, "unknown", f"{member} is named inside {owner}")
+        return ClaimResult(claim, "false", missing)
 
     def check_claim(self, claim: Claim, default_file: str) -> ClaimResult:
         if claim.kind == "quote":
