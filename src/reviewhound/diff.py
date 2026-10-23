@@ -16,6 +16,7 @@ class Hunk:
     context: list[int] = field(default_factory=list)
     old_start: int = 0
     deleted: list[int] = field(default_factory=list)  # base-side line numbers
+    deleted_text: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -33,6 +34,11 @@ class FileDiff:
     @property
     def deleted_lines(self) -> set[int]:
         return {n for h in self.hunks for n in h.deleted}
+
+    @property
+    def deleted_text(self) -> dict[int, str]:
+        """Base line number -> the text the patch shows being deleted there."""
+        return {n: t for h in self.hunks for n, t in h.deleted_text.items()}
 
     @property
     def commentable_lines(self) -> set[int]:
@@ -98,6 +104,7 @@ def parse_patch(path: str, patch: str, status: str = "modified",
             new_line += 1
         elif raw.startswith("-"):
             hunk.deleted.append(old_line)
+            hunk.deleted_text[old_line] = raw[1:]
             old_line += 1
         else:
             hunk.context.append(new_line)

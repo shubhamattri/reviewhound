@@ -274,6 +274,30 @@ def test_base_quote_counts_only_where_it_touches_a_deleted_line() -> None:
     assert reason == "evidence quote is only in code this PR did not change"
 
 
+def test_removed_guard_still_present_in_other_unchanged_code_is_kept_left() -> None:
+    base = {"g.py": 'def a(req):\n    require_role(req, "admin")\n    return 1\n\n\n'
+                    'def b(req):\n    require_role(req, "admin")\n    return 2\n'}
+    head = {"g.py": base["g.py"].replace('    require_role(req, "admin")\n    return 2',
+                                         "    return 2")}
+    c = ClaimChecker(diff_file_maps(base, head), CodeIndex.build(head), base_reader=base.get)
+    f, reason = c.check(mf(file="g.py", line=6, evidence_quote='require_role(req, "admin")'),
+                        "m")
+    assert (reason, f.side, f.line) == (None, "LEFT", 7)
+
+
+def test_base_that_does_not_line_up_with_the_diff_is_not_trusted() -> None:
+    moved = {"h.py": "# a line the base branch added later\n" + DEL_BASE["h.py"]}
+    c = del_checker(moved.get)
+    _, reason = c.check(mf(file="h.py", line=2, evidence_quote='require_role(req, "admin")'), "m")
+    assert reason == "base version of h.py does not match the diff"
+
+
+@pytest.mark.parametrize("name, verdict", [(".save", "true"), ("Repo.save.", "true"),
+                                           (".Cache.save", "false")])
+def test_dotted_names_with_stray_dots_are_normalised(name: str, verdict: str) -> None:
+    assert dotted(Claim(kind="symbol_exists", name=name))[0] == verdict
+
+
 def test_renamed_file_reads_the_base_under_its_old_path() -> None:
     diff = parse_unified_diff("diff --git a/old.py b/new.py\nrename from old.py\n"
                               "rename to new.py\n--- a/old.py\n+++ b/new.py\n@@ -1,2 +1 @@\n"

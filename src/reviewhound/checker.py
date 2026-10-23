@@ -96,12 +96,17 @@ class ClaimChecker:
         spans = find_quote_spans(base, f.evidence_quote) if base is not None else []
         if not spans:
             return None, nowhere
-        deleted = fd.deleted_lines
+        # The base must agree with the patch, or its line numbers mean nothing here.
+        lines = base.splitlines() if base is not None else []
+        deleted = {n for n, t in fd.deleted_text.items()
+                   if n <= len(lines) and _norm(lines[n - 1]) == _norm(t)}
         for start, end in sorted(spans, key=lambda q: abs(q[0] - f.line)):
             hit = [n for n in range(start, end + 1) if n in deleted]
             if hit:
                 best = min(hit, key=lambda n: abs(n - f.line))
                 return best, f"on deleted base line {best}"
+        if len(deleted) < len(fd.deleted_text):
+            return None, f"base version of {f.file} does not match the diff"
         return None, "evidence quote is only in code this PR did not change"
 
     def _uncovered(self, claim: Claim, path: str) -> ClaimResult:
@@ -138,11 +143,12 @@ class ClaimChecker:
         if claim.kind == "symbol_exists":
             if not claim.name:
                 return ClaimResult(claim, "unknown", "no symbol name given")
-            if "." in claim.name.strip("."):
-                owner, member = claim.name.strip(".").rsplit(".", 1)
+            name = claim.name.strip(".")
+            if "." in name:
+                owner, member = name.rsplit(".", 1)
                 miss = self._dotted(claim, f"{owner}.{member}", f"{owner} has no member {member}")
                 return miss or ClaimResult(claim, "true", "qualified definition found")
-            if self.index.has_symbol(claim.name):
+            if self.index.has_symbol(name):
                 return ClaimResult(claim, "true", "symbol found")
             if not self.index.covers(context_file):
                 return self._uncovered(claim, context_file)
@@ -207,17 +213,21 @@ class ClaimChecker:
         quote_spans: list[tuple[int, int]] = []
         if f.evidence_quote:
             quote_spans = find_quote_spans(src, f.evidence_quote)
-        if f.evidence_quote and not quote_spans:
-            line, how = self._locate_deleted(f, fd)
-            if line is None:
-                return f, how
-            f.side = "LEFT"
-            has_evidence = True
-        else:
+        line: int | None = None
+        how = ""
+        has_evidence = bool(quote_spans)
+        if quote_spans or not f.evidence_quote:
             line, how = self._locate(f, quote_spans)
-            if line is None:
-                return f, how
-            has_evidence = bool(quote_spans)
+        if line is None and f.evidence_quote:
+            # A removed line often still exists elsewhere at head, so try the deletions too.
+            left, left_how = self._locate_deleted(f, fd)
+            if left is not None:
+                line, how, has_evidence = left, left_how, True
+                f.side = "LEFT"
+            elif not quote_spans:
+                how = left_how
+        if line is None:
+            return f, how
         if line != f.line or f.side == "LEFT":
             f.notes.append(how)
             f.line = line

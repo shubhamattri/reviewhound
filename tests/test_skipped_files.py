@@ -26,6 +26,7 @@ def test_github_files_without_a_patch_are_recorded_with_a_reason(tmp_path: Path)
     files = [
         {"filename": "big.py", "status": "modified", "changes": 9000},
         {"filename": "logo.png", "status": "added", "changes": 0},
+        {"filename": "pkg/__init__.py", "status": "added", "changes": 0},
         {"filename": "moved.py", "status": "renamed", "changes": 0,
          "previous_filename": "old.py"},
         {"filename": "gone.bin", "status": "removed", "changes": 0},
@@ -34,8 +35,10 @@ def test_github_files_without_a_patch_are_recorded_with_a_reason(tmp_path: Path)
     ]
     diff = gh_files(files, tmp_path).get_diff(make_pr())
     assert diff.skipped == {"big.py": "diff too large for GitHub to return",
-                            "logo.png": "binary file, no text diff"}
-    assert set(diff.files) == {"big.py", "logo.png", "moved.py", "gone.bin", "ok.py"}
+                            "logo.png": "no text diff (binary, empty or mode change)",
+                            "pkg/__init__.py": "no text diff (binary, empty or mode change)"}
+    assert set(diff.files) == {"big.py", "logo.png", "pkg/__init__.py", "moved.py", "gone.bin",
+                               "ok.py"}
     assert diff.files["ok.py"].added_lines == {1}
 
 

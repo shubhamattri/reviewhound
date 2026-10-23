@@ -89,7 +89,7 @@ class GitHubVCS:
                     if int(f.get("changes") or 0) > 0:
                         diff.skipped[f["filename"]] = "diff too large for GitHub to return"
                     elif status in ("added", "modified"):
-                        diff.skipped[f["filename"]] = "binary file, no text diff"
+                        diff.skipped[f["filename"]] = "no text diff (binary, empty or mode change)"
             if len(files) < 100:
                 return diff
             page += 1
