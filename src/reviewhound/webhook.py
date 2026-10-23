@@ -26,14 +26,15 @@ def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
 
 
 def handle_event(queue: JobQueue, event: str, payload: dict[str, Any],
-                 store: Store | None = None, app_id: str | None = None) -> tuple[int, str]:
+                 store: Store | None = None, app_id: str | None = None,
+                 delivery: str = "") -> tuple[int, str]:
     """Return (HTTP status, message). Pure so it can be tested without a socket."""
     if event == "ping":
         return 200, "pong"
     if event in FEEDBACK_EVENTS:
         if store is None:
             return 202, f"ignored event {event}: no store"
-        return handle_feedback_event(store, event, payload, app_id)
+        return handle_feedback_event(store, event, payload, app_id, delivery)
     if event != "pull_request":
         return 202, f"ignored event {event}"
     action = payload.get("action")
@@ -102,7 +103,8 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int, store: Store
                 return
             status, message = handle_event(queue, self.headers.get("X-GitHub-Event", ""),
                                            payload if isinstance(payload, dict) else {},
-                                           store, app_id)
+                                           store, app_id,
+                                           self.headers.get("X-GitHub-Delivery", ""))
             self._reply(status, message)
 
         def log_message(self, format: str, *args: Any) -> None:

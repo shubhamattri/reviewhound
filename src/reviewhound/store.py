@@ -225,22 +225,28 @@ class Store:
             c.execute("DELETE FROM feedback_events WHERE key=?", (key,))
 
     def blocking_reviews_to_dismiss(self, repo: str, pr: int, current_post_id: str) -> list[str]:
-        """Our earlier REQUEST_CHANGES reviews on this PR not yet dismissed successfully."""
+        """Our REQUEST_CHANGES reviews posted before `current_post_id`, not dismissed or given up.
+
+        Only older rows: a late follow-up must never dismiss a newer head's verdict."""
         with self._tx() as c:
             rows = c.execute(
                 "SELECT post_id FROM reviews WHERE repo=? AND pr=? AND outcome='posted' "
-                "AND event='REQUEST_CHANGES' AND post_id != '' AND post_id != ? "
+                "AND event='REQUEST_CHANGES' AND post_id != '' "
+                "AND id < (SELECT MIN(id) FROM reviews WHERE repo=? AND pr=? AND post_id=?) "
                 "AND post_id NOT IN (SELECT review_id FROM dismissals WHERE repo=? AND pr=? "
-                "AND ok=1) ORDER BY id",
-                (repo.lower(), pr, current_post_id, repo.lower(), pr)).fetchall()
+                "AND ok != 0) ORDER BY id",
+                (repo.lower(), pr, repo.lower(), pr, current_post_id, repo.lower(), pr)
+            ).fetchall()
         return [r["post_id"] for r in rows]
 
     def record_dismissal(self, repo: str, pr: int, review_id: str, ok: bool,
-                         error: str = "") -> None:
+                         error: str = "", permanent: bool = False) -> None:
+        """ok is stored as 1 (dismissed), 0 (failed, retry later) or -1 (failed, give up)."""
+        status = 1 if ok else (-1 if permanent else 0)
         with self._tx() as c:
             c.execute("INSERT INTO dismissals (repo, pr, review_id, ok, error, created_at) "
                       "VALUES (?,?,?,?,?,?)",
-                      (repo.lower(), pr, review_id, int(ok), error[:500], self._clock()))
+                      (repo.lower(), pr, review_id, status, error[:500], self._clock()))
 
     def dismissals(self, repo: str, pr: int) -> list[dict[str, Any]]:
         with self._tx() as c:

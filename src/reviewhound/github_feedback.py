@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from reviewhound.config import PolicyConfig, Severity
 from reviewhound.store import Store
 from reviewhound.vcs.base import VCS, ReviewThreads
+from reviewhound.vcs.github import GitHubError
 
 if TYPE_CHECKING:
     from reviewhound.pipeline import ReviewResult
@@ -23,17 +24,18 @@ _NOT_OPEN = ("duplicate", "unverified", "developer ")
 
 
 def handle_feedback_event(store: Store, event: str, payload: dict[str, Any],
-                          app_id: str | None = None) -> tuple[int, str]:
+                          app_id: str | None = None, delivery: str = "") -> tuple[int, str]:
     """DB writes only: this runs inside the webhook request, so no GitHub calls here."""
     repo = (payload.get("repository") or {}).get("full_name")
     if not isinstance(repo, str) or not repo:
         return 400, "missing repository"
     if event == "pull_request_review_thread":
-        return _thread_event(store, repo, payload)
+        return _thread_event(store, repo, payload, delivery)
     return _comment_event(store, repo, payload, app_id)
 
 
-def _thread_event(store: Store, repo: str, payload: dict[str, Any]) -> tuple[int, str]:
+def _thread_event(store: Store, repo: str, payload: dict[str, Any],
+                  delivery: str) -> tuple[int, str]:
     action = payload.get("action")
     kind = THREAD_ACTIONS.get(str(action))
     if kind is None:
@@ -42,6 +44,20 @@ def _thread_event(store: Store, repo: str, payload: dict[str, Any]) -> tuple[int
         ids = [int(c["id"]) for c in (payload["thread"]["comments"] or [])]
     except (KeyError, TypeError, ValueError):
         return 400, "malformed review thread payload"
+    # A late redelivery of an old resolve must not undo a newer unresolve.
+    key = f"thread:{delivery}" if delivery else ""
+    if key and not store.claim_event(key):
+        return 202, "event already applied"
+    try:
+        return _apply_thread(store, repo, str(action), kind, ids)
+    except BaseException:
+        if key:
+            store.release_event(key)
+        raise
+
+
+def _apply_thread(store: Store, repo: str, action: str, kind: str,
+                  ids: list[int]) -> tuple[int, str]:
     links = store.linked_findings(repo, ids)
     unknown = [i for i in ids if i not in links]
     if unknown:
@@ -150,8 +166,11 @@ def dismiss_stale_verdicts(vcs: ReviewThreads, store: Store, result: ReviewResul
             log.warning("dismissal failed", extra={"repo": pr.repo, "pr": pr.number,
                                                    "review_id": review_id,
                                                    "error": type(exc).__name__})
+            # 4xx other than 429 (already dismissed, no permission) will not get better.
+            permanent = (isinstance(exc, GitHubError) and exc.status is not None
+                         and 400 <= exc.status < 500 and exc.status != 429)
             store.record_dismissal(pr.repo, pr.number, review_id, ok=False,
-                                   error=f"{type(exc).__name__}: {exc}")
+                                   error=f"{type(exc).__name__}: {exc}", permanent=permanent)
         else:
             log.info("stale verdict dismissed", extra={"repo": pr.repo, "pr": pr.number,
                                                        "review_id": review_id})

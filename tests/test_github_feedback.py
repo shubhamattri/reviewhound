@@ -11,7 +11,7 @@ from reviewhound.github_feedback import DISMISS_MESSAGE
 from reviewhound.pipeline import Reviewer
 from reviewhound.providers import FakeProvider, ProviderRegistry
 from reviewhound.queue import SQLiteQueue
-from reviewhound.store import Store
+from reviewhound.store import ReviewRecord, Store
 from reviewhound.vcs.base import PostedComment
 from reviewhound.vcs.github import GitHubError, GitHubVCS
 from reviewhound.vcs.memory import MemoryVCS
@@ -235,11 +235,11 @@ def test_new_blocking_review_dismisses_nothing(tmp_path: Path) -> None:
 def test_failed_dismissal_is_recorded_and_never_fails_the_review(tmp_path: Path) -> None:
     vcs, reviewer, store = reviewer_on(tmp_path, [answer(REAL), answer(), answer()])
     reviewer.review("acme/shop", 7, dry_run=False)
-    vcs.dismiss_error = GitHubError("PUT x -> HTTP 422", 422)
+    vcs.dismiss_error = GitHubError("PUT x -> HTTP 502", 502)
     push(vcs, "h2", FIXED)
     assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "posted"
     assert store.dismissals("acme/shop", 7) == [{
-        "review_id": "memory-review-1", "ok": 0, "error": "GitHubError: PUT x -> HTTP 422"}]
+        "review_id": "memory-review-1", "ok": 0, "error": "GitHubError: PUT x -> HTTP 502"}]
     vcs.dismiss_error = None
     push(vcs, "h3", FIXED)
     reviewer.review("acme/shop", 7, dry_run=False)
@@ -282,3 +282,58 @@ def test_github_review_comments_and_dismissal_requests(tmp_path: Path) -> None:
         ("GET", "/repos/acme/shop/pulls/7/reviews/88/comments", "per_page=100&page=2"),
         ("PUT", "/repos/acme/shop/pulls/7/reviews/88/dismissals",
          json.dumps({"message": "msg", "event": "DISMISS"}, separators=(",", ":")))]
+
+
+def test_late_follow_up_never_dismisses_a_newer_review(tmp_path: Path) -> None:
+    store = Store(tmp_path / "s.db")
+    for head, event, post_id in [("h1", "REQUEST_CHANGES", "r1"), ("h2", "COMMENT", "r2"),
+                                 ("h3", "REQUEST_CHANGES", "r3")]:
+        store.record_review(ReviewRecord(repo="acme/shop", pr=7, head_sha=head, outcome="posted",
+                                         event=event, posted=True, post_id=post_id), [], [])
+    assert store.blocking_reviews_to_dismiss("acme/shop", 7, "r2") == ["r1"]
+    assert store.blocking_reviews_to_dismiss("acme/shop", 7, "unknown") == []
+
+
+def test_redelivered_thread_event_is_applied_once(tmp_path: Path) -> None:
+    _vcs, reviewer, store = reviewer_on(tmp_path, [answer(REAL)])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    q = SQLiteQueue(tmp_path / "q.db")
+    assert handle_event(q, "pull_request_review_thread", thread("resolved", 1001), store,
+                        delivery="d1") == (202, "recorded 1 resolved")
+    assert handle_event(q, "pull_request_review_thread", thread("unresolved", 1001), store,
+                        delivery="d2") == (202, "recorded 1 reopened")
+    assert handle_event(q, "pull_request_review_thread", thread("resolved", 1001), store,
+                        delivery="d1") == (202, "event already applied")
+    assert state_of(store) == "reopened"
+    assert [f["kind"] for f in store.feedback("acme/shop", 7)] == ["resolved", "reopened"]
+
+
+def test_thread_write_failure_releases_the_delivery(tmp_path: Path,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    _vcs, reviewer, store = reviewer_on(tmp_path, [answer(REAL)])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    q = SQLiteQueue(tmp_path / "q.db")
+
+    def broken(*a: Any, **k: Any) -> bool:
+        raise RuntimeError("disk full")
+    with monkeypatch.context() as m:
+        m.setattr(store, "add_feedback", broken)
+        with pytest.raises(RuntimeError):
+            handle_event(q, "pull_request_review_thread", thread("resolved", 1001), store,
+                         delivery="d1")
+    assert handle_event(q, "pull_request_review_thread", thread("resolved", 1001), store,
+                        delivery="d1") == (202, "recorded 1 resolved")
+
+
+def test_permanent_dismissal_failure_is_not_retried(tmp_path: Path) -> None:
+    vcs, reviewer, store = reviewer_on(tmp_path, [answer(REAL), answer(), answer()])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    vcs.dismiss_error = GitHubError("PUT x -> HTTP 404", 404)
+    push(vcs, "h2", FIXED)
+    reviewer.review("acme/shop", 7, dry_run=False)
+    vcs.dismiss_error = None
+    push(vcs, "h3", FIXED)
+    reviewer.review("acme/shop", 7, dry_run=False)
+    assert vcs.dismissed == []
+    assert store.dismissals("acme/shop", 7) == [{
+        "review_id": "memory-review-1", "ok": -1, "error": "GitHubError: PUT x -> HTTP 404"}]
