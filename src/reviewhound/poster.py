@@ -19,7 +19,8 @@ def _comment_body(f: Finding) -> str:
 
 
 def build_review(head_sha: str, decision: PolicyDecision, diff: Diff, tier: str,
-                 reviewers: list[str]) -> ReviewPayload:
+                 reviewers: list[str],
+                 not_reviewed: list[tuple[str, str]] | None = None) -> ReviewPayload:
     comments: list[ReviewComment] = []
     body_only: list[Finding] = []
     for f in decision.post:
@@ -39,6 +40,8 @@ def build_review(head_sha: str, decision: PolicyDecision, diff: Diff, tier: str,
         lines.append(f"{len(decision.post)} issue(s) found.")
     for f in body_only:
         lines.append(f"- `{f.file}:{f.line}` [{f.severity.name.lower()}] {f.title}")
+    for path, reason in not_reviewed or []:
+        lines.append(f"- not reviewed: {path} ({reason})")
     return ReviewPayload(head_sha=head_sha, event=decision.event, body="\n".join(lines),
                          comments=comments)
 

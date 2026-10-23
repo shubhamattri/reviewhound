@@ -52,6 +52,7 @@ class FileDiff:
 @dataclass
 class Diff:
     files: dict[str, FileDiff] = field(default_factory=dict)
+    skipped: dict[str, str] = field(default_factory=dict)  # path -> why its patch is missing
 
     @property
     def changed_paths(self) -> list[str]:

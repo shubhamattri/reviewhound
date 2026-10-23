@@ -4,6 +4,7 @@ import pytest
 
 from reviewhound.checker import ClaimChecker, find_quote
 from reviewhound.config import Severity
+from reviewhound.diff import parse_unified_diff
 from reviewhound.findings import Claim, ModelFinding
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.vcs.memory import diff_file_maps
@@ -261,6 +262,17 @@ def test_base_quote_counts_only_where_it_touches_a_deleted_line() -> None:
     c = ClaimChecker(diff_file_maps(base, head), CodeIndex.build(head), base_reader=base.get)
     _, reason = c.check(mf(file="j.py", line=2, evidence_quote="first = 1\nsecond = 2"), "m")
     assert reason == "evidence quote is only in code this PR did not change"
+
+
+def test_renamed_file_reads_the_base_under_its_old_path() -> None:
+    diff = parse_unified_diff("diff --git a/old.py b/new.py\nrename from old.py\n"
+                              "rename to new.py\n--- a/old.py\n+++ b/new.py\n@@ -1,2 +1 @@\n"
+                              " keep_this = 1\n-check_owner(user)\n")
+    head = {"new.py": "keep_this = 1\n"}
+    c = ClaimChecker(diff, CodeIndex.build(head),
+                     base_reader={"old.py": "keep_this = 1\ncheck_owner(user)\n"}.get)
+    f, reason = c.check(mf(file="new.py", line=2, evidence_quote="check_owner(user)"), "m")
+    assert (reason, f.side, f.line) == (None, "LEFT", 2)
 
 
 def test_base_read_failure_drops_with_a_reason_and_reads_each_path_once() -> None:

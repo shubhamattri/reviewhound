@@ -44,6 +44,10 @@ class Snapshot(Protocol):
 
     def paths(self) -> list[str]: ...
 
+    def skip_reason(self, path: str) -> str | None:
+        """Why `read` refuses an existing file (size, encoding); None when it does not."""
+        ...
+
 
 class DictSnapshot:
     def __init__(self, files: dict[str, str]) -> None:
@@ -54,6 +58,9 @@ class DictSnapshot:
 
     def paths(self) -> list[str]:
         return sorted(self._files)
+
+    def skip_reason(self, path: str) -> str | None:
+        return None
 
 
 class DirSnapshot:
@@ -73,6 +80,18 @@ class DirSnapshot:
             return p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return None
+
+    def skip_reason(self, path: str) -> str | None:
+        p = (self.root / path).resolve()
+        if not p.is_relative_to(self.root.resolve()) or not p.is_file():
+            return None
+        if p.stat().st_size > self.max_file_bytes:
+            return f"over the {self.max_file_bytes}-byte snapshot size cap"
+        try:
+            p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return "not UTF-8 text"
+        return None
 
     def paths(self) -> list[str]:
         out = []

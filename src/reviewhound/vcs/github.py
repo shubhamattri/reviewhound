@@ -84,6 +84,12 @@ class GitHubVCS:
                 fd = parse_patch(f["filename"], f.get("patch") or "", status,
                                  f.get("previous_filename"))
                 diff.files[f["filename"]] = fd
+                if not f.get("patch"):
+                    # GitHub drops the patch for very large diffs and for binary files.
+                    if int(f.get("changes") or 0) > 0:
+                        diff.skipped[f["filename"]] = "diff too large for GitHub to return"
+                    elif status in ("added", "modified"):
+                        diff.skipped[f["filename"]] = "binary file, no text diff"
             if len(files) < 100:
                 return diff
             page += 1
