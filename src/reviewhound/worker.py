@@ -31,6 +31,8 @@ def is_retryable(exc: BaseException) -> bool:
         return exc.status is None or exc.status >= 500 or exc.status == 429
     if isinstance(exc, ConfigError):
         return False
+    if getattr(exc, "sqlstate", None) in ("40P01", "40001"):  # Postgres deadlock, serialization
+        return True
     return isinstance(exc, (TimeoutError, ConnectionError, OSError))
 
 

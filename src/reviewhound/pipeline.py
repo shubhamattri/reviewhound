@@ -47,6 +47,8 @@ class ReviewResult:
     rendered: str = ""
     error: str = ""
     post_id: str = ""
+    snapshot: Snapshot | None = None  # the head this run reviewed, for follow-ups
+    changed_paths: list[str] = field(default_factory=list)
 
 
 class _Timer:
@@ -92,6 +94,22 @@ def not_reviewed(diff: Diff, head: Snapshot, ignore_paths: list[str]) -> list[tu
     return sorted((p, r) for p, r in out.items() if not matches_any(p, ignore_paths))
 
 
+def comments_in_body(review: ReviewPayload) -> ReviewPayload:
+    """The same review with every inline comment moved into the body, for a refused anchor."""
+    parts = [review.body, "", "GitHub could not place these comments on their lines:"]
+    for c in review.comments:
+        deleted = " (deleted line)" if c.side == "LEFT" else ""
+        parts += ["", f"**`{c.path}:{c.line}`{deleted}**", "", c.body]
+    return ReviewPayload(head_sha=review.head_sha, event=review.event, body="\n".join(parts),
+                         comments=[])
+
+
+def _refused(exc: Exception) -> bool:
+    """GitHub answered 4xx (not 429): nothing landed, so this head may be posted again."""
+    return (isinstance(exc, GitHubError) and exc.status is not None
+            and 400 <= exc.status < 500 and exc.status != 429)
+
+
 class Reviewer:
     def __init__(self, vcs: VCS, registry: ProviderRegistry, scanners: list[Scanner],
                  store: ReviewStore | None, verify: bool = True,
@@ -124,6 +142,7 @@ class Reviewer:
     def review(self, repo: str, number: int, *, dry_run: bool,
                expected_head: str | None = None,
                should_post: Callable[[], bool] | None = None) -> ReviewResult:
+        """`should_post` is asked right before each post; False (lease lost) posts nothing."""
         t = _Timer()
         with t.stage("fetch"):
             pr = self.vcs.get_pull(repo, number)
@@ -145,7 +164,8 @@ class Reviewer:
             return self._finish(result, t, [], [])
 
         with t.stage("index"):
-            head = self.vcs.snapshot(repo, pr.head_sha)
+            result.snapshot = head = self.vcs.snapshot(repo, pr.head_sha)
+            result.changed_paths = list(diff.changed_paths)
             index = build_index(head, diff, cfg)
             churn = self.vcs.churn(repo, pr.head_sha)
             conv = learn_conventions(index, churn, cfg.auth.guard_functions)
@@ -195,38 +215,62 @@ class Reviewer:
                 result.outcome = "dry-run"
             elif not cfg.posting:
                 result.outcome = "shadow"
-            elif should_post is not None and not should_post():
-                result.outcome = "lease-lost"
             elif self.vcs.current_head(repo, number) != pr.head_sha:
                 result.outcome = "head-moved"
+            elif should_post is not None and not should_post():
+                result.outcome = "lease-lost"
             elif self.store is not None and not self.store.claim_post(repo, number, pr.head_sha):
                 result.outcome = "already-posted"
             else:
                 if result.review.event != "COMMENT" and pr.author and \
                         pr.author == self.vcs.viewer_login():
                     result.review = own_pr_review(result.review)
-                try:
-                    post_id = self.vcs.post_review(pr, result.review)
-                except GitHubError as exc:
-                    if exc.status is not None and 400 <= exc.status < 500 and exc.status != 429:
-                        # GitHub refused it, so nothing landed: free this head for a later retry.
-                        result.outcome = "post-rejected"
-                        if self.store is not None:
-                            self.store.release_post(repo, number, pr.head_sha)
-                    else:
-                        result.outcome = "post-uncertain"
-                    result.error = str(exc)
-                except Exception as exc:  # noqa: BLE001 - the post may or may not have landed
-                    result.outcome = "post-uncertain"
-                    result.error = type(exc).__name__
-                else:
-                    result.outcome = "posted"
-                    result.post_id = post_id
+                self._post(pr, result, should_post)
         done = self._finish(result, t, decision.post,
                             [(f, r) for f, r in decision.held if r != "duplicate"])
+        if done.outcome == "post-uncertain":
+            log.warning("post outcome uncertain; comments not linked, verdicts not dismissed",
+                        extra={"pr": number, "head": pr.head_sha})
         if done.outcome == "posted" and self.store is not None:
             after_post(self.vcs, self.store, done, cfg.policy)
         return done
+
+    def _post(self, pr: PullRequest, result: ReviewResult,
+              should_post: Callable[[], bool] | None) -> None:
+        """Post once; on a refusal of inline comments, once more with them in the body."""
+        assert result.review is not None
+        payload = result.review
+        for attempt in (1, 2):
+            try:
+                result.post_id = self.vcs.post_review(pr, payload)
+            except Exception as exc:  # noqa: BLE001 - every outcome is classified below
+                if not _refused(exc):
+                    result.outcome = "post-uncertain"  # it may have landed
+                    result.error = str(exc) if isinstance(exc, GitHubError) else \
+                        type(exc).__name__
+                    return
+                result.outcome, result.error = "post-rejected", str(exc)
+                status = exc.status if isinstance(exc, GitHubError) else None
+                if attempt == 2 or not payload.comments:
+                    break
+                if should_post is not None and not should_post():
+                    result.outcome = "lease-lost"
+                    break
+                log.warning("inline comments refused; retrying with them in the body",
+                            extra={"pr": pr.number, "status": status})
+                payload = comments_in_body(payload)
+                continue
+            result.outcome = "posted"
+            if attempt == 2:
+                result.review = payload
+                result.error = (f"inline comments refused (HTTP {status}); "
+                                "posted them in the review body")
+            else:
+                result.error = ""
+            return
+        # Refused, so nothing landed: free this head for a later run.
+        if self.store is not None:
+            self.store.release_post(pr.repo, pr.number, pr.head_sha)
 
     def _prove(self, decision: PolicyDecision, cfg: RepoConfig, rt: Route, head: Snapshot,
                index: CodeIndex, result: ReviewResult) -> None:

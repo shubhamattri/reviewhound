@@ -172,6 +172,8 @@ of one person's token, and developers' reactions on GitHub flow back as feedback
 | `REVIEWHOUND_WEBHOOK_SECRET` | `serve` | The App's webhook secret. Required. |
 | `REVIEWHOUND_APP_ID` | `serve`, `worker` | The App id. `serve` uses it to ignore the App's own replies. |
 | `REVIEWHOUND_APP_PRIVATE_KEY_PATH` | `worker` | Path to the App's private key (`.pem`). |
+| `REVIEWHOUND_ALLOWED_OWNERS` | `serve` | Comma-separated repo owners (users or orgs) to accept events for; `--allowed-owner` adds more. Others get a 202 "ignored" and no job. Unset accepts every owner, and `serve` warns at start. **Set it.** |
+| `REVIEWHOUND_METRICS_TOKEN` | `serve` | `/metrics` then needs `Authorization: Bearer <token>`; anything else gets 401. Unset leaves `/metrics` open, and `serve` warns at start. **Set it.** |
 | `GITHUB_TOKEN` | `enqueue` | Reads the PR head for a manual `enqueue`. The worker does not use it in App mode: a job with no installation id (manual `enqueue`, sweep) looks the installation up by repo, and a repo without the App installed fails the job at once. |
 
 ```bash

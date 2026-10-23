@@ -101,7 +101,7 @@ class ClaimChecker:
         deleted = {n for n, t in fd.deleted_text.items()
                    if n <= len(lines) and _norm(lines[n - 1]) == _norm(t)}
         for start, end in sorted(spans, key=lambda q: abs(q[0] - f.line)):
-            hit = [n for n in range(start, end + 1) if n in deleted]
+            hit = [n for n in range(start, end + 1) if n in deleted and lines[n - 1].strip()]
             if hit:
                 best = min(hit, key=lambda n: abs(n - f.line))
                 return best, f"on deleted base line {best}"
@@ -177,14 +177,15 @@ class ClaimChecker:
                                f"{claim.caller} {'does call' if present else 'never calls'} {callee}")
         return ClaimResult(claim, "unknown", f"unsupported claim kind {claim.kind}")
 
-    def _locate(self, finding: Finding,
-                quote_spans: list[tuple[int, int]]) -> tuple[int | None, str]:
+    def _locate(self, finding: Finding, quote_spans: list[tuple[int, int]],
+                src: str) -> tuple[int | None, str]:
         """Pick the changed line the finding belongs to, or explain why there is none."""
         added = self.diff.files[finding.file].added_lines
         if quote_spans:
-            # Evidence must sit on changed code; the occurrence nearest the cited line wins.
+            # Evidence must sit on a changed line of the quote itself, never on a blank one.
+            lines = src.splitlines()
             for start, end in sorted(quote_spans, key=lambda q: abs(q[0] - finding.line)):
-                changed = [n for n in range(start, end + 1) if n in added]
+                changed = [n for n in range(start, end + 1) if n in added and lines[n - 1].strip()]
                 if changed:
                     best = min(changed, key=lambda n: abs(n - finding.line))
                     return best, f"moved to quoted line {best}"
@@ -217,7 +218,7 @@ class ClaimChecker:
         how = ""
         has_evidence = bool(quote_spans)
         if quote_spans or not f.evidence_quote:
-            line, how = self._locate(f, quote_spans)
+            line, how = self._locate(f, quote_spans, src)
         if line is None and f.evidence_quote:
             # A removed line often still exists elsewhere at head, so try the deletions too.
             left, left_how = self._locate_deleted(f, fd)

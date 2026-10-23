@@ -6,7 +6,8 @@ import hashlib
 import hmac
 import json
 import logging
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -17,6 +18,15 @@ from reviewhound.store import ReviewStore
 log = logging.getLogger(__name__)
 PR_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 MAX_BODY = 5 * 1024 * 1024
+READ_TIMEOUT_S = 10.0
+METRICS_TOKEN_ENV = "REVIEWHOUND_METRICS_TOKEN"
+ALLOWED_OWNERS_ENV = "REVIEWHOUND_ALLOWED_OWNERS"
+
+
+def allowed_owners_from(env_value: str, flags: Iterable[str]) -> frozenset[str] | None:
+    """Owners from the comma-separated env value plus --allowed-owner flags; None allows all."""
+    owners = {o.strip().lower() for o in [*env_value.split(","), *flags] if o.strip()}
+    return frozenset(owners) or None
 
 
 def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
@@ -28,14 +38,21 @@ def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
 
 def handle_event(queue: JobQueue, event: str, payload: dict[str, Any],
                  store: ReviewStore | None = None, app_id: str | None = None,
-                 delivery: str = "") -> tuple[int, str]:
+                 body_sha256: str = "",
+                 allowed_owners: frozenset[str] | None = None) -> tuple[int, str]:
     """Return (HTTP status, message). Pure so it can be tested without a socket."""
     if event == "ping":
         return 200, "pong"
+    full_name = (payload.get("repository") or {}).get("full_name")
+    if allowed_owners and isinstance(full_name, str) and \
+            full_name.split("/", 1)[0].lower() not in allowed_owners:
+        log.info("event from an owner not on the allowlist ignored",
+                 extra={"repo": full_name, "event": event})
+        return 202, "ignored: owner not allowed"
     if event in FEEDBACK_EVENTS:
         if store is None:
             return 202, f"ignored event {event}: no store"
-        return handle_feedback_event(store, event, payload, app_id, delivery)
+        return handle_feedback_event(store, event, payload, app_id, body_sha256)
     if event != "pull_request":
         return 202, f"ignored event {event}"
     action = payload.get("action")
@@ -66,11 +83,24 @@ def handle_event(queue: JobQueue, event: str, payload: dict[str, Any],
 
 def make_server(queue: JobQueue, secret: str, host: str, port: int,
                 store: ReviewStore | None = None, app_id: str | None = None,
-                metrics: Callable[[], str] | None = None) -> ThreadingHTTPServer:
+                metrics: Callable[[], str] | None = None,
+                metrics_token: str | None = None,
+                allowed_owners: frozenset[str] | None = None,
+                read_timeout_s: float = READ_TIMEOUT_S) -> ThreadingHTTPServer:
+    """`metrics_token` None reads REVIEWHOUND_METRICS_TOKEN; empty leaves /metrics open."""
     if not secret:
         raise ValueError("webhook secret is required")
+    token = os.environ.get(METRICS_TOKEN_ENV, "") if metrics_token is None else metrics_token
+    expected_auth = f"Bearer {token}".encode() if token else None
+    if metrics is not None and expected_auth is None:
+        log.warning(f"/metrics is UNAUTHENTICATED: set {METRICS_TOKEN_ENV}")
+    if not allowed_owners:
+        log.warning("no owner allowlist: events from ANY repository owner are accepted; "
+                    f"set {ALLOWED_OWNERS_ENV}")
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = read_timeout_s  # a client that stalls mid-body cannot hold a thread forever
+
         def _reply(self, status: int, message: str) -> None:
             data = json.dumps({"message": message}).encode()
             self.send_response(status)
@@ -87,6 +117,12 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int,
                         else "not found")
 
         def _metrics(self, render: Callable[[], str]) -> None:
+            if expected_auth is not None:
+                got = self.headers.get("Authorization", "").encode("utf-8", "replace")
+                if not hmac.compare_digest(got, expected_auth):
+                    log.warning("metrics request without the right bearer token")
+                    self._reply(401, "metrics need a bearer token")
+                    return
             try:
                 data = render().encode()
             except Exception as exc:  # noqa: BLE001 - a scrape failure is a 500, not a crash
@@ -121,8 +157,8 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int,
                 return
             status, message = handle_event(queue, self.headers.get("X-GitHub-Event", ""),
                                            payload if isinstance(payload, dict) else {},
-                                           store, app_id,
-                                           self.headers.get("X-GitHub-Delivery", ""))
+                                           store, app_id, hashlib.sha256(body).hexdigest(),
+                                           allowed_owners)
             self._reply(status, message)
 
         def log_message(self, format: str, *args: Any) -> None:

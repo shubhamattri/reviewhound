@@ -189,7 +189,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    from reviewhound.webhook import make_server
+    from reviewhound.webhook import ALLOWED_OWNERS_ENV, allowed_owners_from, make_server
 
     secret = os.environ.get("REVIEWHOUND_WEBHOOK_SECRET", "")
     if not secret:
@@ -197,11 +197,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     home = Path(args.home)
     queue = open_queue(home, args.database_url)
     metrics = open_metrics(home, args.database_url)
+    owners = allowed_owners_from(os.environ.get(ALLOWED_OWNERS_ENV, ""), args.allowed_owner)
     server = make_server(queue, secret, args.host, args.port,
                          store=open_store(home, args.database_url),
                          app_id=os.environ.get("REVIEWHOUND_APP_ID") or None,
                          metrics=lambda: render_prometheus(
-                             collect(queue, metrics, args.backlog_alarm_s)))
+                             collect(queue, metrics, args.backlog_alarm_s)),
+                         allowed_owners=owners)
     print(f"listening on {args.host}:{args.port}")
     server.serve_forever()
     return 0
@@ -288,6 +290,9 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("serve", help="run the webhook receiver")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8787)
+    s.add_argument("--allowed-owner", action="append", default=[],
+                   help="only accept events for repos of this owner (repeatable); "
+                        "adds to REVIEWHOUND_ALLOWED_OWNERS")
     s.set_defaults(func=cmd_serve)
 
     w = sub.add_parser("worker", help="run the review worker")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,7 @@ def clock() -> FakeClock:
 
 PG_URL = os.environ.get("REVIEWHOUND_TEST_PG", "")
 _PG_TABLES = ("jobs, reviews, findings, posts, feedback, metric_counters, comment_links, "
-              "dismissals, feedback_events")
+              "dismissals, feedback_events, review_findings")
 
 
 @pytest.fixture(params=["sqlite", "postgres"])
@@ -83,3 +84,32 @@ def make_pr(head: str = "h1", base: str = "b1", **kw: Any) -> PullRequest:
 
 def answer(*findings: dict[str, Any]) -> str:
     return json.dumps({"findings": list(findings)})
+
+
+class SpyConn:
+    """Wraps a store connection: records each statement, and can fail one that matches."""
+
+    def __init__(self, conn: Any, log: list[tuple[str, Any]], fail_on: tuple[str, ...]) -> None:
+        self._c, self._log, self._fail_on = conn, log, fail_on
+
+    def execute(self, sql: str, *a: Any, **k: Any) -> Any:
+        if any(marker in sql for marker in self._fail_on):
+            raise RuntimeError("injected failure")
+        self._log.append((sql, a[0] if a else ()))
+        return self._c.execute(sql, *a, **k)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._c, name)
+
+
+def spy(monkeypatch: pytest.MonkeyPatch, store: Any,
+        *fail_on: str) -> list[tuple[str, Any]]:
+    log: list[tuple[str, Any]] = []
+    real = store._tx
+
+    @contextmanager
+    def tx() -> Iterator[Any]:
+        with real() as c:
+            yield SpyConn(c, log, fail_on)
+    monkeypatch.setattr(store, "_tx", tx)
+    return log

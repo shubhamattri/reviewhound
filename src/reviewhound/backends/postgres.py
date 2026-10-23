@@ -18,7 +18,7 @@ from psycopg.rows import DictRow, dict_row
 
 from reviewhound.findings import Finding
 from reviewhound.queue import Job, LeaseLost, job_key
-from reviewhound.store import FEEDBACK_KINDS, ReviewRecord
+from reviewhound.store import ReviewRecord, check_kinds, review_finding_rows, upsert_order
 
 # Separate DDL lists so a later column or table is one more statement, not an edit to a blob.
 QUEUE_DDL: list[str] = [
@@ -84,6 +84,12 @@ STORE_DDL: list[str] = [
         ok INTEGER NOT NULL, error TEXT, created_at DOUBLE PRECISION NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS feedback_events (
         key TEXT PRIMARY KEY, created_at DOUBLE PRECISION NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS review_findings (
+        repo TEXT NOT NULL, pr INTEGER NOT NULL, review_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL, file TEXT NOT NULL, line INTEGER NOT NULL,
+        side TEXT NOT NULL, severity INTEGER NOT NULL, category TEXT NOT NULL,
+        evidence_quote TEXT NOT NULL, identity TEXT NOT NULL,
+        PRIMARY KEY (repo, pr, review_id, fingerprint))""",
 ]
 
 METRICS_DDL: list[str] = [
@@ -290,11 +296,15 @@ class PostgresStore(_Pg):
                  rec.cost_usd, json.dumps(rec.timings or {}), rec.error, now)).fetchone()
             if row is None:
                 raise RuntimeError("INSERT ... RETURNING returned no row")
-            new_state = "posted" if rec.posted else "stored"
-            for f in posted:
-                self._upsert(c, repo, rec.pr, rec.head_sha, f, new_state, None, now)
-            for f, reason in held:
-                self._upsert(c, repo, rec.pr, rec.head_sha, f, "held", reason, now)
+            for f, state, reason in upsert_order(rec, posted, held):
+                self._upsert(c, repo, rec.pr, rec.head_sha, f, state, reason, now)
+            rows = review_finding_rows(rec, posted)
+            if rows:
+                with c.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO review_findings (repo, pr, review_id, fingerprint, file, "
+                        "line, side, severity, category, evidence_quote, identity) VALUES "
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", rows)
             return int(row["id"])
 
     @staticmethod
@@ -330,22 +340,42 @@ class PostgresStore(_Pg):
 
     def add_feedback(self, repo: str, pr: int, fingerprint: str, kind: str,
                      detail: str = "") -> bool:
-        if kind not in FEEDBACK_KINDS:
-            raise ValueError(f"unknown feedback kind {kind!r}")
+        return self.apply_feedback("", repo, [(pr, fingerprint, kind, detail)]) == [True]
+
+    def apply_feedback(self, event_key: str, repo: str,
+                       items: list[tuple[int, str, str, str]]) -> list[bool] | None:
+        """Same contract as Store.apply_feedback: the claim and the writes commit together."""
+        check_kinds(items)
         now = self._clock()
         repo = repo.lower()
         with self._tx() as c:
-            exists = c.execute("SELECT 1 FROM findings WHERE repo=%s AND pr=%s "
-                               "AND fingerprint=%s FOR UPDATE",
-                               (repo, pr, fingerprint)).fetchone()
-            if exists is None:
-                return False
-            c.execute("INSERT INTO feedback (repo, pr, fingerprint, kind, detail, created_at) "
-                      "VALUES (%s,%s,%s,%s,%s,%s)", (repo, pr, fingerprint, kind, detail, now))
-            if kind != "reply":
-                c.execute("UPDATE findings SET state=%s, updated_at=%s WHERE repo=%s AND pr=%s "
-                          "AND fingerprint=%s", (kind, now, repo, pr, fingerprint))
-            return True
+            if event_key:
+                cur = c.execute("INSERT INTO feedback_events (key, created_at) VALUES (%s,%s) "
+                                "ON CONFLICT DO NOTHING", (event_key, now))
+                if cur.rowcount != 1:
+                    return None
+            done: list[bool] = []
+            for pr, fingerprint, kind, detail in items:
+                exists = c.execute("SELECT 1 FROM findings WHERE repo=%s AND pr=%s "
+                                   "AND fingerprint=%s FOR UPDATE",
+                                   (repo, pr, fingerprint)).fetchone()
+                done.append(exists is not None)
+                if exists is None:
+                    continue
+                c.execute("INSERT INTO feedback (repo, pr, fingerprint, kind, detail, created_at) "
+                          "VALUES (%s,%s,%s,%s,%s,%s)",
+                          (repo, pr, fingerprint, kind, detail, now))
+                if kind != "reply":
+                    c.execute("UPDATE findings SET state=%s, updated_at=%s WHERE repo=%s "
+                              "AND pr=%s AND fingerprint=%s", (kind, now, repo, pr, fingerprint))
+            return done
+
+    def posted_findings(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
+        with self._tx() as c:
+            rows = c.execute("SELECT * FROM review_findings WHERE repo=%s AND pr=%s "
+                             "AND review_id=%s ORDER BY file, line, fingerprint",
+                             (repo.lower(), pr, review_id)).fetchall()
+        return [dict(r) for r in rows]
 
     def reviews(self, repo: str, pr: int) -> list[dict[str, Any]]:
         with self._tx() as c:
@@ -382,17 +412,6 @@ class PostgresStore(_Pg):
                              "WHERE repo=%s AND comment_id = ANY(%s)",
                              (repo.lower(), list(comment_ids))).fetchall()
         return {int(r["comment_id"]): (int(r["pr"]), r["fingerprint"]) for r in rows}
-
-    def claim_event(self, key: str) -> bool:
-        """True the first time a webhook event key is seen, so a redelivery is applied once."""
-        with self._tx() as c:
-            cur = c.execute("INSERT INTO feedback_events (key, created_at) VALUES (%s,%s) "
-                            "ON CONFLICT DO NOTHING", (key, self._clock()))
-            return cur.rowcount == 1
-
-    def release_event(self, key: str) -> None:
-        with self._tx() as c:
-            c.execute("DELETE FROM feedback_events WHERE key=%s", (key,))
 
     def blocking_reviews_to_dismiss(self, repo: str, pr: int, current_post_id: str) -> list[str]:
         """Same rule as Store: only older REQUEST_CHANGES rows, not dismissed or given up."""

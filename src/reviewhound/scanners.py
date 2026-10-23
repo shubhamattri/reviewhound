@@ -15,6 +15,7 @@ from typing import Protocol
 from reviewhound.config import RepoConfig, Severity
 from reviewhound.diff import Diff
 from reviewhound.findings import Finding
+from reviewhound.procenv import child_env
 from reviewhound.vcs.base import Snapshot
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,13 @@ _JOINED = [re.compile(r""""([^"]*)"\s*(?:\+|%|\.format\()"""),
 def secret_identity(value: str) -> str:
     """Short one-way id for a secret value, so the value itself is never kept."""
     return hashlib.sha256(b"reviewhound-secret\x00" + value.encode()).hexdigest()[:16]
+
+
+def secret_identities(text: str) -> set[str]:
+    """Identity of every secret-shaped value in `text`, placeholders included."""
+    return {secret_identity(m.groupdict().get("value") or m.group(0))
+            for line in text.splitlines() for _label, pat in _SECRET_PATTERNS
+            for m in pat.finditer(line)}
 
 
 def builds_sql(text: str) -> bool:
@@ -145,7 +153,7 @@ class SemgrepScanner:
             try:
                 res = subprocess.run([self.binary, "--json", "--quiet", "--config", self.config,  # noqa: PLW1510
                                       str(root)], capture_output=True, text=True,
-                                     timeout=self.timeout_s)
+                                     timeout=self.timeout_s, env=child_env())
                 data = json.loads(res.stdout or "{}")
             except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
                 log.warning("semgrep failed", extra={"error": type(exc).__name__})
