@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from reviewhound.pipeline import Reviewer
+from reviewhound.proof import DockerRunner, LocalRunner
 from reviewhound.providers import FakeProvider, Provider, ProviderRegistry
 from reviewhound.scanners import BuiltinScanner
 from reviewhound.vcs.base import PullRequest
@@ -31,6 +32,7 @@ class CaseResult:
     misses: list[str] = field(default_factory=list)
     false_alarms: list[str] = field(default_factory=list)
     error: str = ""
+    proof_mismatches: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -56,7 +58,8 @@ class EvalReport:
         for c in self.cases:
             notes = "; ".join([*(f"miss {m}" for m in c.misses),
                                *(f"false alarm {f}" for f in c.false_alarms),
-                               *([f"error {c.error}"] if c.error else [])])
+                               *([f"error {c.error}"] if c.error else []),
+                               *c.proof_mismatches])
             rows.append(f"{c.name:<38} {c.expected:>3} {c.reported:>3} {c.true_positives:>3} "
                         f"{c.dropped_by_checker:>4}  {notes}")
         dropped = sum(c.dropped_by_checker for c in self.cases)
@@ -105,7 +108,9 @@ def run_case(case_dir: Path, provider_factory: Callable[[dict[str, Any]], Provid
                      body=spec.get("body", ""), base_sha="base", head_sha="head")
     vcs = MemoryVCS(pr, base, head)
     registry = ProviderRegistry([provider_factory(spec)])
-    reviewer = Reviewer(vcs, registry, [BuiltinScanner()], store=None, verify=verify)
+    # Eval cases are our own code, so proofs may run them locally.
+    reviewer = Reviewer(vcs, registry, [BuiltinScanner()], store=None, verify=verify,
+                        proof_runners={"local": LocalRunner(), "docker": DockerRunner()})
     try:
         result = reviewer.review(pr.repo, 1, dry_run=True)
     except Exception as exc:  # noqa: BLE001 - one broken case must not stop the run
@@ -116,12 +121,21 @@ def run_case(case_dir: Path, provider_factory: Callable[[dict[str, Any]], Provid
     posted = [(f.file, f.line, f.side)
               for f in (result.decision.post if result.decision else [])]
     tp, misses, false_alarms = score(spec["expected"], posted)
+    seen = [*result.decision.post, *(f for f, _ in result.decision.held)] \
+        if result.decision else []
+    proofs = {(f.file, f.line): f.proof for f in seen}
+    mismatches = [f"proof {e['file']}:{e['line']} expected {e['proof']} got "
+                  f"{proofs.get((e['file'], int(e['line'])))}"
+                  for e in spec.get("expected_proofs", [])
+                  if proofs.get((e["file"], int(e["line"]))) != e["proof"]]
     return CaseResult(case_dir.name, len(spec["expected"]), len(posted), tp,
-                      len(result.dropped), result.cost_usd, misses, false_alarms)
+                      len(result.dropped), result.cost_usd, misses, false_alarms,
+                      proof_mismatches=mismatches)
 
 
 def recorded_provider(spec: dict[str, Any]) -> Provider:
-    return FakeProvider([json.dumps(spec["recorded_answer"])])
+    return FakeProvider([json.dumps(spec["recorded_answer"]),
+                         *(json.dumps(a) for a in spec.get("recorded_proofs", []))])
 
 
 def run_eval(cases_root: Path, provider_factory: Callable[[dict[str, Any]], Provider]

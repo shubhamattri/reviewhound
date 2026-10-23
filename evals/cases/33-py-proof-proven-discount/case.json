@@ -1,0 +1,43 @@
+{
+  "title": "33-py-proof-proven-discount",
+  "expected": [
+    {
+      "file": "pricing.py",
+      "line": 3,
+      "category": "correctness"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "pricing.py",
+        "severity": "blocker",
+        "category": "correctness",
+        "title": "Discount divides by 10, not 100",
+        "body": "A 10% discount takes the whole price off.",
+        "evidence_quote": "return price_cents - price_cents * percent // 10",
+        "claims": [
+          {
+            "kind": "quote",
+            "file": "pricing.py",
+            "text": "price_cents * percent // 10"
+          }
+        ],
+        "line": 3
+      }
+    ]
+  },
+  "recorded_proofs": [
+    {
+      "test_path": "tests/test_reviewhound_proof.py",
+      "code": "from pricing import apply_discount\n\n\ndef test_ten_percent_off_a_thousand_cents():\n    assert apply_discount(1000, 10) == 900\n"
+    }
+  ],
+  "expected_proofs": [
+    {
+      "file": "pricing.py",
+      "line": 3,
+      "proof": "proven"
+    }
+  ]
+}

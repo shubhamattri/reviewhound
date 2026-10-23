@@ -199,8 +199,12 @@ def test_cli_app_factory_uses_installation_or_static_token(
     app = GitHubApp("1", PEM)
     monkeypatch.setattr(app, "installation_token", lambda iid: f"ghs_{iid}")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    build = _app_reviewer_factory(argparse.Namespace(home=str(tmp_path), fake_answer=None, database_url=None), app)
-    vcs = build(job(42)).vcs
+    ns = argparse.Namespace(home=str(tmp_path), fake_answer=None, database_url=None,
+                            proof_image="img:1", allow_local_proof=True)
+    build = _app_reviewer_factory(ns, app)
+    reviewer = build(job(42))
+    assert sorted(reviewer.proof_runners) == ["docker", "local"]
+    vcs = reviewer.vcs
     assert isinstance(vcs, GitHubVCS) and vcs._token() == "ghs_42"
     monkeypatch.setattr(app, "installation_for_repo", lambda repo: {"acme/shop": 77}[repo])
     vcs = build(job(None)).vcs

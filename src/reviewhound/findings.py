@@ -99,6 +99,8 @@ class Finding:
     notes: list[str] = field(default_factory=list)
     identity: str = ""  # scanner-set short hash that tells apart same-looking findings
     side: Literal["LEFT", "RIGHT"] = "RIGHT"  # LEFT: `line` is a base line this PR deleted
+    proof: Literal["proven", "not_proven", "inconclusive"] | None = None
+    proof_test: str = ""  # the generated test code, when the model produced one
 
     @property
     def fingerprint(self) -> str:

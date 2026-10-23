@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -21,6 +21,7 @@ from reviewhound.paths import language_of, matches_any
 from reviewhound.policy import PolicyDecision, apply_policy
 from reviewhound.poster import build_review, render_dry_run
 from reviewhound.prompt import build_prompt
+from reviewhound.proof import DockerRunner, Prover, SandboxRunner, run_proof_stage, select_runner
 from reviewhound.providers import ProviderError, ProviderRegistry
 from reviewhound.router import Route, route
 from reviewhound.scanners import Scanner
@@ -92,8 +93,12 @@ def not_reviewed(diff: Diff, head: Snapshot, ignore_paths: list[str]) -> list[tu
 
 class Reviewer:
     def __init__(self, vcs: VCS, registry: ProviderRegistry, scanners: list[Scanner],
-                 store: ReviewStore | None, verify: bool = True) -> None:
+                 store: ReviewStore | None, verify: bool = True,
+                 proof_runners: Mapping[str, SandboxRunner] | None = None) -> None:
         self.verify = verify  # False only for the eval baseline that measures the checker
+        # Only runners the operator hands in can run; a repo's config cannot add one.
+        self.proof_runners = proof_runners if proof_runners is not None else \
+            {"docker": DockerRunner()}
         self.vcs = vcs
         self.registry = registry
         self.scanners = scanners
@@ -176,6 +181,9 @@ class Reviewer:
         known = self.store.known_state(repo, number) if self.store else {}
         decision = apply_policy(outcome.kept + scanned, cfg.policy, known)
         result.decision = decision
+        if cfg.proof.enabled:
+            with t.stage("proof"):
+                self._prove(decision, cfg, rt, head, index, result)
         result.review = build_review(pr.head_sha, decision, diff, rt.tier, result.reviewers,
                                      not_reviewed=unseen)
         result.rendered = render_dry_run(result.review, decision)
@@ -203,6 +211,19 @@ class Reviewer:
         if done.outcome == "posted" and self.store is not None:
             after_post(self.vcs, self.store, done, cfg.policy)
         return done
+
+    def _prove(self, decision: PolicyDecision, cfg: RepoConfig, rt: Route, head: Snapshot,
+               index: CodeIndex, result: ReviewResult) -> None:
+        runner = select_runner(cfg.proof, self.proof_runners)
+        prover = Prover(self.registry, runner, cfg.proof, rt.model, rt.timeout_s) if runner \
+            else None
+        try:
+            run_proof_stage(prover, decision, cfg, head, index)
+        except Exception as exc:  # noqa: BLE001 - a proof failure never fails the review
+            log.warning("proof stage failed", extra={"pr": result.pr.number,
+                                                     "error": type(exc).__name__})
+        if prover is not None:
+            result.cost_usd += prover.cost_usd
 
     def _finish(self, result: ReviewResult, t: _Timer, posted: list[Finding],
                 held: list[tuple[Finding, str]]) -> ReviewResult:

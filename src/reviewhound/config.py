@@ -66,6 +66,21 @@ class BudgetConfig(_Strict):
     large_pr_lines: int = Field(default=600, gt=0)
 
 
+class ProofConfig(_Strict):
+    enabled: bool = False  # runs PR code: off until a repo opts in
+    min_severity: str = "blocker"
+    runner: Literal["docker", "local"] = "docker"
+    timeout_s: int = Field(default=60, gt=0, le=600)
+    max_findings: int = Field(default=3, ge=0, le=20)
+    downgrade_unproven: bool = False
+
+    @field_validator("min_severity")
+    @classmethod
+    def _valid_severity(cls, v: str) -> str:
+        Severity.parse(v)
+        return v.lower()
+
+
 class RepoConfig(_Strict):
     version: int = 1
     posting: bool = False  # shadow mode until a repo opts in
@@ -93,6 +108,7 @@ class RepoConfig(_Strict):
     tone_examples: list[str] = Field(default_factory=list)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    proof: ProofConfig = Field(default_factory=ProofConfig)
 
     @field_validator("languages")
     @classmethod

@@ -734,6 +734,25 @@ end
     },
 ]
 
+PROOF_ON = "proof:\n  enabled: true\n  runner: local\n"
+# Only blockers post here, so a blocker the proof cannot reproduce is held, not posted.
+PROOF_STRICT = ("policy:\n  min_severity_to_post: blocker\n"
+                "proof:\n  enabled: true\n  runner: local\n  downgrade_unproven: true\n")
+PRICING_BASE = '''def apply_discount(price_cents, percent):
+    return price_cents
+'''
+PRICING_HEAD = '''def apply_discount(price_cents, percent):
+    """Price after a percentage discount, in whole cents."""
+    return price_cents - price_cents * percent // 10
+'''
+CLAMP_BASE = '''def clamp(value, low, high):
+    return value
+'''
+CLAMP_HEAD = '''def clamp(value, low, high):
+    """Limit value to the closed range [low, high]."""
+    return max(low, min(value, high))
+'''
+
 CASES: list[dict[str, Any]] = [
     {
         "name": "01-py-missing-auth-guard",
@@ -1015,6 +1034,50 @@ export function percent(ratio: number): string {
         "recorded": [],
     },
     *NEW_CASES,
+    {
+        "name": "33-py-proof-proven-discount",
+        "base": {"pricing.py": PRICING_BASE, ".reviewhound.yml": PROOF_ON},
+        "head": {"pricing.py": PRICING_HEAD, ".reviewhound.yml": PROOF_ON},
+        "expected": [{"file": "pricing.py", "anchor": "percent // 10",
+                      "category": "correctness"}],
+        "recorded": [
+            {"file": "pricing.py", "anchor": "percent // 10", "severity": "blocker",
+             "category": "correctness", "title": "Discount divides by 10, not 100",
+             "body": "A 10% discount takes the whole price off.",
+             "evidence_quote": "return price_cents - price_cents * percent // 10",
+             "claims": [{"kind": "quote", "file": "pricing.py",
+                         "text": "price_cents * percent // 10"}]},
+        ],
+        "recorded_proofs": [
+            {"test_path": "tests/test_reviewhound_proof.py",
+             "code": "from pricing import apply_discount\n\n\n"
+                     "def test_ten_percent_off_a_thousand_cents():\n"
+                     "    assert apply_discount(1000, 10) == 900\n"},
+        ],
+        "expected_proofs": [{"file": "pricing.py", "anchor": "percent // 10",
+                             "proof": "proven"}],
+    },
+    {
+        "name": "34-py-proof-not-reproduced",
+        "base": {"clamp.py": CLAMP_BASE, ".reviewhound.yml": PROOF_STRICT},
+        "head": {"clamp.py": CLAMP_HEAD, ".reviewhound.yml": PROOF_STRICT},
+        "expected": [],
+        "recorded": [
+            {"file": "clamp.py", "anchor": "return max(low", "severity": "blocker",
+             "category": "correctness", "title": "clamp returns high for values below low",
+             "body": "min/max are nested the wrong way round.",
+             "evidence_quote": "return max(low, min(value, high))",
+             "claims": [{"kind": "quote", "file": "clamp.py",
+                         "text": "return max(low, min(value, high))"}]},
+        ],
+        "recorded_proofs": [
+            {"test_path": "tests/test_reviewhound_proof.py",
+             "code": "from clamp import clamp\n\n\ndef test_below_low_gives_low():\n"
+                     "    assert clamp(-5, 0, 10) == 0\n"},
+        ],
+        "expected_proofs": [{"file": "clamp.py", "anchor": "return max(low",
+                             "proof": "not_proven"}],
+    },
 ]
 
 
@@ -1056,9 +1119,14 @@ def main(root: Path = ROOT) -> None:
                 r["line"] = _line_of(_tree(case, r)[r["file"]], anchor)
             r.pop("side", None)  # the model does not say which side; the checker decides
             recorded.append(r)
-        (d / "case.json").write_text(json.dumps(
-            {"title": case["name"], "expected": expected,
-             "recorded_answer": {"findings": recorded}}, indent=2) + "\n")
+        spec: dict[str, Any] = {"title": case["name"], "expected": expected,
+                                "recorded_answer": {"findings": recorded}}
+        if "recorded_proofs" in case:
+            spec["recorded_proofs"] = case["recorded_proofs"]
+            spec["expected_proofs"] = [
+                {"file": e["file"], "line": _line_of(case["head"][e["file"]], e["anchor"]),
+                 "proof": e["proof"]} for e in case["expected_proofs"]]
+        (d / "case.json").write_text(json.dumps(spec, indent=2) + "\n")
     print(f"wrote {len(CASES)} cases to {root}")
 
 

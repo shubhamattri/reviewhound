@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0.011" timestamp="2026-10-23T21:13:06.270451+05:30" hostname="sandbox"><testcase classname="test_assertmsg" name="test_a" time="0.000"><failure message="AssertionError: explicit">def test_a():
+&gt;       raise AssertionError("explicit")
+E       AssertionError: explicit
+
+test_assertmsg.py:2: AssertionError</failure></testcase></testsuite></testsuites>

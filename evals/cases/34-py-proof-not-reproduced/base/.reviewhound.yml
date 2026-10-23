@@ -1,0 +1,6 @@
+policy:
+  min_severity_to_post: blocker
+proof:
+  enabled: true
+  runner: local
+  downgrade_unproven: true

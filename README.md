@@ -25,6 +25,7 @@ GitHub webhook ──> webhook.py ──> SQLite job queue (one job per repo + P
    │ rule scanners (built-in + Semgrep if installed): secrets, SQL joins, PII logs  │
    │ policy: severity floor, verified only, one comment per line, max comments,     │
    │         never repeat a posted or declined finding, verdict                     │
+   │ proof (opt-in): a generated pytest that must fail on the head, run in a sandbox│
    │ post (only if config says posting: true and the head did not move) or store    │
    └──────────────────────────────────────────────────────────────────────────────┘
                                         │
@@ -79,18 +80,63 @@ policy:
   drop_unverified: true
 budget:
   context_bytes_standard: 60000
+proof:                    # runs PR code: read "Proof by failing test" first
+  enabled: false
+  min_severity: blocker
+  runner: docker          # docker | local (local also needs --allow-local-proof)
+  timeout_s: 60
+  max_findings: 3
+  downgrade_unproven: false
 ```
 
 Unknown keys or bad values fail the review loudly instead of being guessed.
 
+## Proof by failing test (opt-in, runs PR code)
+
+For each posted finding that is verified, at or above `proof.min_severity`, in a Python file and
+from the model (not a scanner), Reviewhound asks the model for one pytest file that asserts the
+correct behaviour, writes the PR head plus that test into a fresh temp dir and runs it. The
+result is read from pytest's `--junitxml` report, never from its console text:
+
+- **proven**: every test failed with `AssertionError`, or with the exception the model said the
+  bug raises. Import, syntax, collection and fixture errors never count.
+- **not_proven**: the test passed. With `downgrade_unproven: true` a not-proven blocker becomes
+  major (and is held if that is below `min_severity_to_post`).
+- **inconclusive**: anything else, including a timeout, a malformed model answer, Docker not
+  running, or a runner crash. Severity is never changed.
+
+A proven finding's comment says so and carries the test in a collapsed `<details>` block. A
+proof problem never fails the review.
+
+**This executes code from the pull request.** It is off by default and the repo must turn it on
+in `.reviewhound.yml` on its base branch.
+
+- `runner: docker` (default) runs `docker run --rm --network none --read-only --memory 512m
+  --cpus 1 --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges` with a tmpfs
+  `/tmp`, the tree mounted read-only and copied to a writable dir inside the container. The
+  stock `python:3.12-slim` image has no pytest; pass `--proof-image` with an image that does.
+  When the Docker daemon is not reachable the proof is inconclusive ("docker unavailable").
+- `runner: local` is a plain subprocess with an allowlisted environment (no tokens, `HOME` in
+  the temp dir), CPU, file-size and (on Linux) address-space limits, and its process group
+  killed on timeout. It is **not a sandbox**. A repo's config cannot enable it alone: the
+  operator must also start Reviewhound with `--allow-local-proof`. Use it only for repos whose
+  every PR author you would let run code on the machine.
+- With `downgrade_unproven: true`, PR code can influence a finding's severity (a test that
+  passes downgrades it). Keep it off for repos with untrusted authors.
+
+TypeScript proofs are not built yet (next: a vitest or jest runner behind the same interface).
+
 ## Evals
 
-`evals/build_cases.py` writes `evals/cases/*`: 32 small PRs (Python, TypeScript, JavaScript, Go
+`evals/build_cases.py` writes `evals/cases/*`: 34 small PRs (Python, TypeScript, JavaScript, Go
 and one Ruby file) with seeded bugs, six clean PRs, expected findings, and a recorded model
 answer that includes deliberate hallucinations (invented helpers, `Owner.member` names that do
 not exist, quotes that do not exist, bugs in unchanged code, false "missing guard" claims). Two
 cases put the bug on a line the PR deleted, and one has two secrets on identically shaped lines.
 Any prompt or checker change must not lower precision on this set.
+Cases 33 and 34 turn proof on (local runner, recorded proof tests): 33 must be proven, 34 is a
+false blocker whose test passes, so it is downgraded and held. The eval reports any case whose
+proof verdict differs from `expected_proofs`.
 
 ## Install as a GitHub App
 
@@ -144,9 +190,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md). Licensed un
 
 ## Not in milestone 1
 
-- Proof by generated failing test in a sandbox (milestone 2).
+- Proof by generated failing test: done in milestone 4, see "Proof by failing test".
 - Feedback from GitHub events and App installation tokens: done in milestone 3, see
   "Install as a GitHub App".
-- Comments on deleted lines; findings must sit on lines the PR added.
+- Comments on deleted lines: done in milestone 5 (posted on the LEFT side).
 - A post that times out is recorded as `post-uncertain` and not retried, so it may be missing
   or present on GitHub; nothing posts it twice automatically.

@@ -16,6 +16,7 @@ from reviewhound.backends import open_metrics, open_queue, open_store
 from reviewhound.evals import run_eval
 from reviewhound.metrics import BacklogAlarm, collect, render_prometheus, render_stats
 from reviewhound.pipeline import Reviewer
+from reviewhound.proof import DockerRunner, LocalRunner, SandboxRunner
 from reviewhound.providers import ClaudeCliProvider, FakeProvider, Provider, ProviderRegistry
 from reviewhound.queue import Job
 from reviewhound.scanners import BuiltinScanner, Scanner, SemgrepScanner
@@ -69,7 +70,15 @@ def _reviewer(args: argparse.Namespace, with_store: bool) -> Reviewer:
     home.mkdir(parents=True, exist_ok=True)
     vcs = GitHubVCS(_github_token(args.gh_user), home / "checkouts")
     store = open_store(home, args.database_url) if with_store else None
-    return Reviewer(vcs, _registry(args), [BuiltinScanner(), SemgrepScanner()], store)
+    return Reviewer(vcs, _registry(args), [BuiltinScanner(), SemgrepScanner()], store,
+                    proof_runners=_proof_runners(args))
+
+
+def _proof_runners(args: argparse.Namespace) -> dict[str, SandboxRunner]:
+    runners: dict[str, SandboxRunner] = {"docker": DockerRunner(image=args.proof_image)}
+    if args.allow_local_proof:  # runs PR code on this machine: trusted repos only
+        runners["local"] = LocalRunner()
+    return runners
 
 
 def _github_app() -> GitHubApp | None:
@@ -93,12 +102,13 @@ def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp) -> Callable[
     store = open_store(home, args.database_url)
     registry = _registry(args)
     scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner()]
+    runners = _proof_runners(args)
     client = httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
 
     def build(job: Job) -> Reviewer:
         # With an App every job uses an installation token, looked up by repo when missing.
         vcs = GitHubVCS(token_for_job(app, job, lambda: ""), home / "checkouts", client=client)
-        return Reviewer(vcs, registry, scanners, store)
+        return Reviewer(vcs, registry, scanners, store, proof_runners=runners)
     return build
 
 
@@ -205,6 +215,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="postgresql://... (default: $REVIEWHOUND_DATABASE_URL, else SQLite in --home)")
     p.add_argument("--backlog-alarm-s", type=float, default=600.0,
                    help="queued jobs older than this count as stuck")
+    p.add_argument("--allow-local-proof", action="store_true",
+                   help="let repos with proof.runner: local run generated tests on this machine")
+    p.add_argument("--proof-image", default="python:3.12-slim",
+                   help="docker image for proof runs; it must have pytest installed")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("review", help="review one PR")

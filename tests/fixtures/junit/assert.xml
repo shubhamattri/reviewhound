@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0.012" timestamp="2026-10-23T21:13:06.017647+05:30" hostname="sandbox"><testcase classname="test_assert" name="test_a" time="0.000"><failure message="AssertionError: assert 1 == 2&#10; +  where 1 = f({'a': 1})">def test_a():
+&gt;       assert f({"a": 1}) == 2
+E       AssertionError: assert 1 == 2
+E        +  where 1 = f({'a': 1})
+
+test_assert.py:3: AssertionError</failure></testcase></testsuite></testsuites>
