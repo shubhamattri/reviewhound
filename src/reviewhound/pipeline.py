@@ -333,6 +333,9 @@ class Reviewer:
             self._read_back(pr, result)
             return
         held = self.store.post_claim(pr.repo, pr.number, pr.head_sha)
+        if held is None and self.store.claim_post(pr.repo, pr.number, pr.head_sha):
+            self._post(pr, result, should_post)  # the other run freed it in between
+            return
         if held is not None and held[0]:
             result.outcome = "already-posted"
             return
@@ -365,10 +368,26 @@ class Reviewer:
         event = EVENTS.get(landed.state, landed.state)
         log.warning("review already on GitHub; adopting it", extra={
             "pr": pr.number, "head": pr.head_sha, "post_id": landed.id})
-        self._mark_posted(pr, landed.id, event, result.blockers)
         result.outcome, result.post_id, result.error = "posted", landed.id, ADOPTED
         result.posted_event = event
         self._read_back(pr, result)
+        # Only blockers GitHub shows a comment for: this run's answer may differ from that post's.
+        on = {(c.path, c.side, c.line) for c in result.read_back or []}
+        shown = {f.fingerprint for f in (result.decision.post if result.decision else [])
+                 if (f.file, f.side, f.line) in on}
+        result.blockers = [b for b in result.blockers if b.fingerprint in shown]
+        self._mark_posted(pr, landed.id, event, result.blockers)
+
+    def _resolve_uncertain(self, pr: PullRequest, result: ReviewResult) -> None:
+        """After a POST that may have landed, ask GitHub once: adopt it if it is there."""
+        try:
+            landed = self._landed_review(pr)
+        except Exception as exc:  # noqa: BLE001 - stays post-uncertain, as before this check
+            log.warning("could not check GitHub after an uncertain post",
+                        extra={"pr": pr.number, "error": type(exc).__name__})
+            return
+        if landed is not None:
+            self._adopt(pr, result, landed)
 
     def _read_back(self, pr: PullRequest, result: ReviewResult) -> None:
         """The landed review's comments. On failure none: its findings stay `stored`, unlinked."""
@@ -433,6 +452,7 @@ class Reviewer:
                     result.outcome = "post-uncertain"  # it may have landed
                     result.error = str(exc) if isinstance(exc, GitHubError) else \
                         type(exc).__name__
+                    self._resolve_uncertain(pr, result)
                     return
                 claim.keep = False  # GitHub refused it: nothing landed
                 status = exc.status if isinstance(exc, GitHubError) else None

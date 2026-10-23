@@ -112,6 +112,7 @@ STORE_DDL: list[str] = [
         category TEXT NOT NULL, evidence_quote TEXT NOT NULL, identity TEXT NOT NULL,
         PRIMARY KEY (repo, pr, review_id, fingerprint))""",
     "ALTER TABLE review_blockers ADD COLUMN IF NOT EXISTS deleted_text TEXT",
+    "ALTER TABLE review_blockers ADD COLUMN IF NOT EXISTS deleted_kept INTEGER",
 ]
 
 METRICS_DDL: list[str] = [
@@ -359,8 +360,8 @@ class PostgresStore(_Pg):
                 if brows:
                     cur.executemany(
                         "INSERT INTO review_blockers (repo, pr, review_id, fingerprint, file, "
-                        "side, category, evidence_quote, identity, deleted_text) VALUES "
-                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
+                        "side, category, evidence_quote, identity, deleted_text, deleted_kept) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
             return int(row["id"])
         return self._write(body)
 
@@ -433,8 +434,8 @@ class PostgresStore(_Pg):
                 with c.cursor() as cur:
                     cur.executemany(
                         "INSERT INTO review_blockers (repo, pr, review_id, fingerprint, file, "
-                        "side, category, evidence_quote, identity, deleted_text) VALUES "
-                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
+                        "side, category, evidence_quote, identity, deleted_text, deleted_kept) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
         self._write(body)
 
     def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> tuple[str, str] | None:
@@ -451,7 +452,8 @@ class PostgresStore(_Pg):
     def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
         with self._tx() as c:
             rows = c.execute("SELECT fingerprint, file, side, category, evidence_quote, identity, "
-                             "COALESCE(deleted_text, '') AS deleted_text "
+                             "COALESCE(deleted_text, '') AS deleted_text, "
+                             "COALESCE(deleted_kept, 0) AS deleted_kept "
                              "FROM review_blockers WHERE repo=%s AND pr=%s AND review_id=%s "
                              "ORDER BY file, fingerprint", (repo.lower(), pr, review_id)).fetchall()
         return [dict(r) for r in rows]

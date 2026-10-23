@@ -99,7 +99,6 @@ def parse_patch(path: str, patch: str, status: str = "modified",
     fd = FileDiff(path=path, old_path=old_path, status=status, patch=patch)
     hunk: Hunk | None = None
     new_line = old_line = 0
-    prev_deleted = last_deleted = False
     for raw in patch.splitlines():
         m = _HUNK_RE.match(raw)
         if m:
@@ -108,11 +107,9 @@ def parse_patch(path: str, patch: str, status: str = "modified",
             hunk = Hunk(new_start=new_start, new_count=new_count, old_start=int(m.group(1)))
             fd.hunks.append(hunk)
             new_line, old_line = new_start, hunk.old_start
-            last_deleted = False
             continue
         if hunk is None or raw.startswith("\\"):
             continue
-        prev_deleted, last_deleted = last_deleted, raw.startswith("-")
         if raw.startswith("-") and raw[1:].strip():
             # "+N,0" names the line before an empty head range, so the deletion follows it.
             at = new_line if hunk.new_count else hunk.new_start + 1
@@ -123,7 +120,7 @@ def parse_patch(path: str, patch: str, status: str = "modified",
             new_line += 1
         elif raw.startswith("-"):
             at = new_line if hunk.new_count else hunk.new_start + 1
-            if prev_deleted and hunk.runs and hunk.runs[-1][0] == at:
+            if hunk.runs and hunk.runs[-1][0] == at:  # only consecutive deletions share `at`
                 hunk.runs[-1][1].append(old_line)
             else:
                 hunk.runs.append((at, [old_line]))

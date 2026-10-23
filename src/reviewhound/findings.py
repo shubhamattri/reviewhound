@@ -102,6 +102,7 @@ class Finding:
     proof: Literal["proven", "not_proven", "inconclusive"] | None = None
     proof_test: str = ""  # the generated test code, when the model produced one
     deleted_text: str = ""  # LEFT or beside a deletion: the deleted run, gone once restored
+    deleted_kept: int = 0  # copies of deleted_text the file still had at this head
 
     @property
     def fingerprint(self) -> str:

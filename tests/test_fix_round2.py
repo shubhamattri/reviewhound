@@ -633,7 +633,7 @@ def test_blocker_changed_by_a_proof_is_still_dismissed_once_gone(
     assert (first.outcome, first.review.event) == ("posted", "REQUEST_CHANGES")  # type: ignore
     assert store.review_blockers(REPO, PR, "memory-review-1") == [{
         "fingerprint": FP, "file": "app/admin.py", "side": "RIGHT", "category": "auth",
-        "evidence_quote": "db.delete(uid)", "identity": "", "deleted_text": ""}]
+        "evidence_quote": "db.delete(uid)", "identity": "", "deleted_text": "", "deleted_kept": 0}]
     push(vcs, "h2", FIXED)
     _proof_on(vcs)
     assert reviewer.review(REPO, PR, dry_run=False).outcome == "posted"
@@ -672,7 +672,7 @@ def test_blockers_are_written_only_for_a_posted_review_with_an_id(backend: Backe
     assert store.review_blockers(REPO, PR, "") == []
     assert store.review_blockers("ACME/shop", PR, "r1") == [{
         "fingerprint": "fp1", "file": "a.py", "side": "RIGHT", "category": "auth",
-        "evidence_quote": "do_it(x)", "identity": "", "deleted_text": ""}]
+        "evidence_quote": "do_it(x)", "identity": "", "deleted_text": "", "deleted_kept": 0}]
     assert store.review_blockers(REPO, 8, "r1") == []
 
 

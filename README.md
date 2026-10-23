@@ -157,6 +157,30 @@ Cases 33 and 34 turn proof on (local runner, recorded proof tests): 33 must be p
 false blocker whose test passes, so it is downgraded and held. The eval reports any case whose
 proof verdict differs from `expected_proofs`.
 
+### Accuracy: two different numbers
+
+- **Replayed-answer eval** (`reviewhound eval`): the model's answers are recorded, so this
+  measures the claim checker and policy only. It reads `precision 1.00, recall 1.00` on 36
+  cases. That is a regression test for the checker, **not** the tool's accuracy: the recorded
+  answers were written with the seeded bugs in mind.
+- **Live eval** (`reviewhound eval --live`): asks the real model on the same cases, so it
+  measures model plus checker. This is the number to quote.
+
+  LIVE-EVAL-RESULT
+
+### Alternative fair anchors
+
+A few bugs can fairly be flagged on more than one line. An expected finding may list `also`
+anchors; a report on any of them counts, and each expected finding matches **once only**, so
+reporting both anchors gives one true positive and one false alarm. Three cases use it:
+
+- **24 (Go response body not closed):** the leak can be flagged where the response is opened
+  or where its body is read without being closed.
+- **29 (Python role check removed):** the guard is gone, so it can be flagged on the deleted
+  line (LEFT) or on the head line right after the gap.
+- **32 (Go deferred unlock removed):** same shape: the deleted `defer` line, or the `Lock()`
+  line it used to follow.
+
 ## Install as a GitHub App
 
 Running as an App means each repo is reviewed with a short-lived installation token instead
@@ -212,18 +236,55 @@ How one posting job ends:
 | What happened | Review outcome | Job | Head claim |
 |---|---|---|---|
 | Posted (or posted with comments moved into the body after a 400/422) | `posted` | done | kept, with the review id |
+| Before each POST, GitHub already shows our review of this head (an earlier run crashed after posting) | `posted` (adopted: not posted again; only findings GitHub shows are marked posted) | done | kept, with that review's id |
 | PR head moved, checked right before each POST | `head-moved` | done | freed |
 | Lease lost, checked right before each POST | `lease-lost` | retried | freed |
+| Another run holds the claim with no id, younger than one queue lease, nothing on GitHub | `claim-busy` | retried once the claim can be stale | the other run's |
+| Another run's claim with no id is older than one queue lease | taken over; the GitHub check runs before the POST | as for a normal post | this run's |
 | 400/422 again after the body retry | `post-rejected` | dead, with GitHub's reason | freed |
-| 401, 403, 408 on the POST | (raised) | retried | freed |
+| 401, 403, 408, 429 on the POST | (raised) | retried | freed |
 | 404 or another 4xx on the POST | (raised) | dead | freed |
-| 429, 5xx, timeout: it may have landed | `post-uncertain` | done | kept, never posted twice |
+| 5xx, timeout: it may have landed | `post-uncertain` | done | kept, never posted twice |
 | Anything raised before the POST (token lookup, head lookup) | (raised) | by error class | freed |
 | Posted, but recording it failed | (raised) | retried; before any model call the retry records the post with the verdict that was posted, then finishes the follow-ups (outcome `recovered`) without posting again | kept |
 
 Known limit: a resolve event redelivered byte for byte after an unresolve of the same thread is
 treated as already applied, so the finding stays `reopened`. GitHub sends a fresh body (new
 timestamps) for a real second resolve, so this needs a manual redelivery to happen.
+
+## Open risks
+
+Known gaps that remain after fix round 4, in plain words:
+
+- **An uncertain post is not chased.** A POST that times out or gets a 5xx is recorded as
+  `post-uncertain`, its findings as posted, and the job ends. If it did not land, that head has
+  no review until the next push.
+- **The GitHub check trusts what GitHub lists.** If GitHub accepted a review but does not list
+  it yet, a run that took over a stale claim could post a second one.
+- **Unknown account.** When the token cannot say which account it is (`GET /user` failed), any
+  author's review of this head whose body starts with "Reviewhound (" counts as ours.
+- **A stalled worker.** If a worker freezes for longer than one queue lease and then wakes right
+  before its POST, another run may already have taken over its claim; both could post.
+- **A busy claim uses up attempts.** Each `claim-busy` retry counts as an attempt; with a very
+  short lease and many retries a job can go dead (its error says why).
+- **Adopted or recovered reviews use this run's answer.** The verdict, id and comments come from
+  GitHub, but the blockers and the finding list come from this run's model answer. A comment
+  GitHub shows that matches none of them stays unlinked (logged), so replies to it are ignored.
+- **Recording can fail twice.** If saving the post id and saving the review both fail after a
+  POST, the next run finds the review on GitHub and adopts it; with a VCS that cannot list
+  reviews it would not.
+- **Dismissal is evidence based but narrow.** A blocker's quote that only survives in an ignored,
+  non-indexed or past-the-5,000-file-cap file counts as gone. A removed-guard blocker counts as
+  fixed only when the same deleted lines come back in the same file; an equivalent fix written
+  differently keeps the old verdict.
+- **Findings next to a deletion need a true claim.** A real removed-guard finding without a
+  confirming claim is held as unverified; whether the live model supplies one is measured by
+  the live eval, not assumed.
+- **Docker proofs and budget.** `--max-proof-seconds` below about 116 s disables Docker proofs
+  (warned at start). The `claude` child gets no proxy or CA variables. Header bytes trickled
+  slowly can still hold a webhook thread.
+- **Byte-identical resolve redelivery** after an unresolve is treated as already applied (see
+  the known limit above).
 
 ## Contributing and roadmap
 
@@ -236,4 +297,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md). Licensed un
   "Install as a GitHub App".
 - Comments on deleted lines: done in milestone 5 (posted on the LEFT side).
 - A post that times out is recorded as `post-uncertain` and not retried, so it may be missing
-  or present on GitHub; nothing posts it twice automatically.
+  or present on GitHub; nothing posts it twice automatically. A later run for that head checks
+  GitHub first and adopts the review if it is there.

@@ -157,7 +157,7 @@ def open_reason(row: Mapping[str, Any], head: Snapshot, changed: list[str],
     path, quote = str(row["file"]), str(row["evidence_quote"])
     deleted = str(row.get("deleted_text") or "")
     if deleted:
-        return _still_deleted(path, deleted, head)
+        return _still_deleted(path, deleted, int(row.get("deleted_kept") or 0), head)
     if row["side"] == "LEFT":
         return "a deleted-line finding cannot be shown gone"
     secret = row["category"] == "secret" and bool(row["identity"])
@@ -181,7 +181,8 @@ def open_reason(row: Mapping[str, Any], head: Snapshot, changed: list[str],
     return None
 
 
-def _still_deleted(path: str, deleted: str, head: Snapshot) -> str | None:
+def _still_deleted(path: str, deleted: str, kept: int, head: Snapshot) -> str | None:
+    """Back means more copies of the deleted code than the file kept when it was flagged."""
     if not is_meaningful(deleted):
         return "the deleted code is too short to look for"
     src = head.read(path)
@@ -189,7 +190,7 @@ def _still_deleted(path: str, deleted: str, head: Snapshot) -> str | None:
         skip = head.skip_reason(path)
         return f"{path} could not be read at head ({skip})" if skip else \
             f"{path} is not in the head"
-    if find_quote(src, deleted):
+    if len(find_quote(src, deleted)) > kept:
         return None
     return f"the code this PR deleted is still missing from {path}"
 

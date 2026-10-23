@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS review_findings (
 CREATE TABLE IF NOT EXISTS review_blockers (
     repo TEXT NOT NULL, pr INTEGER NOT NULL, review_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
     file TEXT NOT NULL, side TEXT NOT NULL, category TEXT NOT NULL,
-    evidence_quote TEXT NOT NULL, identity TEXT NOT NULL, deleted_text TEXT,
+    evidence_quote TEXT NOT NULL, identity TEXT NOT NULL, deleted_text TEXT, deleted_kept INTEGER,
     PRIMARY KEY (repo, pr, review_id, fingerprint)
 );
 """
@@ -109,18 +109,19 @@ class Blocker:
     evidence_quote: str
     identity: str
     deleted_text: str = ""  # a removed-guard blocker is gone once this text is back
+    deleted_kept: int = 0  # copies of it the file still had, so another copy is not "back"
 
     @classmethod
     def of(cls, f: Finding) -> Blocker:
         return cls(f.fingerprint, f.file, f.side, f.category, f.evidence_quote, f.identity,
-                   f.deleted_text)
+                   f.deleted_text, f.deleted_kept)
 
 
 def blocker_rows(rec: ReviewRecord, blockers: Sequence[Blocker]) -> list[tuple[Any, ...]]:
     if rec.outcome != "posted" or not rec.post_id:
         return []
     return [(rec.repo.lower(), rec.pr, rec.post_id, b.fingerprint, b.file, b.side, b.category,
-             b.evidence_quote, b.identity, b.deleted_text) for b in blockers]
+             b.evidence_quote, b.identity, b.deleted_text, b.deleted_kept) for b in blockers]
 
 
 def upsert_order(rec: ReviewRecord, posted: list[Finding], held: list[tuple[Finding, str]],
@@ -225,6 +226,8 @@ class Store:
             cols = {r["name"] for r in c.execute("PRAGMA table_info(review_blockers)")}
             if "deleted_text" not in cols:
                 c.execute("ALTER TABLE review_blockers ADD COLUMN deleted_text TEXT")
+            if "deleted_kept" not in cols:
+                c.execute("ALTER TABLE review_blockers ADD COLUMN deleted_kept INTEGER")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -268,8 +271,8 @@ class Store:
                           "file, line, side, severity, category, evidence_quote, identity) "
                           "VALUES (?,?,?,?,?,?,?,?,?,?,?)", review_finding_rows(rec, posted))
             c.executemany("INSERT OR IGNORE INTO review_blockers (repo, pr, review_id, fingerprint, "
-                          "file, side, category, evidence_quote, identity, deleted_text) "
-                          "VALUES (?,?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
+                          "file, side, category, evidence_quote, identity, deleted_text, deleted_kept) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
             return int(cur.lastrowid or 0)
 
     @staticmethod
@@ -331,8 +334,8 @@ class Store:
                       "SET post_id=excluded.post_id, event=excluded.event",
                       (repo.lower(), pr, head_sha, self._clock(), post_id, event))
             c.executemany("INSERT OR IGNORE INTO review_blockers (repo, pr, review_id, fingerprint, "
-                          "file, side, category, evidence_quote, identity, deleted_text) "
-                          "VALUES (?,?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
+                          "file, side, category, evidence_quote, identity, deleted_text, deleted_kept) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
 
     def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> tuple[str, str] | None:
         """(review id, event) of a post that landed for this head with no posted review record."""
@@ -347,7 +350,8 @@ class Store:
     def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
         with self._tx() as c:
             rows = c.execute("SELECT fingerprint, file, side, category, evidence_quote, identity, "
-                             "COALESCE(deleted_text, '') AS deleted_text "
+                             "COALESCE(deleted_text, '') AS deleted_text, "
+                             "COALESCE(deleted_kept, 0) AS deleted_kept "
                              "FROM review_blockers WHERE repo=? AND pr=? AND review_id=? "
                              "ORDER BY file, fingerprint", (repo.lower(), pr, review_id)).fetchall()
         return [dict(r) for r in rows]

@@ -266,6 +266,8 @@ class ClaimChecker:
                     how = f"anchored on context line {line}, next to lines this PR deleted"
         if line is None:
             return f, how
+        if f.deleted_text:
+            f.deleted_kept = len(find_quote(src, f.deleted_text))
         if line != f.line or f.side == "LEFT" or beside_deletion:
             f.notes.append(how)
             f.line = line

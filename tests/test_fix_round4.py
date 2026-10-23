@@ -483,12 +483,13 @@ def test_left_and_beside_findings_carry_the_deleted_run_and_others_do_not() -> N
 
 def test_blocker_deleted_text_is_stored_and_read_back(backend: Backend) -> None:
     store = backend.store()
-    b = Blocker("fp1", "a.py", "RIGHT", "auth", "do_it(x)", "", "guard(x)")
+    b = Blocker("fp1", "a.py", "RIGHT", "auth", "do_it(x)", "", "guard(x)", 2)
     store.mark_posted(REPO, PR, H1, "r1", "REQUEST_CHANGES", [b])
     store.record_review(ReviewRecord(repo=REPO, pr=PR, head_sha="h2", outcome="posted",
                                      post_id="r2", posted=True), [], [], [b])
     want = {"fingerprint": "fp1", "file": "a.py", "side": "RIGHT", "category": "auth",
-            "evidence_quote": "do_it(x)", "identity": "", "deleted_text": "guard(x)"}
+            "evidence_quote": "do_it(x)", "identity": "", "deleted_text": "guard(x)",
+            "deleted_kept": 2}
     assert store.review_blockers(REPO, PR, "r1") == [want]
     assert store.review_blockers(REPO, PR, "r2") == [want]
 
@@ -508,10 +509,12 @@ def test_old_sqlite_review_blockers_table_gets_the_deleted_text_column(tmp_path:
     c.commit()
     c.close()
     store = Store(path)
-    assert store.review_blockers(REPO, PR, "r0")[0]["deleted_text"] == ""
+    old = store.review_blockers(REPO, PR, "r0")[0]
+    assert (old["deleted_text"], old["deleted_kept"]) == ("", 0)
     store.mark_posted(REPO, PR, H1, "r1", "REQUEST_CHANGES",
-                      [Blocker("fp1", "a.py", "LEFT", "auth", "q", "", "guard(x)")])
-    assert store.review_blockers(REPO, PR, "r1")[0]["deleted_text"] == "guard(x)"
+                      [Blocker("fp1", "a.py", "LEFT", "auth", "q", "", "guard(x)", 1)])
+    new = store.review_blockers(REPO, PR, "r1")[0]
+    assert (new["deleted_text"], new["deleted_kept"]) == ("guard(x)", 1)
 
 
 def test_old_postgres_review_blockers_table_gets_the_deleted_text_column(backend: Backend) -> None:
@@ -526,10 +529,12 @@ def test_old_postgres_review_blockers_table_gets_the_deleted_text_column(backend
         c.execute("INSERT INTO review_blockers VALUES ('acme/shop', 7, 'r0', 'fp0', 'a.py', "
                   "'RIGHT', 'auth', 'q', '')")
     store = backend.store()
-    assert store.review_blockers(REPO, PR, "r0")[0]["deleted_text"] == ""
+    old = store.review_blockers(REPO, PR, "r0")[0]
+    assert (old["deleted_text"], old["deleted_kept"]) == ("", 0)
     store.mark_posted(REPO, PR, H1, "r1", "REQUEST_CHANGES",
-                      [Blocker("fp1", "a.py", "LEFT", "auth", "q", "", "guard(x)")])
-    assert store.review_blockers(REPO, PR, "r1")[0]["deleted_text"] == "guard(x)"
+                      [Blocker("fp1", "a.py", "LEFT", "auth", "q", "", "guard(x)", 1)])
+    new = store.review_blockers(REPO, PR, "r1")[0]
+    assert (new["deleted_text"], new["deleted_kept"]) == ("guard(x)", 1)
 
 
 def removed_guard_row(side: str = "RIGHT", deleted: str = '    require_role(request, "support")'
@@ -825,3 +830,118 @@ def test_app_bot_login_refuses_a_malformed_answer(body: Any) -> None:
                           base_url="https://api.github.com")
     with pytest.raises(GitHubError, match="malformed app response"):
         GitHubApp("123", PEM, client=client).bot_login()
+
+
+# --- review fixes: a second copy of the guard, adopted blockers, uncertain posts, a freed claim --
+
+TWO_GUARDS_BASE = GUARD_BASE + ('\n\ndef refund_order(request, order_id):\n'
+                                '    require_role(request, "support")\n'
+                                '    orders.refund(order_id)\n')
+TWO_GUARDS_HEAD = TWO_GUARDS_BASE.replace('    require_role(request, "support")\n', "", 1)
+
+
+def test_a_copy_the_file_kept_is_counted_when_the_finding_is_made() -> None:
+    base, head = {"app/orders.py": TWO_GUARDS_BASE}, {"app/orders.py": TWO_GUARDS_HEAD}
+    c = ClaimChecker(diff_file_maps(base, head), CodeIndex.build(head), base_reader=base.get)
+    beside, _ = c.check(mfind(claims=[NOT_CALLS]), "m")
+    left, _ = c.check(mfind(evidence_quote=GUARD, claims=[NOT_CALLS]), "m")
+    assert (beside.deleted_kept, left.deleted_kept) == (1, 1)
+    plain, _ = guard_checker().check(mfind(claims=[NOT_CALLS]), "m")
+    assert plain.deleted_kept == 0
+
+
+@pytest.mark.parametrize("head, reason", [
+    (TWO_GUARDS_HEAD, "the code this PR deleted is still missing from app/orders.py"),
+    (TWO_GUARDS_BASE, None),
+])
+def test_a_copy_of_the_guard_elsewhere_in_the_file_is_not_a_restore(
+        head: str, reason: str | None) -> None:
+    row = {**removed_guard_row(), "deleted_kept": 1}
+    files = {"app/orders.py": head}
+    assert open_reason(row, DictSnapshot(files), [], files) == reason
+
+
+def test_verdict_on_one_of_two_guards_is_kept_while_that_guard_is_missing(
+        backend: Backend) -> None:
+    finding = {"file": "app/orders.py", "line": 5, "severity": "blocker", "category": "auth",
+               "title": "role check removed", "body": "b",
+               "evidence_quote": "orders.cancel(order_id)", "claims": [NOT_CALLS]}
+    vcs = MemoryVCS(make_pr(head=H1), {"app/orders.py": TWO_GUARDS_BASE, **CFG},
+                    {"app/orders.py": TWO_GUARDS_HEAD, **CFG})
+    store = backend.store()
+    reviewer = Reviewer(vcs, ProviderRegistry([FakeProvider([answer(finding), answer()])]), [],
+                        store)
+    assert reviewer.review(REPO, PR, dry_run=False).outcome == "posted"
+    assert store.review_blockers(REPO, PR, "memory-review-1")[0]["deleted_kept"] == 1
+    vcs.pr = make_pr(head="h2")
+    vcs.head = {"app/orders.py": TWO_GUARDS_HEAD + "\n\ndef noop():\n    pass\n", **CFG}
+    vcs.head_sha_now = "h2"
+    assert reviewer.review(REPO, PR, dry_run=False).outcome == "posted"
+    assert vcs.dismissed == []
+
+
+def test_adopted_review_keeps_only_the_blockers_github_shows(backend: Backend) -> None:
+    vcs, reviewer, store = rig(backend, [answer(REAL, SECOND)])
+    vcs.posted.append(landed([ReviewComment(path="app/admin.py", line=12, body="x")]))
+    result = reviewer.review(REPO, PR, dry_run=False)
+    assert result.error == ADOPTED
+    second = next(f["fingerprint"] for f in store.findings(REPO, PR) if f["line"] == 12)
+    assert [b["fingerprint"] for b in store.review_blockers(REPO, PR, "memory-review-1")] == [
+        second]
+
+
+def test_adopted_review_with_no_comments_keeps_no_blockers(backend: Backend) -> None:
+    vcs, reviewer, store = rig(backend, [answer(REAL, SECOND)])
+    vcs.posted.append(landed([]))
+    reviewer.review(REPO, PR, dry_run=False)
+    assert store.review_blockers(REPO, PR, "memory-review-1") == []
+
+
+def test_uncertain_post_that_landed_is_adopted_at_once(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = rig(backend, [answer(REAL)])
+    real = vcs.post_review
+
+    def lands_then_times_out(pr: PullRequest, review: ReviewPayload) -> str:
+        real(pr, review)
+        raise TimeoutError("socket")
+    monkeypatch.setattr(vcs, "post_review", lands_then_times_out)
+    result = reviewer.review(REPO, PR, dry_run=False)
+    assert (result.outcome, result.post_id, result.error) == ("posted", "memory-review-1", ADOPTED)
+    assert store.post_claim(REPO, PR, H1)[0] == "memory-review-1"  # type: ignore[index]
+    assert states(store) == {11: "posted"}
+
+
+def test_uncertain_post_stays_uncertain_when_github_cannot_be_asked(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    vcs, reviewer, store = rig(backend, [answer(REAL)], FakeClock())
+    scripted_posts(vcs, monkeypatch, TimeoutError("socket"))
+    lists = iter([[], GitHubError("GET /reviews -> HTTP 502", 502)])
+
+    def list_reviews(repo: str, number: int) -> list[PostedReview]:
+        nxt = next(lists)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+    monkeypatch.setattr(vcs, "list_reviews", list_reviews)
+    caplog.set_level(logging.WARNING, logger="reviewhound.pipeline")
+    result = reviewer.review(REPO, PR, dry_run=False)
+    assert (result.outcome, result.error) == ("post-uncertain", "TimeoutError")
+    assert store.post_claim(REPO, PR, H1) == ("", 0.0)  # kept: it may have landed
+    assert "could not check GitHub after an uncertain post" in [r.msg for r in caplog.records]
+
+
+def test_claim_freed_by_the_other_run_in_between_is_claimed_and_posted(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = rig(backend, [answer(REAL)])
+    real = store.claim_post
+    calls: list[str] = []
+
+    def claim(repo: str, pr: int, head: str) -> bool:
+        calls.append(head)
+        return False if len(calls) == 1 else real(repo, pr, head)  # held, then freed
+    monkeypatch.setattr(store, "claim_post", claim)
+    result = reviewer.review(REPO, PR, dry_run=False)
+    assert (result.outcome, result.post_id, len(vcs.posted)) == ("posted", "memory-review-1", 1)
+    assert calls == [H1, H1]
