@@ -771,6 +771,54 @@ def test_app_bot_login_is_its_slug_looked_up_once() -> None:
     assert calls == ["/app"]
 
 
+# --- wiring: the worker's stale threshold is its queue lease; the App posts as its bot ----------
+
+def _args(tmp_path: Any) -> Any:
+    import argparse
+    return argparse.Namespace(home=str(tmp_path), gh_user=None, fake_answer=None,
+                              database_url=None, allow_local_proof_repo=[],
+                              proof_image="img:1", max_proof_seconds=300.0)
+
+
+def _job() -> Any:
+    from reviewhound.queue import Job
+    return Job(1, REPO, PR, H1, "running", 1, 4, None, "t", installation_id=42)
+
+
+def test_worker_factories_use_the_given_stale_threshold_and_the_app_login(
+        tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from reviewhound.cli import _app_reviewer_factory, _worker_reviewer_factory
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    assert _worker_reviewer_factory(_args(tmp_path), 42.0)(_job()).stale_claim_s == 42.0
+    app = GitHubApp("1", PEM)
+    monkeypatch.setattr(app, "installation_token", lambda iid: f"ghs_{iid}")
+    monkeypatch.setattr(app, "bot_login", lambda: "reviewhound-acme[bot]")
+    reviewer = _app_reviewer_factory(_args(tmp_path), app, 43.0)(_job())
+    assert (reviewer.stale_claim_s, reviewer.vcs.viewer_login()) == (43.0,
+                                                                    "reviewhound-acme[bot]")
+
+
+def test_worker_command_passes_its_queue_lease_as_the_stale_threshold(
+        tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from reviewhound import cli
+    for k in ("REVIEWHOUND_DATABASE_URL", "REVIEWHOUND_APP_ID", "REVIEWHOUND_APP_PRIVATE_KEY_PATH"):
+        monkeypatch.delenv(k, raising=False)
+    seen: list[float] = []
+
+    def factory(args: Any, stale_claim_s: float) -> Any:
+        seen.append(stale_claim_s)
+        return lambda job: None
+    monkeypatch.setattr(cli, "_worker_reviewer_factory", factory)
+    assert cli.main(["--home", str(tmp_path), "worker", "--once"]) == 0
+    assert seen == [1800.0]
+
+
+def test_left_finding_quote_claim_of_its_deleted_line_is_still_checked_at_head() -> None:
+    _, reason = guard_checker().check(mfind(evidence_quote=GUARD, claims=[
+        {"kind": "quote", "text": GUARD}]), "m")
+    assert reason == "false claim: quoted text not found in app/orders.py"
+
+
 @pytest.mark.parametrize("body", [{"name": "x"}, {"slug": ""}, {"slug": 5}, ["slug"]])
 def test_app_bot_login_refuses_a_malformed_answer(body: Any) -> None:
     client = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=body)),

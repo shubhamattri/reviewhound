@@ -337,8 +337,7 @@ class Reviewer:
             result.outcome = "already-posted"
             return
         age = held[1] if held is not None else self.stale_claim_s
-        if age > self.stale_claim_s and self.store.take_stale_claim(
-                pr.repo, pr.number, pr.head_sha, self.stale_claim_s):
+        if self.store.take_stale_claim(pr.repo, pr.number, pr.head_sha, self.stale_claim_s):
             log.warning("taking over an abandoned post claim", extra={
                 "pr": pr.number, "head": pr.head_sha, "age_s": round(age, 1)})
             self._post(pr, result, should_post)  # the remote check runs before its POST
