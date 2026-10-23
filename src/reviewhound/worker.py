@@ -48,7 +48,7 @@ def _reviewer_for(reviewer: Reviewer | Callable[[Job], Reviewer], job: Job) -> R
     # Duck-typed: anything with .review() is a reviewer, anything else is a per-job factory.
     if hasattr(reviewer, "review"):
         return cast(Reviewer, reviewer)
-    return cast(Callable[[Job], Reviewer], reviewer)(job)
+    return reviewer(job)
 
 
 def run_one(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],

@@ -39,6 +39,7 @@ QUEUE_DDL: list[str] = [
         updated_at DOUBLE PRECISION NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(state, run_after)",
     "CREATE INDEX IF NOT EXISTS jobs_pr ON jobs(repo, pr)",
+    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS installation_id BIGINT",
 ]
 
 STORE_DDL: list[str] = [
@@ -71,6 +72,18 @@ STORE_DDL: list[str] = [
         id BIGSERIAL PRIMARY KEY,
         repo TEXT NOT NULL, pr INTEGER NOT NULL, fingerprint TEXT NOT NULL,
         kind TEXT NOT NULL, detail TEXT, created_at DOUBLE PRECISION NOT NULL)""",
+    # GitHub comment ids we posted, verdicts we dismissed, webhook events already applied.
+    """CREATE TABLE IF NOT EXISTS comment_links (
+        repo TEXT NOT NULL, comment_id BIGINT NOT NULL, pr INTEGER NOT NULL,
+        fingerprint TEXT NOT NULL, review_id TEXT NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY (repo, comment_id))""",
+    """CREATE TABLE IF NOT EXISTS dismissals (
+        id BIGSERIAL PRIMARY KEY,
+        repo TEXT NOT NULL, pr INTEGER NOT NULL, review_id TEXT NOT NULL,
+        ok INTEGER NOT NULL, error TEXT, created_at DOUBLE PRECISION NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS feedback_events (
+        key TEXT PRIMARY KEY, created_at DOUBLE PRECISION NOT NULL)""",
 ]
 
 METRICS_DDL: list[str] = [
@@ -116,9 +129,10 @@ class PostgresQueue(_Pg):
         return Job(id=row["id"], repo=row["repo"], pr=row["pr"], head_sha=row["head_sha"],
                    state=row["state"], attempts=row["attempts"],
                    max_attempts=row["max_attempts"], last_error=row["last_error"],
-                   lease_token=row["lease_token"])
+                   lease_token=row["lease_token"], installation_id=row["installation_id"])
 
-    def enqueue(self, repo: str, pr: int, head_sha: str) -> tuple[int, bool]:
+    def enqueue(self, repo: str, pr: int, head_sha: str,
+                installation_id: int | None = None) -> tuple[int, bool]:
         """Return (job id, created). Older queued jobs for the same PR are superseded."""
         repo = repo.lower()
         now = self._clock()
@@ -131,6 +145,9 @@ class PostgresQueue(_Pg):
                       (now, repo, pr, key))
             row = c.execute("SELECT id, state FROM jobs WHERE key=%s FOR UPDATE",
                             (key,)).fetchone()
+            if row is not None and installation_id is not None:
+                c.execute("UPDATE jobs SET installation_id=%s WHERE id=%s",
+                          (installation_id, row["id"]))
             if row is not None:
                 if row["state"] != "superseded":
                     return int(row["id"]), False
@@ -139,8 +156,9 @@ class PostgresQueue(_Pg):
                 return int(row["id"]), True
             new = c.execute(
                 "INSERT INTO jobs (key, repo, pr, head_sha, state, max_attempts, run_after, "
-                "created_at, updated_at) VALUES (%s, %s, %s, %s, 'queued', %s, %s, %s, %s) "
-                "RETURNING id", (key, repo, pr, head_sha, self.max_attempts, now, now, now)
+                "created_at, updated_at, installation_id) "
+                "VALUES (%s, %s, %s, %s, 'queued', %s, %s, %s, %s, %s) RETURNING id",
+                (key, repo, pr, head_sha, self.max_attempts, now, now, now, installation_id)
             ).fetchone()
             if new is None:
                 raise RuntimeError("INSERT ... RETURNING returned no row")
@@ -333,6 +351,75 @@ class PostgresStore(_Pg):
         with self._tx() as c:
             rows = c.execute("SELECT * FROM findings WHERE repo=%s AND pr=%s ORDER BY id",
                              (repo.lower(), pr)).fetchall()
+        return [dict(r) for r in rows]
+
+    def link_comments(self, repo: str, pr: int, review_id: str,
+                      links: list[tuple[int, str]]) -> None:
+        """Remember which GitHub comment carries which finding, so thread events map back."""
+        if not links:
+            return
+        now = self._clock()
+        with self._tx() as c, c.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO comment_links (repo, comment_id, pr, fingerprint, review_id, "
+                "created_at) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (repo, comment_id) DO UPDATE "
+                "SET pr=excluded.pr, fingerprint=excluded.fingerprint, "
+                "review_id=excluded.review_id, created_at=excluded.created_at",
+                [(repo.lower(), cid, pr, fp, review_id, now) for cid, fp in links])
+
+    def linked_findings(self, repo: str, comment_ids: list[int]) -> dict[int, tuple[int, str]]:
+        """comment id -> (PR, fingerprint), for the ids we posted; others are absent."""
+        if not comment_ids:
+            return {}
+        with self._tx() as c:
+            rows = c.execute("SELECT comment_id, pr, fingerprint FROM comment_links "
+                             "WHERE repo=%s AND comment_id = ANY(%s)",
+                             (repo.lower(), list(comment_ids))).fetchall()
+        return {int(r["comment_id"]): (int(r["pr"]), r["fingerprint"]) for r in rows}
+
+    def claim_event(self, key: str) -> bool:
+        """True the first time a webhook event key is seen, so a redelivery is applied once."""
+        with self._tx() as c:
+            cur = c.execute("INSERT INTO feedback_events (key, created_at) VALUES (%s,%s) "
+                            "ON CONFLICT DO NOTHING", (key, self._clock()))
+            return cur.rowcount == 1
+
+    def release_event(self, key: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM feedback_events WHERE key=%s", (key,))
+
+    def blocking_reviews_to_dismiss(self, repo: str, pr: int, current_post_id: str) -> list[str]:
+        """Same rule as Store: only older REQUEST_CHANGES rows, not dismissed or given up."""
+        repo = repo.lower()
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT post_id FROM reviews WHERE repo=%s AND pr=%s AND outcome='posted' "
+                "AND event='REQUEST_CHANGES' AND post_id != '' "
+                "AND id < (SELECT MIN(id) FROM reviews WHERE repo=%s AND pr=%s AND post_id=%s) "
+                "AND post_id NOT IN (SELECT review_id FROM dismissals WHERE repo=%s AND pr=%s "
+                "AND ok != 0) ORDER BY id",
+                (repo, pr, repo, pr, current_post_id, repo, pr)).fetchall()
+        return [r["post_id"] for r in rows]
+
+    def record_dismissal(self, repo: str, pr: int, review_id: str, ok: bool,
+                         error: str = "", permanent: bool = False) -> None:
+        """ok is stored as 1 (dismissed), 0 (failed, retry later) or -1 (failed, give up)."""
+        status = 1 if ok else (-1 if permanent else 0)
+        with self._tx() as c:
+            c.execute("INSERT INTO dismissals (repo, pr, review_id, ok, error, created_at) "
+                      "VALUES (%s,%s,%s,%s,%s,%s)",
+                      (repo.lower(), pr, review_id, status, error[:500], self._clock()))
+
+    def dismissals(self, repo: str, pr: int) -> list[dict[str, Any]]:
+        with self._tx() as c:
+            rows = c.execute("SELECT review_id, ok, error FROM dismissals WHERE repo=%s "
+                             "AND pr=%s ORDER BY id", (repo.lower(), pr)).fetchall()
+        return [dict(r) for r in rows]
+
+    def feedback(self, repo: str, pr: int) -> list[dict[str, Any]]:
+        with self._tx() as c:
+            rows = c.execute("SELECT fingerprint, kind, detail FROM feedback WHERE repo=%s "
+                             "AND pr=%s ORDER BY id", (repo.lower(), pr)).fetchall()
         return [dict(r) for r in rows]
 
 

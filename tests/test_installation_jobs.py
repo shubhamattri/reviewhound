@@ -12,7 +12,7 @@ from reviewhound.vcs.github_app import GitHubApp, token_for_job
 from reviewhound.vcs.memory import MemoryVCS
 from reviewhound.webhook import handle_event
 from reviewhound.worker import run_one
-from tests.conftest import answer, make_pr
+from tests.conftest import Backend, answer, make_pr
 from tests.test_github_app import PEM
 from tests.test_pipeline import BASE, HEAD
 
@@ -47,8 +47,8 @@ def pr_event(sha: str = "abc", installation: Any = 42) -> dict[str, Any]:
     return event
 
 
-def test_enqueue_stores_installation_id(tmp_path: Path) -> None:
-    q = SQLiteQueue(tmp_path / "q.db")
+def test_enqueue_stores_installation_id(backend: Backend) -> None:
+    q = backend.queue()
     q.enqueue("acme/shop", 7, "h1", installation_id=42)
     q.enqueue("acme/shop", 8, "h1")
     first, second = q.claim(), q.claim()
@@ -57,8 +57,8 @@ def test_enqueue_stores_installation_id(tmp_path: Path) -> None:
     assert (second.pr, second.installation_id) == (8, None)
 
 
-def test_redelivery_keeps_or_updates_installation_id(tmp_path: Path) -> None:
-    q = SQLiteQueue(tmp_path / "q.db")
+def test_redelivery_keeps_or_updates_installation_id(backend: Backend) -> None:
+    q = backend.queue()
     job_id, _ = q.enqueue("acme/shop", 7, "h1")
     assert q.enqueue("acme/shop", 7, "h1", installation_id=42) == (job_id, False)
     assert q.enqueue("acme/shop", 7, "h1") == (job_id, False)
@@ -69,26 +69,48 @@ def test_redelivery_keeps_or_updates_installation_id(tmp_path: Path) -> None:
     assert job is not None and job.installation_id == 43
 
 
-def test_old_queue_db_is_migrated_in_place(tmp_path: Path) -> None:
-    path = tmp_path / "q.db"
-    c = sqlite3.connect(path)
-    c.executescript(OLD_SCHEMA)
-    c.close()
-    q = SQLiteQueue(path)
-    SQLiteQueue(path)  # a second process opening the same DB must not fail
+def _old_jobs_table(backend: Backend) -> None:
+    if backend.url is None:
+        c = sqlite3.connect(backend.home / "q.db")
+        c.executescript(OLD_SCHEMA)
+        c.close()
+        return
+    import psycopg
+
+    from reviewhound.backends.postgres import QUEUE_DDL
+    with psycopg.connect(backend.url, autocommit=True) as pg:
+        pg.execute(QUEUE_DDL[0])  # the jobs table as milestone 6 created it
+        pg.execute("INSERT" + OLD_SCHEMA.split("INSERT", 1)[1])
+
+
+def _job_columns(backend: Backend) -> list[str]:
+    if backend.url is None:
+        c = sqlite3.connect(backend.home / "q.db")
+        cols = [r[1] for r in c.execute("PRAGMA table_info(jobs)")]
+        c.close()
+        return cols
+    import psycopg
+    with psycopg.connect(backend.url) as pg:
+        rows = pg.execute("SELECT column_name FROM information_schema.columns "
+                          "WHERE table_name = 'jobs'").fetchall()
+    return [r[0] for r in rows]
+
+
+def test_old_queue_db_is_migrated_in_place(backend: Backend) -> None:
+    _old_jobs_table(backend)
+    assert "installation_id" not in _job_columns(backend)
+    q = backend.queue()
+    backend.queue()  # a second process opening the same DB must not fail
     old = q.claim()
     assert old is not None and (old.head_sha, old.installation_id) == ("old", None)
     q.enqueue("acme/shop", 9, "h9", installation_id=5)
     new = q.claim()
     assert new is not None and (new.pr, new.installation_id) == (9, 5)
-    c = sqlite3.connect(path)
-    cols = [r[1] for r in c.execute("PRAGMA table_info(jobs)")]
-    c.close()
-    assert cols.count("installation_id") == 1
+    assert _job_columns(backend).count("installation_id") == 1
 
 
-def test_webhook_puts_installation_id_on_the_job(tmp_path: Path) -> None:
-    q = SQLiteQueue(tmp_path / "q.db")
+def test_webhook_puts_installation_id_on_the_job(backend: Backend) -> None:
+    q = backend.queue()
     assert handle_event(q, "pull_request", pr_event()) == (202, "job 1 queued")
     job = q.claim()
     assert job is not None and job.installation_id == 42
@@ -98,8 +120,8 @@ def test_webhook_puts_installation_id_on_the_job(tmp_path: Path) -> None:
     assert job is not None and job.installation_id is None
 
 
-def test_webhook_rejects_malformed_installation_id(tmp_path: Path) -> None:
-    q = SQLiteQueue(tmp_path / "q.db")
+def test_webhook_rejects_malformed_installation_id(backend: Backend) -> None:
+    q = backend.queue()
     assert handle_event(q, "pull_request", pr_event(installation="x")) == (
         400, "malformed installation id")
     assert handle_event(q, "pull_request", pr_event(installation=True)) == (
