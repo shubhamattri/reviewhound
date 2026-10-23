@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS findings (
 );
 CREATE TABLE IF NOT EXISTS posts (
     repo TEXT NOT NULL, pr INTEGER NOT NULL, head_sha TEXT NOT NULL, created_at REAL NOT NULL,
-    post_id TEXT,
+    post_id TEXT, event TEXT,
     PRIMARY KEY (repo, pr, head_sha)
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -157,9 +157,10 @@ class ReviewStore(Protocol):
 
     def release_post(self, repo: str, pr: int, head_sha: str) -> None: ...
 
-    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str) -> None: ...
+    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str, event: str,
+                    blockers: Sequence[Blocker] = ()) -> None: ...
 
-    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> str | None: ...
+    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> tuple[str, str] | None: ...
 
     def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]: ...
 
@@ -211,6 +212,8 @@ class Store:
             cols = {r["name"] for r in c.execute("PRAGMA table_info(posts)")}
             if "post_id" not in cols:
                 c.execute("ALTER TABLE posts ADD COLUMN post_id TEXT")
+            if "event" not in cols:
+                c.execute("ALTER TABLE posts ADD COLUMN event TEXT")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -289,23 +292,28 @@ class Store:
             c.execute("DELETE FROM posts WHERE repo=? AND pr=? AND head_sha=?",
                       (repo.lower(), pr, head_sha))
 
-    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str) -> None:
-        """Record the GitHub review id on the claim the moment the post lands."""
+    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str, event: str,
+                    blockers: Sequence[Blocker] = ()) -> None:
+        """The moment the post lands: its id and event on the claim, and its blockers."""
+        rec = ReviewRecord(repo=repo, pr=pr, head_sha=head_sha, outcome="posted", post_id=post_id)
         with self._tx() as c:
-            c.execute("INSERT INTO posts (repo, pr, head_sha, created_at, post_id) "
-                      "VALUES (?,?,?,?,?) ON CONFLICT (repo, pr, head_sha) DO UPDATE "
-                      "SET post_id=excluded.post_id",
-                      (repo.lower(), pr, head_sha, self._clock(), post_id))
+            c.execute("INSERT INTO posts (repo, pr, head_sha, created_at, post_id, event) "
+                      "VALUES (?,?,?,?,?,?) ON CONFLICT (repo, pr, head_sha) DO UPDATE "
+                      "SET post_id=excluded.post_id, event=excluded.event",
+                      (repo.lower(), pr, head_sha, self._clock(), post_id, event))
+            c.executemany("INSERT OR IGNORE INTO review_blockers (repo, pr, review_id, fingerprint, "
+                          "file, side, category, evidence_quote, identity) "
+                          "VALUES (?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
 
-    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> str | None:
-        """The review id of a post that landed for this head but has no posted review record."""
+    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> tuple[str, str] | None:
+        """(review id, event) of a post that landed for this head with no posted review record."""
         with self._tx() as c:
             row = c.execute(
-                "SELECT p.post_id FROM posts p WHERE p.repo=? AND p.pr=? AND p.head_sha=? "
+                "SELECT p.post_id, p.event FROM posts p WHERE p.repo=? AND p.pr=? AND p.head_sha=? "
                 "AND p.post_id IS NOT NULL AND p.post_id != '' AND NOT EXISTS (SELECT 1 FROM "
                 "reviews r WHERE r.repo=p.repo AND r.pr=p.pr AND r.post_id=p.post_id "
                 "AND r.outcome='posted')", (repo.lower(), pr, head_sha)).fetchone()
-        return None if row is None else str(row["post_id"])
+        return None if row is None else (str(row["post_id"]), str(row["event"] or ""))
 
     def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
         with self._tx() as c:

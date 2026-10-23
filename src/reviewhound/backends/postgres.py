@@ -83,6 +83,7 @@ STORE_DDL: list[str] = [
         created_at DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (repo, pr, head_sha))""",
     "ALTER TABLE posts ADD COLUMN IF NOT EXISTS post_id TEXT",
+    "ALTER TABLE posts ADD COLUMN IF NOT EXISTS event TEXT",
     """CREATE TABLE IF NOT EXISTS feedback (
         id BIGSERIAL PRIMARY KEY,
         repo TEXT NOT NULL, pr INTEGER NOT NULL, fingerprint TEXT NOT NULL,
@@ -395,24 +396,35 @@ class PostgresStore(_Pg):
                       (repo.lower(), pr, head_sha))
         self._write(body)
 
-    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str) -> None:
-        """Record the GitHub review id on the claim the moment the post lands."""
+    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str, event: str,
+                    blockers: Sequence[Blocker] = ()) -> None:
+        """The moment the post lands: its id and event on the claim, and its blockers."""
+        brows = blocker_rows(ReviewRecord(repo=repo, pr=pr, head_sha=head_sha, outcome="posted",
+                                          post_id=post_id), blockers)
+
         def body(c: Conn) -> None:
-            c.execute("INSERT INTO posts (repo, pr, head_sha, created_at, post_id) "
-                      "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (repo, pr, head_sha) DO UPDATE "
-                      "SET post_id=excluded.post_id",
-                      (repo.lower(), pr, head_sha, self._clock(), post_id))
+            c.execute("INSERT INTO posts (repo, pr, head_sha, created_at, post_id, event) "
+                      "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (repo, pr, head_sha) DO UPDATE "
+                      "SET post_id=excluded.post_id, event=excluded.event",
+                      (repo.lower(), pr, head_sha, self._clock(), post_id, event))
+            if brows:
+                with c.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO review_blockers (repo, pr, review_id, fingerprint, file, "
+                        "side, category, evidence_quote, identity) VALUES "
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
         self._write(body)
 
-    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> str | None:
-        """The review id of a post that landed for this head but has no posted review record."""
+    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> tuple[str, str] | None:
+        """(review id, event) of a post that landed for this head with no posted review record."""
         with self._tx() as c:
             row = c.execute(
-                "SELECT p.post_id FROM posts p WHERE p.repo=%s AND p.pr=%s AND p.head_sha=%s "
-                "AND p.post_id IS NOT NULL AND p.post_id != '' AND NOT EXISTS (SELECT 1 FROM "
-                "reviews r WHERE r.repo=p.repo AND r.pr=p.pr AND r.post_id=p.post_id "
-                "AND r.outcome='posted')", (repo.lower(), pr, head_sha)).fetchone()
-        return None if row is None else str(row["post_id"])
+                "SELECT p.post_id, p.event FROM posts p WHERE p.repo=%s AND p.pr=%s "
+                "AND p.head_sha=%s AND p.post_id IS NOT NULL AND p.post_id != '' AND NOT EXISTS "
+                "(SELECT 1 FROM reviews r WHERE r.repo=p.repo AND r.pr=p.pr "
+                "AND r.post_id=p.post_id AND r.outcome='posted')",
+                (repo.lower(), pr, head_sha)).fetchone()
+        return None if row is None else (str(row["post_id"]), str(row["event"] or ""))
 
     def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
         with self._tx() as c:

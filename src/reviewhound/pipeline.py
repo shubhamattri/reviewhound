@@ -35,6 +35,9 @@ MAX_BODY_CHARS = 60_000  # GitHub refuses a review body over 65,536 characters
 RETRY_IN_BODY = (400, 422)  # GitHub could not place an inline comment
 
 
+RECOVERED = "recovered: an earlier attempt posted this review but did not record it"
+
+
 class RecordAfterPostError(RuntimeError):
     """The review is on GitHub but its record is not: retry, and the retry records it."""
 
@@ -61,6 +64,7 @@ class ReviewResult:
     changed_paths: list[str] = field(default_factory=list)
     head_sources: Mapping[str, str] = field(default_factory=dict)  # the head index's files
     blockers: list[Blocker] = field(default_factory=list)  # as decided before any proof
+    recovered_id: str = ""  # an earlier attempt's post of this head, recorded by this run
 
 
 @dataclass
@@ -186,6 +190,7 @@ class Reviewer:
         with t.stage("fetch"):
             pr = self.vcs.get_pull(repo, number)
         result = ReviewResult(pr=pr, outcome="")
+        result.recovered_id = self._record_landed(repo, number, expected_head or pr.head_sha)
         if pr.state != "open":
             result.outcome = "skipped"
             result.error = f"PR is {pr.state}"
@@ -256,6 +261,8 @@ class Reviewer:
                 result.outcome = "dry-run"
             elif not cfg.posting:
                 result.outcome = "shadow"
+            elif should_post is not None and not should_post():
+                result.outcome = "lease-lost"  # checked again right before each POST
             elif self.store is not None and not self.store.claim_post(repo, number, pr.head_sha):
                 self._already_posted(pr, result)
             else:
@@ -265,21 +272,37 @@ class Reviewer:
         if done.outcome == "post-uncertain":
             log.warning("post outcome uncertain; comments not linked, verdicts not dismissed",
                         extra={"pr": number, "head": pr.head_sha})
-        if done.outcome == "posted" and self.store is not None:
+        if done.outcome in ("posted", "recovered") and self.store is not None:
             after_post(self.vcs, self.store, done, cfg.policy)
         return done
 
+    def _record_landed(self, repo: str, number: int, head: str) -> str:
+        """Before any model call: record a post an earlier attempt landed but never recorded,
+        with the event and blockers saved when it landed. Returns its id, or ""."""
+        if self.store is None:
+            return ""
+        landed = self.store.unrecorded_post(repo, number, head)
+        if landed is None:
+            return ""
+        post_id, event = landed
+        log.warning("recording a review an earlier attempt posted",
+                    extra={"pr": number, "head": head, "post_id": post_id})
+        try:
+            self.store.record_review(ReviewRecord(
+                repo=repo, pr=number, head_sha=head, outcome="posted", event=event, posted=True,
+                post_id=post_id, error=RECOVERED), [], [])
+        except Exception as exc:
+            raise RecordAfterPostError(f"review {post_id} posted but not recorded: "
+                                       f"{type(exc).__name__}") from exc
+        return post_id
+
     def _already_posted(self, pr: PullRequest, result: ReviewResult) -> None:
-        """Another run holds this head. If its post landed but was never recorded, record it."""
-        assert self.store is not None
-        post_id = self.store.unrecorded_post(pr.repo, pr.number, pr.head_sha)
-        if post_id is None:
+        """Another run holds this head. If it was this run that recorded that post, finish its
+        follow-ups (findings, comment links, dismissal) as outcome `recovered`."""
+        if not result.recovered_id:
             result.outcome = "already-posted"
             return
-        result.outcome, result.post_id = "posted", post_id
-        result.error = "recovered: an earlier attempt posted this review but did not record it"
-        log.warning("recording a review an earlier attempt posted",
-                    extra={"pr": pr.number, "head": pr.head_sha, "post_id": post_id})
+        result.outcome, result.post_id, result.error = "recovered", result.recovered_id, RECOVERED
 
     def _post(self, pr: PullRequest, result: ReviewResult,
               should_post: Callable[[], bool] | None) -> None:
@@ -338,14 +361,15 @@ class Reviewer:
             result.outcome, result.post_id, result.review = "posted", post_id, payload
             result.error = "" if attempt == 1 else (f"inline comments refused (HTTP {status}); "
                                                     "posted them in the review body")
-            self._mark_posted(pr, post_id)
+            self._mark_posted(pr, post_id, payload.event, result.blockers)
             return
 
-    def _mark_posted(self, pr: PullRequest, post_id: str) -> None:
+    def _mark_posted(self, pr: PullRequest, post_id: str, event: str,
+                     blockers: list[Blocker]) -> None:
         if self.store is None:
             return
         try:
-            self.store.mark_posted(pr.repo, pr.number, pr.head_sha, post_id)
+            self.store.mark_posted(pr.repo, pr.number, pr.head_sha, post_id, event, blockers)
         except Exception as exc:  # noqa: BLE001 - the review record below still carries the id
             log.error("could not record the post id on the claim",
                       extra={"pr": pr.number, "head": pr.head_sha, "post_id": post_id,
@@ -392,7 +416,7 @@ class Reviewer:
                          providers=tuple(result.reviewers),
                          event=result.review.event if result.review else "",
                          # An uncertain post may have landed: never risk posting it twice.
-                         posted=result.outcome in ("posted", "post-uncertain"),
+                         posted=result.outcome in ("posted", "post-uncertain", "recovered"),
                          post_id=result.post_id, cost_usd=result.cost_usd,
                          timings=t.timings, error=result.error),
             posted, held, result.blockers)

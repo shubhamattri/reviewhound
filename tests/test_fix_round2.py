@@ -369,7 +369,7 @@ def test_post_id_is_written_before_the_review_record(backend: Backend,
     mark = next(i for i, s in enumerate(sql) if "SET post_id" in s)
     record = next(i for i, s in enumerate(sql) if s.startswith("INSERT INTO reviews"))
     assert mark < record
-    assert log[mark][1][-1] == "memory-review-1"
+    assert log[mark][1][4:] == ("memory-review-1", "REQUEST_CHANGES")
 
 
 def test_record_failure_after_the_post_is_retryable_and_the_retry_recovers(
@@ -381,14 +381,16 @@ def test_record_failure_after_the_post_is_retryable_and_the_retry_recovers(
         reviewer.review(REPO, PR, dry_run=False)
     assert str(raised.value) == "review memory-review-1 posted but not recorded: RuntimeError"
     assert is_retryable(raised.value) is True
-    assert store.unrecorded_post(REPO, PR, H1) == "memory-review-1"
+    assert store.unrecorded_post(REPO, PR, H1) == ("memory-review-1", "REQUEST_CHANGES")
     monkeypatch.setattr(store, "_tx", real_tx)
 
     again = reviewer.review(REPO, PR, dry_run=False)
-    assert (again.outcome, again.post_id, len(vcs.posted)) == ("posted", "memory-review-1", 1)
+    assert (again.outcome, again.post_id, len(vcs.posted)) == ("recovered", "memory-review-1", 1)
     assert again.error == "recovered: an earlier attempt posted this review but did not record it"
-    assert [(r["outcome"], r["posted"], r["post_id"]) for r in store.reviews(REPO, PR)] == [
-        ("posted", 1, "memory-review-1")]
+    assert [(r["outcome"], r["posted"], r["post_id"], r["event"])
+            for r in store.reviews(REPO, PR)] == [
+        ("posted", 1, "memory-review-1", "REQUEST_CHANGES"),
+        ("recovered", 1, "memory-review-1", "REQUEST_CHANGES")]
     assert store.linked_findings(REPO, [1001]) == {1001: (PR, FP)}
     assert store.unrecorded_post(REPO, PR, H1) is None
     assert [f["state"] for f in store.findings(REPO, PR)] == ["posted"]
@@ -406,7 +408,7 @@ def test_recovery_runs_the_dismissal_too(backend: Backend,
     assert vcs.dismissed == []
     monkeypatch.setattr(store, "_tx", real_tx)
     again = reviewer.review(REPO, PR, dry_run=False)
-    assert (again.outcome, again.post_id, len(vcs.posted)) == ("posted", "memory-review-2", 2)
+    assert (again.outcome, again.post_id, len(vcs.posted)) == ("recovered", "memory-review-2", 2)
     assert vcs.dismissed == [("memory-review-1", DISMISS_MESSAGE)]
 
 
@@ -428,7 +430,91 @@ def test_worker_retries_a_record_failure_and_completes_without_posting_twice(
     done = q.get(job.id)
     assert done is not None and done.state == "done"
     assert len(vcs.posted) == 1
-    assert [r["outcome"] for r in store.reviews(REPO, PR)] == ["posted"]
+    assert [r["outcome"] for r in store.reviews(REPO, PR)] == ["posted", "recovered"]
+
+
+def _post_then_fail_record(backend: Backend, monkeypatch: pytest.MonkeyPatch,
+                           answers: list[str]) -> tuple[MemoryVCS, Reviewer, ReviewStore, Any]:
+    vcs, reviewer, store = reviewer_on(backend, answers)
+    real_tx = store._tx  # type: ignore[attr-defined]
+    spy(monkeypatch, store, "INSERT INTO reviews")
+    with pytest.raises(RecordAfterPostError):
+        reviewer.review(REPO, PR, dry_run=False, expected_head=H1)
+    monkeypatch.setattr(store, "_tx", real_tx)
+    return vcs, reviewer, store, real_tx
+
+
+def test_recovery_records_what_was_posted_not_what_the_retry_decided(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store, _ = _post_then_fail_record(backend, monkeypatch,
+                                                     [answer(REAL), answer()])
+    again = reviewer.review(REPO, PR, dry_run=False, expected_head=H1)
+    assert (again.outcome, again.review.event) == ("recovered", "COMMENT")  # type: ignore
+    assert [(r["outcome"], r["event"]) for r in store.reviews(REPO, PR)] == [
+        ("posted", "REQUEST_CHANGES"), ("recovered", "COMMENT")]
+    assert [r["fingerprint"] for r in store.review_blockers(REPO, PR, "memory-review-1")] == [FP]
+    push(vcs, "h2", FIXED)
+    vcs.posted.append(ReviewPayload(head_sha="h2", event="COMMENT", body=""))  # id 2 is taken
+    Reviewer(vcs, ProviderRegistry([FakeProvider([answer()])]), [], store).review(
+        REPO, PR, dry_run=False)
+    assert vcs.dismissed == [("memory-review-1", DISMISS_MESSAGE)]
+
+
+def test_recovery_happens_even_when_the_head_moved_before_the_retry(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store, _ = _post_then_fail_record(backend, monkeypatch, [answer(REAL)])
+    push(vcs, "h2", FIXED)
+    again = reviewer.review(REPO, PR, dry_run=False, expected_head=H1)  # no model answer left
+    assert again.outcome == "superseded"
+    assert [(r["head_sha"], r["outcome"], r["post_id"], r["event"])
+            for r in store.reviews(REPO, PR)] == [
+        ("h1", "posted", "memory-review-1", "REQUEST_CHANGES"), ("h2", "superseded", "", "")]
+    assert store.unrecorded_post(REPO, PR, H1) is None
+
+
+def test_recovery_happens_even_when_the_retry_model_call_fails(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    from reviewhound.providers import ProviderError
+    _vcs, reviewer, store, _ = _post_then_fail_record(backend, monkeypatch, [answer(REAL)])
+    with pytest.raises(ProviderError):
+        reviewer.review(REPO, PR, dry_run=False, expected_head=H1)
+    assert [(r["outcome"], r["post_id"], r["error"]) for r in store.reviews(REPO, PR)] == [
+        ("posted", "memory-review-1",
+         "recovered: an earlier attempt posted this review but did not record it")]
+
+
+def test_recovery_of_an_own_pr_review_records_the_comment_it_really_was(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL), answer(REAL)])
+    vcs.pr = make_pr(head=H1, author="reviewhound-bot")
+    real_tx = store._tx  # type: ignore[attr-defined]
+    spy(monkeypatch, store, "INSERT INTO reviews")
+    with pytest.raises(RecordAfterPostError):
+        reviewer.review(REPO, PR, dry_run=False)
+    monkeypatch.setattr(store, "_tx", real_tx)
+    assert vcs.posted[0].event == "COMMENT"
+    reviewer.review(REPO, PR, dry_run=False)
+    assert [(r["outcome"], r["event"]) for r in store.reviews(REPO, PR)][0] == ("posted", "COMMENT")
+
+
+def test_recovery_failing_to_record_is_retryable(backend: Backend,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    _vcs, reviewer, store, real_tx = _post_then_fail_record(backend, monkeypatch, [answer(REAL)])
+    spy(monkeypatch, store, "INSERT INTO reviews")
+    with pytest.raises(RecordAfterPostError) as raised:
+        reviewer.review(REPO, PR, dry_run=False, expected_head=H1)
+    assert is_retryable(raised.value) is True
+    assert store.unrecorded_post(REPO, PR, H1) == ("memory-review-1", "REQUEST_CHANGES")
+
+
+def test_lost_lease_takes_no_claim_at_all(backend: Backend,
+                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    _vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    claims: list[str] = []
+    on_claim(store, monkeypatch, lambda: claims.append("claim"))
+    assert reviewer.review(REPO, PR, dry_run=False, should_post=lambda: False).outcome == \
+        "lease-lost"
+    assert claims == []
 
 
 def test_mark_failure_is_logged_and_the_review_still_records(
@@ -464,13 +550,13 @@ def test_unrecorded_post_store_contract(backend: Backend) -> None:
     assert store.unrecorded_post(REPO, PR, H1) is None
     assert store.claim_post("Acme/Shop", PR, H1) is True
     assert store.unrecorded_post(REPO, PR, H1) is None
-    store.mark_posted("ACME/shop", PR, H1, "r9")
-    assert store.unrecorded_post("acme/SHOP", PR, H1) == "r9"
+    store.mark_posted("ACME/shop", PR, H1, "r9", "COMMENT")
+    assert store.unrecorded_post("acme/SHOP", PR, H1) == ("r9", "COMMENT")
     assert store.unrecorded_post(REPO, PR, "h2") is None
     assert store.claim_post(REPO, PR, H1) is False
     store.record_review(ReviewRecord(repo=REPO, pr=PR, head_sha=H1, outcome="post-uncertain",
                                      posted=True, post_id="r9"), [], [])
-    assert store.unrecorded_post(REPO, PR, H1) == "r9"  # only a posted record counts
+    assert store.unrecorded_post(REPO, PR, H1) == ("r9", "COMMENT")  # only `posted` counts
     store.record_review(ReviewRecord(repo=REPO, pr=PR, head_sha=H1, outcome="posted",
                                      posted=True, post_id="r9"), [], [])
     assert store.unrecorded_post(REPO, PR, H1) is None
@@ -478,9 +564,13 @@ def test_unrecorded_post_store_contract(backend: Backend) -> None:
 
 def test_mark_posted_without_a_claim_still_records_the_id(backend: Backend) -> None:
     store = backend.store()
-    store.mark_posted(REPO, PR, H1, "r1")
+    b = Blocker("fp1", "a.py", "RIGHT", "auth", "do_it(x)", "")
+    store.mark_posted(REPO, PR, H1, "r1", "REQUEST_CHANGES", [b])
     assert store.claim_post(REPO, PR, H1) is False
-    assert store.unrecorded_post(REPO, PR, H1) == "r1"
+    assert store.unrecorded_post(REPO, PR, H1) == ("r1", "REQUEST_CHANGES")
+    assert [r["fingerprint"] for r in store.review_blockers(REPO, PR, "r1")] == ["fp1"]
+    store.mark_posted(REPO, PR, H1, "r1", "REQUEST_CHANGES", [b])  # a repeat is harmless
+    assert len(store.review_blockers(REPO, PR, "r1")) == 1
 
 
 def test_old_sqlite_posts_table_gets_the_post_id_column(tmp_path: Any) -> None:
@@ -495,8 +585,8 @@ def test_old_sqlite_posts_table_gets_the_post_id_column(tmp_path: Any) -> None:
     store = Store(db)
     Store(db)  # a second start must not try to add it again
     assert store.claim_post(REPO, PR, "h0") is False  # the old claim survived
-    store.mark_posted(REPO, PR, "h0", "r1")
-    assert store.unrecorded_post(REPO, PR, "h0") == "r1"
+    store.mark_posted(REPO, PR, "h0", "r1", "COMMENT")
+    assert store.unrecorded_post(REPO, PR, "h0") == ("r1", "COMMENT")
 
 
 def test_old_postgres_posts_table_gets_the_post_id_column(backend: Backend) -> None:
@@ -511,8 +601,8 @@ def test_old_postgres_posts_table_gets_the_post_id_column(backend: Backend) -> N
     store = backend.store()
     backend.store()
     assert store.claim_post(REPO, PR, "h0") is False
-    store.mark_posted(REPO, PR, "h0", "r1")
-    assert store.unrecorded_post(REPO, PR, "h0") == "r1"
+    store.mark_posted(REPO, PR, "h0", "r1", "COMMENT")
+    assert store.unrecorded_post(REPO, PR, "h0") == ("r1", "COMMENT")
 
 
 # --- D1: blocking evidence is kept as decided before any proof downgrade or hold ----------
@@ -945,3 +1035,18 @@ def test_budget_smaller_than_docker_overhead_refuses_before_any_docker_call(cloc
                         clock=clock)
     ok.run(FILES, "tests/test_p.py", 60)
     assert docker.fake.timeouts[2] == 1.5 + 10
+
+
+@pytest.mark.parametrize(("seconds", "warned"), [("100", True), ("116", False), ("300", False)])
+def test_worker_warns_when_the_budget_cannot_fit_one_docker_run(
+        tmp_path: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+        seconds: str, warned: bool) -> None:
+    from reviewhound.cli import main
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    for k in ("REVIEWHOUND_DATABASE_URL", "REVIEWHOUND_APP_ID", "REVIEWHOUND_APP_PRIVATE_KEY_PATH"):
+        monkeypatch.delenv(k, raising=False)
+    caplog.set_level(logging.WARNING, logger="reviewhound.cli")
+    assert main(["--home", str(tmp_path), "--max-proof-seconds", seconds, "worker", "--once"]) == 0
+    msgs = [r.msg for r in caplog.records if r.name == "reviewhound.cli"]
+    assert msgs == (["--max-proof-seconds is below the Docker runner's own worst-case time: "
+                     "no Docker proof will run"] if warned else [])

@@ -217,6 +217,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_worker(args: argparse.Namespace) -> int:
     from reviewhound.worker import run_forever, run_one
 
+    docker_overhead = DockerRunner(image=args.proof_image).overhead_s
+    if args.max_proof_seconds < docker_overhead + 1:
+        logging.getLogger(__name__).warning(
+            "--max-proof-seconds is below the Docker runner's own worst-case time: no Docker "
+            "proof will run", extra={"max_proof_seconds": args.max_proof_seconds,
+                                     "docker_overhead_s": docker_overhead})
     queue = open_queue(Path(args.home), args.database_url)
     metrics = open_metrics(Path(args.home), args.database_url)
     app = _github_app()
