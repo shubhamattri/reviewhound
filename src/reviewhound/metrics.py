@@ -63,8 +63,11 @@ def failure_increments(error_type: str) -> list[Increment]:
 class SQLiteMetrics:
     def __init__(self, path: Path | str) -> None:
         self.path = str(path)
-        with self._tx() as c:
+        c = sqlite3.connect(self.path, timeout=30)
+        try:
             c.executescript(_SCHEMA)
+        finally:
+            c.close()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
