@@ -1,5 +1,26 @@
 [
-  {"bug": "refund_order has no role check", "file": "shop/orders.py", "lines": [20, 21]},
-  {"bug": "refund_order crashes on a missing order", "file": "shop/orders.py", "lines": [22, 24]},
-  {"bug": "assignment instead of comparison", "file": "web/cart.ts", "lines": [12, 12]}
+  {
+    "bug": "refund_order has no role check",
+    "file": "shop/orders.py",
+    "lines": [
+      20,
+      25
+    ]
+  },
+  {
+    "bug": "refund_order crashes on a missing order",
+    "file": "shop/orders.py",
+    "lines": [
+      21,
+      24
+    ]
+  },
+  {
+    "bug": "assignment instead of comparison",
+    "file": "web/cart.ts",
+    "lines": [
+      12,
+      12
+    ]
+  }
 ]

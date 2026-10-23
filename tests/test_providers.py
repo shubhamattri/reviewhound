@@ -91,3 +91,43 @@ def test_fake_provider_refuses_when_out_of_answers() -> None:
     assert fake.complete("x", model="m", timeout_s=1).text == "a"
     with pytest.raises(ProviderError):
         fake.complete("y", model="m", timeout_s=1)
+
+
+def test_github_error_carries_githubs_reason_but_never_headers() -> None:
+    import httpx
+
+    from reviewhound.vcs.github import GitHubError, GitHubVCS
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"message": "Unprocessable Entity",
+                                         "errors": ["Can not request changes on your own pull request"]})
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.github.com")
+    vcs = GitHubVCS("tok-secret", __import__("pathlib").Path("/tmp/x"), client=client)
+    with pytest.raises(GitHubError) as exc:
+        vcs._request("POST", "/repos/o/r/pulls/1/reviews", json={})
+    assert str(exc.value) == ("POST /repos/o/r/pulls/1/reviews -> HTTP 422: Unprocessable Entity; "
+                              "Can not request changes on your own pull request")
+    assert exc.value.status == 422
+    assert "tok-secret" not in str(exc.value)
+
+
+def test_viewer_login_is_cached_and_empty_when_github_will_not_say() -> None:
+    import httpx
+
+    from reviewhound.vcs.github import GitHubVCS
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"login": "alice"})
+
+    ok = GitHubVCS("t", __import__("pathlib").Path("/tmp/x"),
+                   client=httpx.Client(transport=httpx.MockTransport(handler),
+                                       base_url="https://api.github.com"))
+    assert (ok.viewer_login(), ok.viewer_login()) == ("alice", "alice")
+    assert calls == ["/user"]
+    denied = GitHubVCS("t", __import__("pathlib").Path("/tmp/x"),
+                       client=httpx.Client(transport=httpx.MockTransport(
+                           lambda r: httpx.Response(403, json={"message": "Resource not accessible"})),
+                           base_url="https://api.github.com"))
+    assert denied.viewer_login() == ""

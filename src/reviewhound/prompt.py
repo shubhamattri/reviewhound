@@ -25,6 +25,9 @@ Every finding must be provable from the code shown:
 
 Severity: blocker (will break production or open a security hole), major (wrong behaviour
 users will hit), minor (edge case or robustness), nit (rarely worth reporting).
+Report each defect once, at the line that causes it, with its own severity: never bundle
+unrelated defects into one finding, and never split one defect into several. In `body`, state only what the code shown proves: no guesses about
+compilers, linters, frameworks or code you cannot see.
 If there is nothing real to report, return {"findings": []}. Fewer, certain findings beat
 many guesses.
 

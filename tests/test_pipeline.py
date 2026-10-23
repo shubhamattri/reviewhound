@@ -161,3 +161,58 @@ def test_uncertain_post_is_remembered_as_posted_so_it_is_never_doubled(tmp_path:
     vcs.head_sha_now = "h2"
     reviewer.review("acme/shop", 7, dry_run=False)
     assert [len(p.comments) for p in vcs.posted] == [0]
+
+
+def test_github_refusal_is_rejected_not_uncertain_and_frees_the_head(tmp_path: Path) -> None:
+    from reviewhound.vcs.github import GitHubError
+    vcs, reviewer, store = setup([answer(REAL)], posting=True, tmp_path=tmp_path)
+
+    def refuse(pr, review):  # type: ignore[no-untyped-def]
+        raise GitHubError("POST /x -> HTTP 422: Unprocessable Entity", 422)
+    vcs.post_review = refuse  # type: ignore[method-assign]
+    result = reviewer.review("acme/shop", 7, dry_run=False)
+    assert (result.outcome, result.error) == ("post-rejected",
+                                              "POST /x -> HTTP 422: Unprocessable Entity")
+    assert [f["state"] for f in store.findings("acme/shop", 7)] == ["stored"]
+    assert store.claim_post("acme/shop", 7, "h1") is True
+
+
+def test_github_server_error_on_post_stays_uncertain(tmp_path: Path) -> None:
+    from reviewhound.vcs.github import GitHubError
+    vcs, reviewer, store = setup([answer(REAL)], posting=True, tmp_path=tmp_path)
+
+    def boom(pr, review):  # type: ignore[no-untyped-def]
+        raise GitHubError("POST /x -> HTTP 502", 502)
+    vcs.post_review = boom  # type: ignore[method-assign]
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "post-uncertain"
+    assert store.claim_post("acme/shop", 7, "h1") is False
+
+
+def test_verdict_on_your_own_pr_is_posted_as_a_comment_with_the_verdict_in_text(
+        tmp_path: Path) -> None:
+    vcs, reviewer, _ = setup([answer(REAL)], posting=True, tmp_path=tmp_path)
+    vcs.pr = make_pr(head="h1", author="alice")
+    vcs.viewer = "alice"
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "posted"
+    posted = vcs.posted[0]
+    assert posted.event == "COMMENT"
+    assert posted.body.endswith("Verdict: changes requested. Posted as a comment because this "
+                                "account opened the pull request, and GitHub does not let an "
+                                "account give a verdict on its own pull request.")
+    assert [(c.path, c.line) for c in posted.comments] == [("app/admin.py", 11)]
+
+
+def test_someone_elses_pr_keeps_request_changes(tmp_path: Path) -> None:
+    vcs, reviewer, _ = setup([answer(REAL)], posting=True, tmp_path=tmp_path)
+    vcs.pr = make_pr(head="h1", author="alice")
+    vcs.viewer = "reviewhound-bot"
+    reviewer.review("acme/shop", 7, dry_run=False)
+    assert vcs.posted[0].event == "REQUEST_CHANGES"
+
+
+def test_prompt_asks_for_one_defect_per_finding_and_no_speculation() -> None:
+    from reviewhound.config import RepoConfig
+    from reviewhound.prompt import build_prompt
+    text = build_prompt("CTX", RepoConfig())
+    assert "never bundle\nunrelated defects into one finding, and never split one defect" in text
+    assert "no guesses about\ncompilers, linters, frameworks or code you cannot see" in text

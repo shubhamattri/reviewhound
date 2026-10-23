@@ -163,6 +163,12 @@ class Store:
                             "VALUES (?,?,?,?)", (repo.lower(), pr, head_sha, self._clock()))
             return cur.rowcount == 1
 
+    def release_post(self, repo: str, pr: int, head_sha: str) -> None:
+        """Undo claim_post after GitHub rejected the review, so a later run may post it."""
+        with self._tx() as c:
+            c.execute("DELETE FROM posts WHERE repo=? AND pr=? AND head_sha=?",
+                      (repo.lower(), pr, head_sha))
+
     def add_feedback(self, repo: str, pr: int, fingerprint: str, kind: str,
                      detail: str = "") -> bool:
         if kind not in FEEDBACK_KINDS:

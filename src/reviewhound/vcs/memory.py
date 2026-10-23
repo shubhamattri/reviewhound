@@ -35,6 +35,7 @@ class MemoryVCS:
         self.head = head
         self.head_sha_now = pr.head_sha
         self.posted: list[ReviewPayload] = []
+        self.viewer = "reviewhound-bot"
         self.dismissed: list[tuple[str, str]] = []
         self.dismiss_error: Exception | None = None
         self.comments_error: Exception | None = None
@@ -56,6 +57,9 @@ class MemoryVCS:
 
     def current_head(self, repo: str, number: int) -> str:
         return self.head_sha_now
+
+    def viewer_login(self) -> str:
+        return self.viewer
 
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str:
         self.posted.append(review)

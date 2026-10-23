@@ -23,6 +23,21 @@ API = "https://api.github.com"
 _RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
+def _github_reason(resp: httpx.Response) -> str:
+    """GitHub's own error text (never echoes credentials), so a refusal can be acted on."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    parts = [str(data.get("message") or "")]
+    parts += [str(e.get("message") or e) if isinstance(e, dict) else str(e)
+              for e in (data.get("errors") or [])]
+    reason = "; ".join(p for p in parts if p)
+    return f": {reason[:300]}" if reason else ""
+
+
 class GitHubError(RuntimeError):
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
@@ -40,6 +55,7 @@ class GitHubVCS:
         self.cache_dir = cache_dir
         self.max_attempts = max_attempts
         self.history_depth = history_depth
+        self._viewer: str | None = None
         self._http = client or httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
         self._headers = {"Accept": "application/vnd.github+json",
                          "X-GitHub-Api-Version": "2022-11-28"}
@@ -71,8 +87,8 @@ class GitHubVCS:
                 if resp.status_code < 400:
                     return resp
                 if resp.status_code not in _RETRY_STATUS or attempt == attempts:
-                    raise GitHubError(f"{method} {url} -> HTTP {resp.status_code}",
-                                      resp.status_code)
+                    raise GitHubError(f"{method} {url} -> HTTP {resp.status_code}"
+                                      f"{_github_reason(resp)}", resp.status_code)
             time.sleep(delay)
             delay *= 2
         raise GitHubError(f"{method} {url} exhausted retries")
@@ -150,6 +166,15 @@ class GitHubVCS:
             return Counter()
         return Counter(ln for ln in res.stdout.splitlines() if ln.strip())
 
+    def viewer_login(self) -> str:
+        """Login the token acts as, or "" when it cannot say (app installation tokens)."""
+        if self._viewer is None:
+            try:
+                self._viewer = str(self._request("GET", "/user").json().get("login") or "")
+            except GitHubError:
+                self._viewer = ""
+        return self._viewer
+
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str:
         payload = {"commit_id": review.head_sha, "event": review.event, "body": review.body,
                    "comments": [{"path": c.path, "line": c.line, "side": "RIGHT", "body": c.body}
@@ -159,12 +184,15 @@ class GitHubVCS:
         return str(d.get("id", ""))
 
     def review_comments(self, repo: str, number: int, review_id: str) -> list[PostedComment]:
+        # The per-review endpoint omits `line`; the PR-wide list has it, so filter that by review.
         out: list[PostedComment] = []
         page = 1
         while True:
-            items = self._request("GET", f"/repos/{repo}/pulls/{number}/reviews/{review_id}"
-                                  "/comments", params={"per_page": 100, "page": page}).json()
+            items = self._request("GET", f"/repos/{repo}/pulls/{number}/comments",
+                                  params={"per_page": 100, "page": page}).json()
             for c in items:
+                if str(c.get("pull_request_review_id")) != str(review_id):
+                    continue
                 out.append(PostedComment(id=int(c["id"]), path=str(c.get("path") or ""),
                                          line=int(c.get("line") or c.get("original_line") or 0)))
             if len(items) < 100:

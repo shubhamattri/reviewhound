@@ -106,6 +106,8 @@ class VCS(Protocol):
 
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str: ...
 
+    def viewer_login(self) -> str: ...
+
 
 @runtime_checkable
 class ReviewThreads(Protocol):

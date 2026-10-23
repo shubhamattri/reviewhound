@@ -50,3 +50,12 @@ def render_dry_run(review: ReviewPayload, decision: PolicyDecision) -> str:
         for f, reason in decision.held:
             out.append(f"- {f.file}:{f.line} [{f.severity.name.lower()}] {f.title} -> {reason}")
     return "\n".join(out)
+
+
+def own_pr_review(review: ReviewPayload) -> ReviewPayload:
+    """GitHub forbids approving or requesting changes on your own PR: post the verdict as text."""
+    verdict = {"REQUEST_CHANGES": "changes requested", "APPROVE": "approved"}[review.event]
+    note = (f"Verdict: {verdict}. Posted as a comment because this account opened the pull "
+            "request, and GitHub does not let an account give a verdict on its own pull request.")
+    return ReviewPayload(head_sha=review.head_sha, event="COMMENT",
+                         body=f"{review.body}\n{note}", comments=review.comments)

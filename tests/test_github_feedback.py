@@ -259,6 +259,7 @@ def test_shadow_and_dry_run_never_dismiss(tmp_path: Path) -> None:
 # GitHubVCS endpoints
 
 def test_github_review_comments_and_dismissal_requests(tmp_path: Path) -> None:
+    """Shaped like real GitHub: only the PR-wide comment list carries `line`."""
     seen: list[tuple[str, str, str]] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -266,20 +267,21 @@ def test_github_review_comments_and_dismissal_requests(tmp_path: Path) -> None:
         if req.method == "PUT":
             return httpx.Response(200, json={})
         page = int(req.url.params["page"])
-        items = [{"id": page * 1000 + i, "path": "a.py", "line": i, "original_line": i}
-                 for i in range(100 if page == 1 else 2)]
+        items = [{"id": page * 1000 + i, "path": "a.py", "line": i, "original_line": i,
+                  "pull_request_review_id": 88 if i % 2 == 0 else 99}
+                 for i in range(100 if page == 1 else 3)]
         if page == 2:
-            items[1]["line"] = None
+            items[2]["line"] = None
         return httpx.Response(200, json=items)
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.github.com")
     vcs = GitHubVCS("t", tmp_path, client=client)
     comments = vcs.review_comments("acme/shop", 7, "88")
-    assert len(comments) == 102
-    assert comments[-2:] == [PostedComment(2000, "a.py", 0), PostedComment(2001, "a.py", 1)]
+    assert len(comments) == 52
+    assert comments[-2:] == [PostedComment(2000, "a.py", 0), PostedComment(2002, "a.py", 2)]
     vcs.dismiss_review("acme/shop", 7, "88", "msg")
     assert seen == [
-        ("GET", "/repos/acme/shop/pulls/7/reviews/88/comments", "per_page=100&page=1"),
-        ("GET", "/repos/acme/shop/pulls/7/reviews/88/comments", "per_page=100&page=2"),
+        ("GET", "/repos/acme/shop/pulls/7/comments", "per_page=100&page=1"),
+        ("GET", "/repos/acme/shop/pulls/7/comments", "per_page=100&page=2"),
         ("PUT", "/repos/acme/shop/pulls/7/reviews/88/dismissals",
          json.dumps({"message": "msg", "event": "DISMISS"}, separators=(",", ":")))]
 

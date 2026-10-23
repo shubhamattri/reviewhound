@@ -43,7 +43,9 @@ def test_only_the_bot_review_on_this_head_and_its_comments_are_used() -> None:
     gh = FakeGitHub({
         ("GET", "/repos/o/r/pulls/5/reviews"): [
             review(1, "old-head"), review(3, HEAD), review(4, HEAD, body="LGTM from a human")],
-        ("GET", "/repos/o/r/pulls/5/reviews/3/comments"): [comment(30, "web/cart.ts", 12)],
+        ("GET", "/repos/o/r/pulls/5/comments"): [
+            {**comment(30, "web/cart.ts", 12), "pull_request_review_id": 3},
+            {**comment(31, "web/cart.ts", 15), "pull_request_review_id": 1}],
     })
     found, posted = fetch_bot_review(gh, "o/r", 5, HEAD, sleep=lambda s: None)
     assert found is not None and found["id"] == 3
@@ -61,7 +63,7 @@ def test_review_that_never_appears_times_out_as_none() -> None:
 def test_review_that_appears_late_is_found_by_polling() -> None:
     gh = FakeGitHub({
         ("GET", "/repos/o/r/pulls/5/reviews"): [[], [review(3, HEAD)]],
-        ("GET", "/repos/o/r/pulls/5/reviews/3/comments"): [],
+        ("GET", "/repos/o/r/pulls/5/comments"): [],
     })
     found, _ = fetch_bot_review(gh, "o/r", 5, HEAD, sleep=lambda s: None)
     assert found is not None and found["id"] == 3

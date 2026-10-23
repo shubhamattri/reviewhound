@@ -19,13 +19,14 @@ from reviewhound.index.conventions import learn_conventions
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.paths import language_of, matches_any
 from reviewhound.policy import PolicyDecision, apply_policy
-from reviewhound.poster import build_review, render_dry_run
+from reviewhound.poster import build_review, own_pr_review, render_dry_run
 from reviewhound.prompt import build_prompt
 from reviewhound.providers import ProviderError, ProviderRegistry
 from reviewhound.router import Route, route
 from reviewhound.scanners import Scanner
 from reviewhound.store import ReviewRecord, Store
 from reviewhound.vcs.base import VCS, PullRequest, ReviewPayload, Snapshot
+from reviewhound.vcs.github import GitHubError
 
 log = logging.getLogger(__name__)
 MAX_INDEX_FILES = 5_000
@@ -174,8 +175,20 @@ class Reviewer:
             elif self.store is not None and not self.store.claim_post(repo, number, pr.head_sha):
                 result.outcome = "already-posted"
             else:
+                if result.review.event != "COMMENT" and pr.author and \
+                        pr.author == self.vcs.viewer_login():
+                    result.review = own_pr_review(result.review)
                 try:
                     post_id = self.vcs.post_review(pr, result.review)
+                except GitHubError as exc:
+                    if exc.status is not None and 400 <= exc.status < 500 and exc.status != 429:
+                        # GitHub refused it, so nothing landed: free this head for a later retry.
+                        result.outcome = "post-rejected"
+                        if self.store is not None:
+                            self.store.release_post(repo, number, pr.head_sha)
+                    else:
+                        result.outcome = "post-uncertain"
+                    result.error = str(exc)
                 except Exception as exc:  # noqa: BLE001 - the post may or may not have landed
                     result.outcome = "post-uncertain"
                     result.error = type(exc).__name__

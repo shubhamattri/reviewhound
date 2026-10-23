@@ -107,8 +107,10 @@ def fetch_bot_review(gh: Api, repo: str, number: int, head: str,
                 and (r.get("body") or "").startswith(SUMMARY_PREFIX)]
         if ours:
             review = ours[-1]
-            comments = gh.call("GET", f"/repos/{repo}/pulls/{number}/reviews/{review['id']}"
-                                      "/comments", params={"per_page": 100})
+            # Only the PR-wide list carries `line`; keep this review's comments.
+            comments = [c for c in gh.call("GET", f"/repos/{repo}/pulls/{number}/comments",
+                                           params={"per_page": 100})
+                        if c.get("pull_request_review_id") == review["id"]]
             posted = [{"id": c["id"], "path": c["path"], "line": c.get("line"),
                        "title": c["body"].split("\n", 1)[0].replace("**", "").strip()}
                       for c in comments]
