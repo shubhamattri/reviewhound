@@ -128,6 +128,8 @@ class Store:
         self._clock = clock
         c = sqlite3.connect(self.path, timeout=30)
         try:
+            # Switch to WAL once here: racing writers switching it later can fail with "locked".
+            c.execute("PRAGMA journal_mode=WAL")
             c.executescript(_SCHEMA)
             c.executescript(_GITHUB_SCHEMA)
         finally:

@@ -1,8 +1,11 @@
+import sqlite3
+from pathlib import Path
+
 import pytest
 
 from reviewhound.config import Severity
 from reviewhound.findings import Finding
-from reviewhound.store import ReviewRecord
+from reviewhound.store import ReviewRecord, Store
 from tests.conftest import Backend, FakeClock
 
 
@@ -84,3 +87,13 @@ def test_only_one_post_per_head(backend: Backend) -> None:
     assert s.claim_post("A/b", 1, "h1") is True
     assert s.claim_post("a/b", 1, "h1") is False
     assert s.claim_post("a/b", 1, "h2") is True
+
+
+def test_new_sqlite_store_is_in_wal_mode_once_constructed(tmp_path: Path) -> None:
+    # Before any transaction: writers racing to switch a fresh file to WAL can hit "locked".
+    Store(tmp_path / "s.db")
+    c = sqlite3.connect(tmp_path / "s.db")
+    try:
+        assert c.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        c.close()
