@@ -6,6 +6,13 @@ authors = [
     { name = "Shubham Attri" }
 ]
 requires-python = ">=3.12"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["code-review", "pull-request", "github", "llm", "static-analysis"]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.14.1",
@@ -22,6 +29,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "mypy>=2.4.0",
+    "playwright>=1.64.1",
     "pytest>=9.1.1",
     "ruff>=0.17.2",
     "types-pyyaml>=6.0.12.20260906",
@@ -33,7 +41,7 @@ reviewhound = "reviewhound.cli:main"
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src/reviewhound"]
+files = ["src/reviewhound", "qa"]
 
 [[tool.mypy.overrides]]
 module = ["tree_sitter_python", "tree_sitter_typescript"]
