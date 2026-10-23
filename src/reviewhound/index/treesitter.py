@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 import tree_sitter_go
@@ -12,7 +12,7 @@ import tree_sitter_python
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
-from reviewhound.paths import language_of
+from reviewhound.paths import LANGUAGES, language_of
 
 _PY = Language(tree_sitter_python.language())
 _TS = Language(tree_sitter_typescript.language_typescript())
@@ -149,21 +149,24 @@ def index_file(path: str, source: str) -> FileIndex | None:
 class CodeIndex:
     """Index of one repo snapshot (normally the PR head)."""
 
-    def __init__(self) -> None:
+    def __init__(self, languages: Iterable[str] = LANGUAGES) -> None:
+        self.languages = frozenset(languages)
         self.files: dict[str, FileIndex] = {}
         self.sources: dict[str, str] = {}
         self._by_name: dict[str, list[Definition]] = defaultdict(list)
         self._callers: dict[str, set[str]] = defaultdict(set)
 
     @classmethod
-    def build(cls, sources: dict[str, str]) -> CodeIndex:
-        idx = cls()
+    def build(cls, sources: dict[str, str], languages: Iterable[str] = LANGUAGES) -> CodeIndex:
+        idx = cls(languages)
         for path, src in sources.items():
             idx.add(path, src)
         return idx
 
     def add(self, path: str, source: str) -> None:
         self.sources[path] = source
+        if not self.covers(path):
+            return
         fi = index_file(path, source)
         if fi is None:
             return
@@ -175,6 +178,16 @@ class CodeIndex:
         for owner, callees in fi.calls.items():
             for callee in callees:
                 self._callers[callee].add(f"{path}::{owner}")
+
+    def covers(self, path: str) -> bool:
+        """True when facts about `path` can be checked: its language is parsed by this index."""
+        return language_of(path) in self.languages
+
+    def qualified_matches(self, dotted: str) -> list[Definition]:
+        """Definitions whose qualified name is `dotted` or ends with `.dotted`."""
+        suffix = "." + dotted
+        return [d for d in self.iter_definitions()
+                if d.qualified == dotted or d.qualified.endswith(suffix)]
 
     def definitions(self, name: str) -> list[Definition]:
         return list(self._by_name.get(name, []))
@@ -189,8 +202,9 @@ class CodeIndex:
 
     def calls_of(self, qualified_or_name: str) -> set[str] | None:
         """Callees of a function, or None when the function is unknown or ambiguous."""
+        name = qualified_or_name
         hits = [fi.calls[q] for fi in self.files.values() for q in fi.calls
-                if q == qualified_or_name or q.rsplit(".", 1)[-1] == qualified_or_name]
+                if q == name or q.rsplit(".", 1)[-1] == name or q.endswith("." + name)]
         if len(hits) != 1:
             return None
         return set(hits[0])

@@ -116,6 +116,101 @@ def test_unknown_claim_keeps_finding_but_unverified() -> None:
     assert f.verified is False
 
 
+DOTTED_BASE = {"m.py": '''class Repo:
+    def save(self, x):
+        return x
+
+
+class Cache:
+    def get(self, k):
+        return k
+'''}
+DOTTED_HEAD = {"m.py": DOTTED_BASE["m.py"] + '''
+
+def run(c):
+    return c.get(1)
+'''}
+
+
+def dotted_checker() -> ClaimChecker:
+    return ClaimChecker(diff_file_maps(DOTTED_BASE, DOTTED_HEAD), CodeIndex.build(DOTTED_HEAD))
+
+
+def dotted(claim: Claim) -> tuple[str, str | None]:
+    f, reason = dotted_checker().check(mf(file="m.py", line=12, evidence_quote="return c.get(1)",
+                                          claims=[claim]), "m")
+    return f.claim_results[0].verdict, reason
+
+
+@pytest.mark.parametrize("claim, verdict, reason", [
+    (Claim(kind="symbol_exists", name="Repo.save"), "true", None),
+    (Claim(kind="symbol_exists", name="save"), "true", None),
+    (Claim(kind="symbol_exists", name="Cache.save"), "false",
+     "false claim: Cache has no member save"),
+    (Claim(kind="calls", caller="Cache.save", callee="get"), "false",
+     "false claim: function Cache.save does not exist"),
+    (Claim(kind="not_calls", caller="Repo.save", callee="get"), "true", None),
+    (Claim(kind="symbol_exists", name="requests.get"), "unknown", None),
+])
+def test_dotted_symbol_must_match_its_qualified_definition(claim: Claim, verdict: str,
+                                                            reason: str | None) -> None:
+    assert dotted(claim) == (verdict, reason)
+
+
+def test_dotted_names_with_braces_from_the_model_do_not_crash() -> None:
+    assert dotted(Claim(kind="calls", caller="Cache.{x}", callee="get")) == (
+        "false", "false claim: function Cache.{x} does not exist")
+    assert dotted(Claim(kind="symbol_exists", name="Cache.{0}")) == (
+        "false", "false claim: Cache has no member {0}")
+
+
+def test_dotted_symbol_matches_a_nested_qualified_suffix() -> None:
+    idx = CodeIndex.build({"n.py": "class A:\n    class B:\n        def go(self):\n"
+                                   "            pass\n"})
+    c = ClaimChecker(diff_file_maps({}, {"n.py": idx.sources["n.py"]}), idx)
+    assert c.check_claim(Claim(kind="symbol_exists", name="B.go"), "n.py").verdict == "true"
+    assert c.check_claim(Claim(kind="symbol_exists", name="A.B.go"), "n.py").verdict == "true"
+    assert c.check_claim(Claim(kind="symbol_exists", name="A.go"), "n.py").verdict == "false"
+
+
+def test_quote_spanning_blank_lines_matches_and_locates_the_changed_line() -> None:
+    src = "def f():\n    a = 1\n\n    return a\n"
+    assert find_quote(src, "a = 1\n\nreturn a") == [2]
+    assert find_quote(src, "a = 1\nreturn a") == [2]
+    base = {"q.py": "def f():\n    a = 1\n\n    return 0\n"}
+    head = {"q.py": src}
+    c = ClaimChecker(diff_file_maps(base, head), CodeIndex.build(head))
+    f, reason = c.check(mf(file="q.py", line=1, evidence_quote="a = 1\nreturn a"), "m")
+    assert (reason, f.line, f.verified) == (None, 4, True)
+
+
+def test_claims_in_languages_the_index_does_not_cover_are_unknown_not_false() -> None:
+    base = {"lib/pay.rb": "def charge(amount)\n  gateway.charge(amount)\nend\n"}
+    head = {"lib/pay.rb": "def charge(amount)\n  gateway.charge(amount)\n  rescue nil\nend\n"}
+    c = ClaimChecker(diff_file_maps(base, head), CodeIndex.build(head))
+    f, reason = c.check(mf(file="lib/pay.rb", line=3, evidence_quote="rescue nil", claims=[
+        Claim(kind="symbol_exists", name="charge"),
+        Claim(kind="calls", caller="charge", callee="charge"),
+        Claim(kind="quote", file="lib/gateway.rb", text="def charge"),
+        Claim(kind="quote", file="lib/pay.rb", text="gateway.charge(amount)")]), "m")
+    assert reason is None
+    assert [r.verdict for r in f.claim_results] == ["unknown", "unknown", "unknown", "true"]
+    assert f.verified is False
+
+
+def test_covered_language_still_returns_false_for_missing_things() -> None:
+    _, reason = checker().check(mf(claims=[Claim(kind="quote", file="lib/x.py", text="abc")]),
+                                "m")
+    assert reason == "false claim: file lib/x.py not found at head"
+
+
+def test_index_limited_to_configured_languages_treats_others_as_uncovered() -> None:
+    idx = CodeIndex(languages={"python"})
+    idx.add("a.go", "package a\n\nfunc Run() {}\n")
+    assert (idx.covers("a.go"), idx.covers("a.py"), idx.is_defined("Run")) == (False, True, False)
+    assert idx.sources["a.go"] == "package a\n\nfunc Run() {}\n"
+
+
 def test_trivial_quote_counts_as_no_evidence() -> None:
     f, reason = checker().check(mf(line=11, evidence_quote="i)", severity="major"), "model:x")
     assert reason is None

@@ -60,7 +60,7 @@ class _Timer:
 
 
 def build_index(head: Snapshot, diff: Diff, cfg: RepoConfig) -> CodeIndex:
-    index = CodeIndex()
+    index = CodeIndex(cfg.languages)
     paths = [p for p in head.paths() if language_of(p) in cfg.languages
              and not matches_any(p, cfg.ignore_paths)]
     changed = set(diff.changed_paths)

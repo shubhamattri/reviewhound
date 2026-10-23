@@ -97,11 +97,12 @@ class Finding:
     verified: bool = False
     claim_results: list[ClaimResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    identity: str = ""  # scanner-set short hash that tells apart same-looking findings
 
     @property
     def fingerprint(self) -> str:
         """Stable identity across re-reviews: survives line shifts, not content changes."""
-        anchor = " ".join(self.evidence_quote.split()) or self.title.lower()
+        anchor = self.identity or " ".join(self.evidence_quote.split()) or self.title.lower()
         raw = f"{self.file}\x00{self.category}\x00{anchor}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
