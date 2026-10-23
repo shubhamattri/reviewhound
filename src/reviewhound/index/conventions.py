@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from reviewhound.index.treesitter import CodeIndex
 
 _AUTH_NAME = re.compile(
-    r"(auth|login_required|permission|authori[sz]e|require_role|has_role|is_admin|can_access|"
-    r"ensure_access|check_access|guard)", re.IGNORECASE)
+    r"(auth|login_required|permission|authori[sz]e|^require_|^ensure_|has_role|admin|can_access|"
+    r"check_access|guard)", re.IGNORECASE)
 _LOG_CALL = re.compile(r"\b(logger|log|logging|console)\.(debug|info|warn|warning|error|exception)\b")
 _RAISE_TYPE = re.compile(r"\b(?:raise|throw new)\s+([A-Z][A-Za-z0-9_]*)")
 
