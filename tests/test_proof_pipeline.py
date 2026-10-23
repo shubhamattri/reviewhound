@@ -57,7 +57,7 @@ def test_proof_off_by_default_changes_nothing() -> None:
     assert (f.proof, f.proof_test, f.severity) == (None, "", Severity.BLOCKER)
     assert "proof" not in result.timings
     assert len(fake.prompts) == 1
-    assert "Proven" not in review_of(result).comments[0].body
+    assert "Reproduced" not in review_of(result).comments[0].body
 
 
 def test_real_bug_is_proven_posted_with_the_test_and_timed(tmp_path: Path) -> None:
@@ -72,19 +72,20 @@ def test_real_bug_is_proven_posted_with_the_test_and_timed(tmp_path: Path) -> No
     [posted] = vcs.posted
     assert posted.event == "REQUEST_CHANGES"
     body = posted.comments[0].body
-    assert "**Proven:** a generated test fails on this PR's head." in body
+    assert "**Reproduced by a generated test:** it fails on this PR's head." in body
     assert f"<details><summary>Failing test</summary>\n\n```python\n{TEST_CODE}```" in body
     assert "First item is skipped" in fake.prompts[1]
 
 
-def test_unproven_blocker_is_downgraded_to_major_when_configured() -> None:
+def test_unproven_blocker_is_downgraded_but_the_verdict_is_kept() -> None:
+    # PR code runs in the sandbox and can make any test pass, so a proof never relaxes a review.
     finding = {**FINDING, "evidence_quote": "for x in xs:"}
     result, _, _ = review(CORRECT, ON + "  downgrade_unproven: true\n", [answer(finding), PROOF])
     assert result.decision is not None
     [f] = result.decision.post
     assert (f.proof, f.severity) == ("not_proven", Severity.MAJOR)
-    assert review_of(result).event == "COMMENT"
-    assert "Proven" not in review_of(result).comments[0].body
+    assert review_of(result).event == "REQUEST_CHANGES"
+    assert "Reproduced" not in review_of(result).comments[0].body
     assert "[major]" in review_of(result).comments[0].body
 
 
@@ -165,3 +166,19 @@ def test_findings_below_min_severity_are_not_sent_for_proof() -> None:
     [f] = result.decision.post
     assert f.proof is None
     assert len(fake.prompts) == 1
+
+
+def test_held_unreproduced_blocker_keeps_the_verdict_and_is_named_in_the_body() -> None:
+    finding = {**FINDING, "evidence_quote": "for x in xs:"}
+    strict = "policy:\n  min_severity_to_post: blocker\n" + ON + "  downgrade_unproven: true\n"
+    result, _, _ = review(CORRECT, strict, [answer(finding), PROOF])
+    assert result.decision is not None
+    assert result.decision.post == []
+    [(f, reason)] = result.decision.held
+    assert (f.severity, reason) == (Severity.MAJOR, "below blocker after an unreproduced proof")
+    payload = review_of(result)
+    assert payload.event == "REQUEST_CHANGES"
+    assert payload.body.splitlines()[1:] == [
+        "No verified issues found.",
+        ("- `calc/stats.py:3` [major] First item is skipped (held: a generated test passed on "
+         "this head; the verdict was set before the proof and is kept)")]

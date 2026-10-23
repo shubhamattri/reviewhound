@@ -489,9 +489,16 @@ def select_runner(cfg: ProofConfig, runners: Mapping[str, SandboxRunner]) -> San
     return runners.get(cfg.runner)
 
 
+UNREPRODUCED = "after an unreproduced proof"
+
+
 def run_proof_stage(prover: Prover | None, decision: PolicyDecision, cfg: RepoConfig,
                     head: Snapshot, index: CodeIndex) -> None:
-    """Attach proofs to the findings about to be posted. Never raises."""
+    """Attach proofs to the findings about to be posted.
+
+    PR code runs in the same sandbox as the test and can forge its result, so a proof never
+    makes the review more lenient: the verdict computed before proofs is always kept.
+    """
     pc = cfg.proof
     candidates = eligible(pc, decision.post)
     if not candidates:
@@ -507,10 +514,12 @@ def run_proof_stage(prover: Prover | None, decision: PolicyDecision, cfg: RepoCo
         for f in candidates:
             _attach(f, ProofResult("inconclusive", str(exc)))
         return
+    verdict = decision.event
     try:
         _prove_each(prover, candidates, files, index, pc)
     finally:
-        _reapply_floor_and_event(decision, cfg)
+        _reapply_floor(decision, cfg)
+        decision.event = verdict
 
 
 def _prove_each(prover: Prover, candidates: list[Finding], files: Mapping[str, str],
@@ -537,16 +546,12 @@ def _attach(f: Finding, r: ProofResult) -> None:
     f.notes.append(f"proof {r.verdict}: {r.reason}")
 
 
-def _reapply_floor_and_event(decision: PolicyDecision, cfg: RepoConfig) -> None:
+def _reapply_floor(decision: PolicyDecision, cfg: RepoConfig) -> None:
     floor = Severity.parse(cfg.policy.min_severity_to_post)
     keep: list[Finding] = []
     for f in decision.post:
         if f.severity < floor:
-            decision.held.append((f, (f"below {cfg.policy.min_severity_to_post} after an "
-                                     "unreproduced proof")))
+            decision.held.append((f, f"below {cfg.policy.min_severity_to_post} {UNREPRODUCED}"))
         else:
             keep.append(f)
     decision.post = keep
-    blocking = Severity.parse(cfg.policy.blocking_severity)
-    decision.event = "REQUEST_CHANGES" if any(f.severity >= blocking for f in keep) \
-        else "COMMENT"

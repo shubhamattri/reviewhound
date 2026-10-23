@@ -353,7 +353,8 @@ def test_not_proven_blocker_is_downgraded_only_when_configured() -> None:
     f = finding()
     decision, _ = stage([f], RecordingRunner(sample("pass", 0)), [GOOD],
                         "proof:\n  enabled: true\n  downgrade_unproven: true\n")
-    assert (f.proof, f.severity, decision.event) == ("not_proven", Severity.MAJOR, "COMMENT")
+    assert (f.proof, f.severity, decision.event) == ("not_proven", Severity.MAJOR,
+                                                     "REQUEST_CHANGES")
     assert decision.post == [f]
     g = finding()
     decision, _ = stage([g], RecordingRunner(sample("pass", 0)), [GOOD],
@@ -369,7 +370,7 @@ def test_downgrade_below_the_posting_floor_holds_the_finding() -> None:
                         "proof:\n  enabled: true\n  downgrade_unproven: true\n")
     assert decision.post == []
     assert decision.held == [(f, "below blocker after an unreproduced proof")]
-    assert decision.event == "COMMENT"
+    assert decision.event == "REQUEST_CHANGES"
 
 
 def test_inconclusive_and_proven_never_change_severity() -> None:
@@ -412,7 +413,7 @@ def test_proven_comment_says_so_and_folds_the_test_in_details() -> None:
     f.proof, f.proof_test = "proven", "def test_x():\n    s = '```'\n    assert s == ''\n"
     body = _comment_body(f)
     assert body == ("**[blocker] first element skipped**\n\nrange starts at 1\n\n"
-                    "**Proven:** a generated test fails on this PR's head.\n\n"
+                    "**Reproduced by a generated test:** it fails on this PR's head.\n\n"
                     "<details><summary>Failing test</summary>\n\n````python\n"
                     "def test_x():\n    s = '```'\n    assert s == ''\n````\n\n</details>")
 
@@ -427,7 +428,7 @@ def test_body_only_findings_say_proven_and_skipped_files_follow() -> None:
                           not_reviewed=[("big.bin", "diff too large for GitHub to return")])
     assert review.comments == []
     assert review.body.splitlines()[2:] == [
-        "- `calc/stats.py:3` [blocker] first element skipped (proven by a failing test)",
+        "- `calc/stats.py:3` [blocker] first element skipped (reproduced by a generated test)",
         "- `calc/stats.py:3` [blocker] other",
         "- not reviewed: big.bin (diff too large for GitHub to return)"]
 
@@ -480,7 +481,7 @@ def test_floor_and_verdict_are_reapplied_even_if_proving_crashes(
     decision = PolicyDecision(post=[f], event="REQUEST_CHANGES")
     with pytest.raises(MemoryError):
         run_proof_stage(p, decision, cfg, DictSnapshot(HEAD), CodeIndex.build(HEAD))
-    assert (decision.post, decision.event) == ([f], "COMMENT")
+    assert (decision.post, decision.event) == ([f], "REQUEST_CHANGES")
 
 
 def test_report_symlinked_to_a_regular_file_outside_is_not_followed(tmp_path: Path) -> None:
