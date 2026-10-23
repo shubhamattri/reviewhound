@@ -1,0 +1,10 @@
+# Image for `proof.runner: docker`. Build it on every worker host before turning proofs on:
+#   docker build -f Dockerfile.proof -t reviewhound-proof:latest .
+# Reviewhound runs it with --pull never, so it is never fetched from a registry.
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir "pytest==8.3.5"
+
+# Reviewhound also passes --user 65534:65534; this is the same user, for direct `docker run`s.
+USER 65534:65534
+WORKDIR /tmp
