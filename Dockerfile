@@ -7,7 +7,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.10.9 /uv /uvx /bin/
 # git: the worker checks out PR heads. The model runs through the `claude` CLI, which needs Node;
 # build with --build-arg INSTALL_CLAUDE_CLI=1 for worker images (serve does not need it).
 ARG INSTALL_CLAUDE_CLI=0
-ARG CLAUDE_CODE_VERSION=latest
+# Pinned so a rebuild never pulls an unreviewed CLI; bump it deliberately.
+ARG CLAUDE_CODE_VERSION=2.1.299
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && if [ "$INSTALL_CLAUDE_CLI" = "1" ]; then \

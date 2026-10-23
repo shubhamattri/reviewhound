@@ -1,0 +1,20 @@
+# GitHub App mode, layered on docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.app.yml up -d
+# The private key is a file on the host, mounted read-only as a secret; it is never put in the
+# environment or the image. It must be readable by uid 10001 (the image's user). See docs/deploy.md.
+
+services:
+  serve:
+    environment:
+      REVIEWHOUND_APP_ID: ${REVIEWHOUND_APP_ID:?set REVIEWHOUND_APP_ID}
+
+  worker:
+    environment:
+      REVIEWHOUND_APP_ID: ${REVIEWHOUND_APP_ID:?set REVIEWHOUND_APP_ID}
+      REVIEWHOUND_APP_PRIVATE_KEY_PATH: /run/secrets/github_app_key
+    secrets:
+      - github_app_key
+
+secrets:
+  github_app_key:
+    file: ${REVIEWHOUND_APP_PRIVATE_KEY_FILE:?set REVIEWHOUND_APP_PRIVATE_KEY_FILE}
