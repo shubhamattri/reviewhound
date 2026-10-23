@@ -50,7 +50,8 @@ def handle_event(queue: JobQueue, event: str, payload: dict[str, Any],
         return 400, "malformed pull_request payload"
     if not repo:
         return 400, "missing repository"
-    installation = (payload.get("installation") or {}).get("id")
+    inst = payload.get("installation")
+    installation = inst.get("id") if isinstance(inst, dict) else inst
     if installation is not None and (isinstance(installation, bool)
                                      or not isinstance(installation, int)):
         return 400, "malformed installation id"

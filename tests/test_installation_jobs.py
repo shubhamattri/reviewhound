@@ -104,6 +104,8 @@ def test_webhook_rejects_malformed_installation_id(tmp_path: Path) -> None:
         400, "malformed installation id")
     assert handle_event(q, "pull_request", pr_event(installation=True)) == (
         400, "malformed installation id")
+    assert handle_event(q, "pull_request", {**pr_event(), "installation": "x"}) == (
+        400, "malformed installation id")
     assert q.claim() is None
 
 
