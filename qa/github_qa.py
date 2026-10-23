@@ -92,6 +92,12 @@ def _in_range(c: dict[str, Any], e: dict[str, Any]) -> bool:
             and e["lines"][0] <= c["line"] <= e["lines"][1])
 
 
+def _describes(c: dict[str, Any], e: dict[str, Any]) -> bool:
+    """A planted bug counts as found only if a comment in its range actually talks about it."""
+    text = f"{c['title']} {c.get('body', '')}".lower()
+    return _in_range(c, e) and any(w.lower() in text for w in e.get("mentions", [""]))
+
+
 def fetch_bot_review(gh: Api, repo: str, number: int, head: str,
                      timeout_s: float = 60, sleep: Callable[[float], None] = time.sleep
                      ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -112,7 +118,8 @@ def fetch_bot_review(gh: Api, repo: str, number: int, head: str,
                                            params={"per_page": 100})
                         if c.get("pull_request_review_id") == review["id"]]
             posted = [{"id": c["id"], "path": c["path"], "line": c.get("line"),
-                       "title": c["body"].split("\n", 1)[0].replace("**", "").strip()}
+                       "title": c["body"].split("\n", 1)[0].replace("**", "").strip(),
+                       "body": c["body"]}
                       for c in comments]
             return review, posted
         if waited >= timeout_s:
@@ -126,7 +133,7 @@ def api_checks(review: dict[str, Any] | None, posted: list[dict[str, Any]],
     checks = [Check("API: review by Reviewhound on this head", review is not None,
                     str(review["id"]) if review else "no review on this head")]
     for e in expected:
-        hit = [c for c in posted if _in_range(c, e)]
+        hit = [c for c in posted if _describes(c, e)]
         checks.append(Check(f"API: comment for {e['bug']}", bool(hit),
                             f"{e['file']}:{e['lines']} -> {[h['line'] for h in hit]}"))
     stray = [c for c in posted if not any(_in_range(c, e) for e in expected)]

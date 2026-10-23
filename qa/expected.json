@@ -5,6 +5,12 @@
     "lines": [
       20,
       25
+    ],
+    "mentions": [
+      "require_role",
+      "authoriz",
+      "role check",
+      "permission"
     ]
   },
   {
@@ -13,6 +19,13 @@
     "lines": [
       21,
       24
+    ],
+    "mentions": [
+      "none",
+      "missing order",
+      "unknown",
+      "does not exist",
+      "typeerror"
     ]
   },
   {
@@ -21,6 +34,10 @@
     "lines": [
       12,
       12
+    ],
+    "mentions": [
+      "assign",
+      "==="
     ]
   }
 ]

@@ -49,7 +49,8 @@ def test_only_the_bot_review_on_this_head_and_its_comments_are_used() -> None:
     })
     found, posted = fetch_bot_review(gh, "o/r", 5, HEAD, sleep=lambda s: None)
     assert found is not None and found["id"] == 3
-    assert posted == [{"id": 30, "path": "web/cart.ts", "line": 12, "title": "[major] t"}]
+    assert posted == [{"id": 30, "path": "web/cart.ts", "line": 12, "title": "[major] t",
+                       "body": "**[major] t**\n\nbody"}]
 
 
 def test_review_that_never_appears_times_out_as_none() -> None:
@@ -185,3 +186,14 @@ def test_saved_login_must_be_signed_in(tmp_path: Path, content: str, user: str) 
     f.write_text(content)
     assert github_qa.saved_login_user(f) == user
     assert github_qa.saved_login_user(tmp_path / "missing.json") == ""
+
+
+def test_a_comment_in_range_about_something_else_does_not_count() -> None:
+    expected = [{"bug": "crash on missing order", "file": "shop/orders.py", "lines": [21, 24],
+                 "mentions": ["none", "missing order"]}]
+    cap = {"id": 1, "path": "shop/orders.py", "line": 22, "title": "[major] Refund cap",
+           "body": "Cap ignores the refunded total."}
+    crash = {**cap, "id": 2, "body": "ORDERS.get returns None for an unknown id."}
+    assert [c.ok for c in api_checks(review(3, HEAD), [cap], expected)][1] is False
+    assert [c.ok for c in api_checks(review(3, HEAD), [cap, crash], expected)][1:3] == [True,
+                                                                                         True]
