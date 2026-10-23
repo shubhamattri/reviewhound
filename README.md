@@ -56,9 +56,12 @@ uv run reviewhound enqueue owner/repo 12     # manual / missed-PR sweep
 uv run reviewhound feedback owner/repo 12 <fingerprint> declined --detail "intended"
 ```
 
-Model calls go through `claude -p` with `ANTHROPIC_API_KEY` removed from the environment, in an
-empty working directory with only local settings loaded, so no other project's instructions
-leak into a review.
+Model calls go through `claude -p` in an empty working directory with only local settings loaded,
+so no other project's instructions leak into a review. The `claude` process gets only `PATH`,
+`HOME`, `USER`, `LOGNAME`, `LANG`, `TMPDIR`, `SHELL`, `CLAUDE_CODE_OAUTH_TOKEN` and
+`CLAUDE_CONFIG_DIR`: never `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, the database URL or the webhook
+secret. `git` and `semgrep` get `PATH`, `HOME`, `LANG`, the proxy variables (`HTTPS_PROXY`,
+`HTTP_PROXY`, `NO_PROXY`, either case) and `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`.
 
 ## Config (`.reviewhound.yml`, all optional)
 
@@ -109,7 +112,9 @@ result is read from pytest's `--junitxml` report, never from its console text:
 A proven finding's comment says "Reproduced by a generated test" and carries the test in a
 collapsed `<details>` block. A held, downgraded blocker is still named in the review body. A
 proof problem never fails the review, and all proofs in one review share a time budget
-(`--max-proof-seconds`, default 300).
+(`--max-proof-seconds`, default 300). The budget counts the Docker runner's own worst case
+(`docker info`, start, exec slack, two read-backs and `rm`: 115 s with the default 30 s start
+grace) on top of each test's timeout, so a budget under about 116 s runs no Docker proof.
 
 **Threat model.** The generated test runs in the same sandbox as the PR's own code, and that
 code (a `conftest.py`, a `sitecustomize.py`, an import side effect) can rewrite the report or
@@ -172,7 +177,7 @@ of one person's token, and developers' reactions on GitHub flow back as feedback
 | `REVIEWHOUND_WEBHOOK_SECRET` | `serve` | The App's webhook secret. Required. |
 | `REVIEWHOUND_APP_ID` | `serve`, `worker` | The App id. `serve` uses it to ignore the App's own replies. |
 | `REVIEWHOUND_APP_PRIVATE_KEY_PATH` | `worker` | Path to the App's private key (`.pem`). |
-| `REVIEWHOUND_ALLOWED_OWNERS` | `serve` | Comma-separated repo owners (users or orgs) to accept events for; `--allowed-owner` adds more. Others get a 202 "ignored" and no job. Unset accepts every owner, and `serve` warns at start. **Set it.** |
+| `REVIEWHOUND_ALLOWED_OWNERS` | `serve` | Comma-separated repo owners (users or orgs) to accept events for; `--allowed-owner` adds more. Others get a 202 "ignored" and no job. Unset (or empty) accepts every owner, and `serve` warns at start. Set to only spaces or commas, `serve` refuses to start. **Set it.** |
 | `REVIEWHOUND_METRICS_TOKEN` | `serve` | `/metrics` then needs `Authorization: Bearer <token>`; anything else gets 401. Unset leaves `/metrics` open, and `serve` warns at start. **Set it.** |
 | `GITHUB_TOKEN` | `enqueue` | Reads the PR head for a manual `enqueue`. The worker does not use it in App mode: a job with no installation id (manual `enqueue`, sweep) looks the installation up by repo, and a repo without the App installed fails the job at once. |
 
@@ -198,7 +203,27 @@ What the App does with the events:
   reviews on that PR are dismissed. A failed dismissal is logged, recorded, and retried after
   the next posted review; it never fails the review.
 
-The webhook only writes to the local database; it never calls GitHub.
+The webhook only writes to the local database; it never calls GitHub. A request body must
+arrive within 30 seconds in total (and no single read may stall past 10 seconds); a slower
+client gets 408 and its connection is closed.
+
+How one posting job ends:
+
+| What happened | Review outcome | Job | Head claim |
+|---|---|---|---|
+| Posted (or posted with comments moved into the body after a 400/422) | `posted` | done | kept, with the review id |
+| PR head moved, checked right before each POST | `head-moved` | done | freed |
+| Lease lost, checked right before each POST | `lease-lost` | retried | freed |
+| 400/422 again after the body retry | `post-rejected` | dead, with GitHub's reason | freed |
+| 401, 403, 408 on the POST | (raised) | retried | freed |
+| 404 or another 4xx on the POST | (raised) | dead | freed |
+| 429, 5xx, timeout: it may have landed | `post-uncertain` | done | kept, never posted twice |
+| Anything raised before the POST (token lookup, head lookup) | (raised) | by error class | freed |
+| Posted, but recording it failed | (raised) | retried; the retry records it and runs the follow-ups without posting again | kept |
+
+Known limit: a resolve event redelivered byte for byte after an unresolve of the same thread is
+treated as already applied, so the finding stays `reopened`. GitHub sends a fresh body (new
+timestamps) for a real second resolve, so this needs a manual redelivery to happen.
 
 ## Contributing and roadmap
 

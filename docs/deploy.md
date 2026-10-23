@@ -21,8 +21,8 @@ fine for one machine. For more than one host, or for containers, use Postgres.
 | `REVIEWHOUND_APP_ID` | serve, worker | App mode: the GitHub App's id. Set together with the key path. |
 | `REVIEWHOUND_APP_PRIVATE_KEY_PATH` | worker | App mode: path to the App's private key file (compose mounts it at `/run/secrets/github_app_key`). |
 | `REVIEWHOUND_METRICS_TOKEN` | serve | When set, `/metrics` requires `Authorization: Bearer <token>`. Set it: `/metrics` is served on the published webhook port. |
-| `REVIEWHOUND_ALLOWED_OWNERS` | serve | The repository owners whose webhooks become jobs (format: `serve --help`); others are ignored. Unset allows every owner, so set it. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | worker | Lets the `claude` CLI run without an interactive login (create one with `claude setup-token`). `ANTHROPIC_API_KEY` is deliberately removed from the model's environment, so reviews do not bill an API key. |
+| `REVIEWHOUND_ALLOWED_OWNERS` | serve | The repository owners whose webhooks become jobs (format: `serve --help`); others are ignored. Unset or empty allows every owner, so set it; only spaces or commas stops `serve` at start. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | worker | Lets the `claude` CLI run without an interactive login (create one with `claude setup-token`). The `claude` process gets only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `TMPDIR`, `SHELL`, this token and `CLAUDE_CONFIG_DIR`; `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, the database URL and the webhook secret never reach it. |
 
 Useful flags:
 
@@ -35,7 +35,8 @@ Useful flags:
   worker reclaims the job.
 - `--max-proof-seconds` (default 300): total sandbox time for all proofs in one review,
   whatever a repo's `proof.timeout_s` asks for. When it runs out, the remaining proofs are
-  inconclusive and no more proof prompts are sent.
+  inconclusive and no more proof prompts are sent. The Docker runner's own worst case (115 s with
+  the default start grace) counts against it too, so keep it above about 116 s.
 - `--allow-local-proof-repo OWNER/NAME` (repeatable): the only repos whose
   `proof.runner: local` may run generated tests as plain processes on the worker. A repo's own
   config can never enable it. See "Proof runs in Docker" for the default runner.
