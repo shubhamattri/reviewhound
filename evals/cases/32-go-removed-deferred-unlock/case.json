@@ -5,7 +5,13 @@
       "file": "cache/cache.go",
       "line": 12,
       "category": "concurrency",
-      "side": "LEFT"
+      "side": "LEFT",
+      "also": [
+        {
+          "line": 11,
+          "side": "RIGHT"
+        }
+      ]
     }
   ],
   "recorded_answer": {

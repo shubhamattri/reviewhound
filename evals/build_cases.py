@@ -540,8 +540,10 @@ func Body(url string) ([]byte, error) {
     return io.ReadAll(resp.Body)
 }
 ''')},
+        # The leak is equally fair to flag where the body is read without ever being closed.
         "expected": [{"file": "fetch/fetch.go", "anchor": "resp, err := http.Get(url)",
-                      "category": "resource-leak"}],
+                      "category": "resource-leak",
+                      "also": [{"anchor": "return io.ReadAll(resp.Body)"}]}],
         "recorded": [
             {"file": "fetch/fetch.go", "anchor": "resp, err := http.Get(url)",
              "severity": "major", "category": "resource-leak",
@@ -644,8 +646,10 @@ func Trim(s string) string {
         "base": {"app/orders.py": PY_ORDERS_BASE, "app/auth.py": AUTH_LIB},
         "head": {"app/orders.py": PY_ORDERS_BASE.replace(
             '    require_role(request, "support")\n', ""), "app/auth.py": AUTH_LIB},
+        # A removed guard is anchored on the deleted line or the head line right next to the gap.
         "expected": [{"file": "app/orders.py", "anchor": 'require_role(request, "support")',
-                      "category": "auth", "side": "LEFT"}],
+                      "category": "auth", "side": "LEFT",
+                      "also": [{"anchor": "orders.cancel(order_id)"}]}],
         "recorded": [
             {"file": "app/orders.py", "anchor": 'require_role(request, "support")',
              "side": "LEFT", "severity": "blocker", "category": "auth",
@@ -717,7 +721,8 @@ end
         "base": {"cache/cache.go": GO_CACHE_BASE},
         "head": {"cache/cache.go": GO_CACHE_BASE.replace("\tdefer c.mu.Unlock()\n", "")},
         "expected": [{"file": "cache/cache.go", "anchor": "defer c.mu.Unlock()",
-                      "category": "concurrency", "side": "LEFT"}],
+                      "category": "concurrency", "side": "LEFT",
+                      "also": [{"anchor": "c.mu.Lock()"}]}],
         "recorded": [
             {"file": "cache/cache.go", "anchor": "defer c.mu.Unlock()", "side": "LEFT",
              "severity": "blocker", "category": "concurrency",
@@ -1150,6 +1155,9 @@ def main(root: Path = ROOT) -> None:
                    "category": e["category"]}
             if e.get("side") == "LEFT":
                 exp["side"] = "LEFT"
+            if e.get("also"):
+                exp["also"] = [{"line": _line_of(_tree(case, a)[e["file"]], a["anchor"]),
+                                "side": a.get("side", "RIGHT")} for a in e["also"]]
             expected.append(exp)
         recorded = []
         for r in case["recorded"]:

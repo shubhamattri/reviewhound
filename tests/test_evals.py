@@ -37,8 +37,8 @@ def test_recorded_eval_set_scores_and_checker_earns_its_keep() -> None:
     assert [c.error for c in with_checker.cases if c.error] == []
     baseline = run_eval(CASES, verify=False)
     assert (sum(c.reported for c in baseline.cases),
-            sum(c.true_positives for c in baseline.cases)) == (58, 28)
-    assert round(baseline.precision, 2) == 0.48
+            sum(c.true_positives for c in baseline.cases)) == (58, 30)
+    assert round(baseline.precision, 2) == 0.52
 
 
 def test_committed_cases_match_what_the_generator_writes(tmp_path: Path) -> None:
@@ -146,3 +146,12 @@ def test_recorded_eval_without_a_sandbox_still_counts_proof_mismatches() -> None
                       runners=docker_only(daemon_up=False))
     assert (result.proof_mismatches, result.proof_skipped) == (
         ["proof pricing.py:3 expected proven got inconclusive"], [])
+
+
+def test_an_alternative_fair_anchor_counts_once_and_only_on_its_own_side() -> None:
+    from reviewhound.evals import score
+    exp = [{"file": "c.go", "line": 12, "side": "LEFT", "also": [{"line": 11, "side": "RIGHT"}]}]
+    assert score(exp, [("c.go", 11, "RIGHT")])[0] == 1
+    assert score(exp, [("c.go", 11, "RIGHT"), ("c.go", 12, "LEFT")]) == (1, [], ["c.go:12:LEFT"])
+    assert score(exp, [("c.go", 20, "RIGHT")]) == (0, ["c.go:12:LEFT"], ["c.go:20"])
+    assert score([{"file": "c.go", "line": 12, "side": "LEFT"}], [("c.go", 11, "RIGHT")])[0] == 0

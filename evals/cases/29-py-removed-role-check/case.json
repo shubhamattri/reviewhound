@@ -5,7 +5,13 @@
       "file": "app/orders.py",
       "line": 5,
       "category": "auth",
-      "side": "LEFT"
+      "side": "LEFT",
+      "also": [
+        {
+          "line": 5,
+          "side": "RIGHT"
+        }
+      ]
     }
   ],
   "recorded_answer": {

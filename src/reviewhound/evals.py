@@ -90,9 +90,10 @@ def score(expected: list[dict[str, Any]], reported: Sequence[tuple[str, int, str
     tp = 0
     false_alarms: list[str] = []
     for path, line, side in reported:
-        hit = next((e for e in unmatched if e["file"] == path and
-                    e.get("side", "RIGHT") == side and
-                    abs(int(e["line"]) - line) <= line_tolerance), None)
+        hit = next((e for e in unmatched if e["file"] == path and any(
+                    pos.get("side", "RIGHT") == side and
+                    abs(int(pos["line"]) - line) <= line_tolerance
+                    for pos in [e, *e.get("also", [])])), None)
         if hit is None:
             false_alarms.append(_label(path, line, side))
         else:

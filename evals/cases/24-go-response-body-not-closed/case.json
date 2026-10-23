@@ -4,7 +4,13 @@
     {
       "file": "fetch/fetch.go",
       "line": 18,
-      "category": "resource-leak"
+      "category": "resource-leak",
+      "also": [
+        {
+          "line": 22,
+          "side": "RIGHT"
+        }
+      ]
     }
   ],
   "recorded_answer": {
