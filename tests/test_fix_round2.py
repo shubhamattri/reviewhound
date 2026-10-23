@@ -76,6 +76,20 @@ def test_lease_lost_after_the_claim_posts_nothing_and_frees_the_claim(
     assert claim_free(store) is True
 
 
+def test_lease_lost_during_the_head_lookup_posts_nothing(backend: Backend,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    lease = {"held": True}
+
+    def slow_head(repo: str, number: int) -> str:
+        lease["held"] = False  # the lookup took long enough for the lease to run out
+        return H1
+    monkeypatch.setattr(vcs, "current_head", slow_head)
+    result = reviewer.review(REPO, PR, dry_run=False, should_post=lambda: lease["held"])
+    assert (result.outcome, vcs.posted) == ("lease-lost", [])
+    assert claim_free(store) is True
+
+
 def test_body_retry_never_posts_against_a_superseded_head(
         backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
     vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])

@@ -143,9 +143,8 @@ def _refused(exc: Exception) -> bool:
 
 
 def blocking_snapshot(decision: PolicyDecision, policy: PolicyConfig) -> list[Blocker]:
-    """The blockers behind a REQUEST_CHANGES verdict, copied before a proof can change them."""
-    if decision.event != "REQUEST_CHANGES":
-        return []
+    """The blockers behind a REQUEST_CHANGES verdict, copied before a proof can change them.
+    apply_policy requests changes exactly when one of these exists."""
     blocking = Severity.parse(policy.blocking_severity)
     return [Blocker.of(f) for f in decision.post if f.severity >= blocking]
 
@@ -293,11 +292,12 @@ class Reviewer:
                 self.store.release_post(pr.repo, pr.number, pr.head_sha)
 
     def _blocked(self, pr: PullRequest, should_post: Callable[[], bool] | None) -> str:
-        """Checked right before every POST: a lost lease or a moved head posts nothing."""
-        if should_post is not None and not should_post():
-            return "lease-lost"
+        """Checked right before every POST: a moved head or a lost lease posts nothing. The lease
+        is read last, after the head lookup's network time."""
         if self.vcs.current_head(pr.repo, pr.number) != pr.head_sha:
             return "head-moved"
+        if should_post is not None and not should_post():
+            return "lease-lost"
         return ""
 
     def _send(self, pr: PullRequest, result: ReviewResult,
