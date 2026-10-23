@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 
 from reviewhound.diff import Diff, parse_patch
+from reviewhound.procenv import child_env
 from reviewhound.vcs.base import DirSnapshot, PostedComment, PullRequest, ReviewPayload, Snapshot
 
 log = logging.getLogger(__name__)
@@ -150,9 +151,9 @@ class GitHubVCS:
 
     def _git_env(self) -> dict[str, str]:
         basic = base64.b64encode(f"x-access-token:{self._token()}".encode()).decode()
-        return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "http.extraHeader",
-                "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}"}
+        return child_env(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT="1",
+                         GIT_CONFIG_KEY_0="http.extraHeader",
+                         GIT_CONFIG_VALUE_0=f"Authorization: Basic {basic}")
 
     def _checkout(self, repo: str, sha: str) -> Path:
         """Fetch into a private temp dir, then rename it into place, so no worker ever deletes
@@ -198,7 +199,8 @@ class GitHubVCS:
     def churn(self, repo: str, sha: str) -> Counter[str]:
         dest = self._checkout(repo, sha)
         res = subprocess.run(["git", "log", "--name-only", "--format="], cwd=dest, check=False,
-                             capture_output=True, text=True, timeout=60)
+                             capture_output=True, text=True, timeout=60,
+                             env=child_env(GIT_TERMINAL_PROMPT="0"))
         if res.returncode != 0:
             return Counter()
         return Counter(ln for ln in res.stdout.splitlines() if ln.strip())

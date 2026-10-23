@@ -15,6 +15,7 @@ from typing import Protocol
 from reviewhound.config import RepoConfig, Severity
 from reviewhound.diff import Diff
 from reviewhound.findings import Finding
+from reviewhound.procenv import child_env
 from reviewhound.vcs.base import Snapshot
 
 log = logging.getLogger(__name__)
@@ -145,7 +146,7 @@ class SemgrepScanner:
             try:
                 res = subprocess.run([self.binary, "--json", "--quiet", "--config", self.config,  # noqa: PLW1510
                                       str(root)], capture_output=True, text=True,
-                                     timeout=self.timeout_s)
+                                     timeout=self.timeout_s, env=child_env())
                 data = json.loads(res.stdout or "{}")
             except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
                 log.warning("semgrep failed", extra={"error": type(exc).__name__})
