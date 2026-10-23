@@ -1,8 +1,14 @@
 import json
 import shutil
+import subprocess
 from pathlib import Path
+from typing import Any
 
+import pytest
+
+from reviewhound import evals, proof
 from reviewhound.evals import recorded_provider, run_case, run_eval, score
+from reviewhound.proof import DockerRunner, LocalRunner, SandboxRunner
 
 CASES = Path(__file__).parent.parent / "evals" / "cases"
 
@@ -74,3 +80,69 @@ def test_a_wrong_proof_verdict_is_reported_as_a_mismatch(tmp_path: Path) -> None
     (case / "case.json").write_text(json.dumps(spec))
     result = run_case(case, recorded_provider)
     assert result.proof_mismatches == ["proof pricing.py:3 expected not_proven got proven"]
+
+
+# Live eval: with no usable sandbox, proof expectations are skipped, not counted as misses.
+
+def fake_docker(daemon_up: bool) -> Any:
+    def run(cmd: list[str], timeout_s: float) -> subprocess.CompletedProcess[str]:
+        up = daemon_up and cmd[1] == "info"
+        return subprocess.CompletedProcess(cmd, 0 if up else 1, "27.0" if up else "", "")
+    return run
+
+
+def docker_only(daemon_up: bool) -> dict[str, SandboxRunner]:
+    return {"docker": DockerRunner(command=fake_docker(daemon_up))}
+
+
+def test_live_eval_without_a_sandbox_skips_proof_expectations() -> None:
+    report = run_eval(CASES, live=True, runners=docker_only(daemon_up=False))
+    by_name = {c.name: c for c in report.cases}
+    proven, held = by_name["33-py-proof-proven-discount"], by_name["34-py-proof-not-reproduced"]
+    assert (proven.reported, proven.true_positives, proven.proof_mismatches,
+            proven.proof_skipped) == (1, 1, [], ["proof pricing.py:3 skipped (no sandbox)"])
+    assert (held.proof_mismatches, held.proof_skipped) == (
+        [], ["proof clamp.py:3 skipped (no sandbox)"])
+    assert [c.name for c in report.cases if c.proof_skipped or c.proof_mismatches] == [
+        "33-py-proof-proven-discount", "34-py-proof-not-reproduced"]
+    assert "skipped (no sandbox)" in report.render()
+
+
+def test_live_eval_gives_no_local_runner_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(evals, "DockerRunner",
+                        lambda: proof.DockerRunner(command=fake_docker(daemon_up=False)))
+    result = run_case(CASES / "33-py-proof-proven-discount", recorded_provider, live=True)
+    assert (result.proof_mismatches, result.proof_skipped) == (
+        [], ["proof pricing.py:3 skipped (no sandbox)"])
+
+
+def test_live_eval_with_a_usable_runner_still_checks_proofs(tmp_path: Path) -> None:
+    case = tmp_path / "33-copy"
+    shutil.copytree(CASES / "33-py-proof-proven-discount", case)
+    spec = json.loads((case / "case.json").read_text())
+    spec["expected_proofs"][0]["proof"] = "not_proven"
+    (case / "case.json").write_text(json.dumps(spec))
+    result = run_case(case, recorded_provider, live=True, runners={"local": LocalRunner()})
+    assert (result.proof_mismatches, result.proof_skipped) == (
+        ["proof pricing.py:3 expected not_proven got proven"], [])
+
+
+def test_live_eval_with_docker_up_checks_proofs_and_with_it_down_skips(tmp_path: Path) -> None:
+    case = tmp_path / "33-docker"
+    shutil.copytree(CASES / "33-py-proof-proven-discount", case)
+    for side in ("base", "head"):
+        (case / side / ".reviewhound.yml").write_text("proof:\n  enabled: true\n"
+                                                      "  runner: docker\n")
+    up = run_case(case, recorded_provider, live=True, runners=docker_only(daemon_up=True))
+    assert (up.proof_skipped, len(up.proof_mismatches)) == ([], 1)
+    assert up.proof_mismatches[0].startswith("proof pricing.py:3 expected proven got ")
+    down = run_case(case, recorded_provider, live=True, runners=docker_only(daemon_up=False))
+    assert (down.proof_mismatches, down.proof_skipped) == (
+        [], ["proof pricing.py:3 skipped (no sandbox)"])
+
+
+def test_recorded_eval_without_a_sandbox_still_counts_proof_mismatches() -> None:
+    result = run_case(CASES / "33-py-proof-proven-discount", recorded_provider,
+                      runners=docker_only(daemon_up=False))
+    assert (result.proof_mismatches, result.proof_skipped) == (
+        ["proof pricing.py:3 expected proven got inconclusive"], [])

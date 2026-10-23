@@ -181,7 +181,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
     verify = not args.no_checker
     if args.live:
         claude = ClaudeCliProvider()
-        report = run_eval(Path(args.cases), lambda spec: claude, verify=verify)
+        report = run_eval(Path(args.cases), lambda spec: claude, verify=verify, live=True)
     else:
         report = run_eval(Path(args.cases), verify=verify)
     print(report.render())

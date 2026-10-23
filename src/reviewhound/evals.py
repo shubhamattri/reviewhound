@@ -8,13 +8,14 @@ Each expected finding can be matched once.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from reviewhound.config import CONFIG_FILENAME, load_config
 from reviewhound.pipeline import Reviewer
-from reviewhound.proof import DockerRunner, LocalRunner
+from reviewhound.proof import DockerRunner, LocalRunner, SandboxRunner
 from reviewhound.providers import FakeProvider, Provider, ProviderRegistry
 from reviewhound.scanners import BuiltinScanner
 from reviewhound.vcs.base import PullRequest
@@ -33,6 +34,7 @@ class CaseResult:
     false_alarms: list[str] = field(default_factory=list)
     error: str = ""
     proof_mismatches: list[str] = field(default_factory=list)
+    proof_skipped: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -59,7 +61,7 @@ class EvalReport:
             notes = "; ".join([*(f"miss {m}" for m in c.misses),
                                *(f"false alarm {f}" for f in c.false_alarms),
                                *([f"error {c.error}"] if c.error else []),
-                               *c.proof_mismatches])
+                               *c.proof_mismatches, *c.proof_skipped])
             rows.append(f"{c.name:<38} {c.expected:>3} {c.reported:>3} {c.true_positives:>3} "
                         f"{c.dropped_by_checker:>4}  {notes}")
         dropped = sum(c.dropped_by_checker for c in self.cases)
@@ -100,17 +102,34 @@ def score(expected: list[dict[str, Any]], reported: Sequence[tuple[str, int, str
                 for e in unmatched], false_alarms
 
 
+def default_runners(live: bool) -> dict[str, SandboxRunner]:
+    # Live proofs run tests the model wrote, so they only ever get the container.
+    if live:
+        return {"docker": DockerRunner()}
+    # Recorded cases and their recorded proofs are our own code, so they may run locally.
+    return {"local": LocalRunner(), "docker": DockerRunner()}
+
+
+def sandbox_missing(base: Mapping[str, str], runners: Mapping[str, SandboxRunner]) -> bool:
+    """True when the runner the case's config asks for is absent or cannot start."""
+    runner = runners.get(load_config(base.get(CONFIG_FILENAME)).proof.runner)
+    if runner is None:
+        return True
+    return isinstance(runner, DockerRunner) and bool(runner.unavailable())
+
+
 def run_case(case_dir: Path, provider_factory: Callable[[dict[str, Any]], Provider],
-             verify: bool = True) -> CaseResult:
+             verify: bool = True, live: bool = False,
+             runners: Mapping[str, SandboxRunner] | None = None) -> CaseResult:
     spec = json.loads((case_dir / "case.json").read_text())
     base, head = _read_tree(case_dir / "base"), _read_tree(case_dir / "head")
     pr = PullRequest(repo=f"eval/{case_dir.name}", number=1, title=spec.get("title", ""),
                      body=spec.get("body", ""), base_sha="base", head_sha="head")
     vcs = MemoryVCS(pr, base, head)
     registry = ProviderRegistry([provider_factory(spec)])
-    # Eval cases are our own code, so proofs may run them locally.
+    runners = default_runners(live) if runners is None else runners
     reviewer = Reviewer(vcs, registry, [BuiltinScanner()], store=None, verify=verify,
-                        proof_runners={"local": LocalRunner(), "docker": DockerRunner()})
+                        proof_runners=runners)
     try:
         result = reviewer.review(pr.repo, 1, dry_run=True)
     except Exception as exc:  # noqa: BLE001 - one broken case must not stop the run
@@ -124,9 +143,16 @@ def run_case(case_dir: Path, provider_factory: Callable[[dict[str, Any]], Provid
     seen = [*result.decision.post, *(f for f, _ in result.decision.held)] \
         if result.decision else []
     proofs = {(f.file, f.line): f.proof for f in seen}
+    expected_proofs = spec.get("expected_proofs", [])
+    if live and expected_proofs and sandbox_missing(base, runners):
+        # A live model cannot be judged on proofs that had nowhere to run.
+        skipped = [f"proof {e['file']}:{e['line']} skipped (no sandbox)" for e in expected_proofs]
+        return CaseResult(case_dir.name, len(spec["expected"]), len(posted), tp,
+                          len(result.dropped), result.cost_usd, misses, false_alarms,
+                          proof_skipped=skipped)
     mismatches = [f"proof {e['file']}:{e['line']} expected {e['proof']} got "
                   f"{proofs.get((e['file'], int(e['line'])))}"
-                  for e in spec.get("expected_proofs", [])
+                  for e in expected_proofs
                   if proofs.get((e["file"], int(e["line"]))) != e["proof"]]
     return CaseResult(case_dir.name, len(spec["expected"]), len(posted), tp,
                       len(result.dropped), result.cost_usd, misses, false_alarms,
@@ -139,6 +165,7 @@ def recorded_provider(spec: dict[str, Any]) -> Provider:
 
 
 def run_eval(cases_root: Path, provider_factory: Callable[[dict[str, Any]], Provider]
-             = recorded_provider, verify: bool = True) -> EvalReport:
+             = recorded_provider, verify: bool = True, live: bool = False,
+             runners: Mapping[str, SandboxRunner] | None = None) -> EvalReport:
     cases = sorted(p for p in cases_root.iterdir() if (p / "case.json").exists())
-    return EvalReport([run_case(c, provider_factory, verify) for c in cases])
+    return EvalReport([run_case(c, provider_factory, verify, live, runners) for c in cases])

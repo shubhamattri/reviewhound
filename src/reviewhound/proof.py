@@ -348,6 +348,10 @@ class DockerRunner:
         read-backs and the rm."""
         return self.INFO_S + self.startup_grace_s + self.EXEC_SLACK_S + 2 * self.READ_S + self.RM_S
 
+    def unavailable(self) -> str:
+        """Why Docker cannot run a proof right now, or "" when it can."""
+        return self._unavailable()
+
     def _unavailable(self) -> str:
         try:
             res = self._cmd([self.docker, "info", "--format", "{{.ServerVersion}}"], self.INFO_S)
