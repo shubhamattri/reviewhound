@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from reviewhound.findings import Finding
 
@@ -66,6 +66,24 @@ class ReviewRecord:
     cost_usd: float = 0.0
     timings: dict[str, float] | None = None
     error: str = ""
+
+
+class ReviewStore(Protocol):
+    """What the pipeline and CLI need from a store; SQLite and Postgres both provide it."""
+
+    def known_state(self, repo: str, pr: int) -> dict[str, str]: ...
+
+    def record_review(self, rec: ReviewRecord, posted: list[Finding],
+                      held: list[tuple[Finding, str]]) -> int: ...
+
+    def claim_post(self, repo: str, pr: int, head_sha: str) -> bool: ...
+
+    def add_feedback(self, repo: str, pr: int, fingerprint: str, kind: str,
+                     detail: str = "") -> bool: ...
+
+    def reviews(self, repo: str, pr: int) -> list[dict[str, Any]]: ...
+
+    def findings(self, repo: str, pr: int) -> list[dict[str, Any]]: ...
 
 
 class Store:

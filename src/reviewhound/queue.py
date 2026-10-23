@@ -58,6 +58,24 @@ class JobQueue(Protocol):
     def dead_jobs(self) -> list[Job]: ...
 
 
+class WorkerQueue(JobQueue, Protocol):
+    """The full queue surface the worker, CLI and metrics use; both backends implement it."""
+
+    lease_s: float
+
+    def extend_lease(self, job: Job) -> float: ...
+
+    def get(self, job_id: int) -> Job | None: ...
+
+    def requeue(self, job_id: int) -> bool: ...
+
+    def stuck_count(self, older_than_s: float) -> int: ...
+
+    def state_counts(self) -> dict[str, int]: ...
+
+    def oldest_queued_age(self) -> float: ...
+
+
 class LeaseLost(RuntimeError):
     """This worker no longer owns the job; its result must not be recorded."""
 
@@ -198,3 +216,25 @@ class SQLiteQueue:
             row = c.execute("SELECT COUNT(*) AS n FROM jobs WHERE state='queued' "
                             "AND created_at < ?", (self._clock() - older_than_s,)).fetchone()
         return int(row["n"])
+
+    def extend_lease(self, job: Job) -> float:
+        """Push the lease out by lease_s. Raises LeaseLost if the job is no longer ours."""
+        now = self._clock()
+        with self._tx() as c:
+            cur = c.execute("UPDATE jobs SET lease_until=?, updated_at=? WHERE id=? "
+                            "AND state='running' AND lease_token=?",
+                            (now + self.lease_s, now, job.id, job.lease_token))
+            if cur.rowcount != 1:
+                raise LeaseLost(job.id)
+        return now + self.lease_s
+
+    def state_counts(self) -> dict[str, int]:
+        with self._conn() as c:
+            rows = c.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state").fetchall()
+        return {r["state"]: int(r["n"]) for r in rows}
+
+    def oldest_queued_age(self) -> float:
+        """Seconds the oldest queued job has waited; 0 when nothing is queued."""
+        with self._conn() as c:
+            row = c.execute("SELECT MIN(created_at) AS t FROM jobs WHERE state='queued'").fetchone()
+        return 0.0 if row["t"] is None else max(0.0, self._clock() - float(row["t"]))

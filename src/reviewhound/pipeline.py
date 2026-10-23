@@ -23,7 +23,7 @@ from reviewhound.prompt import build_prompt
 from reviewhound.providers import ProviderError, ProviderRegistry
 from reviewhound.router import Route, route
 from reviewhound.scanners import Scanner
-from reviewhound.store import ReviewRecord, Store
+from reviewhound.store import ReviewRecord, ReviewStore
 from reviewhound.vcs.base import VCS, PullRequest, ReviewPayload, Snapshot
 
 log = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ def build_index(head: Snapshot, diff: Diff, cfg: RepoConfig) -> CodeIndex:
 
 class Reviewer:
     def __init__(self, vcs: VCS, registry: ProviderRegistry, scanners: list[Scanner],
-                 store: Store | None, verify: bool = True) -> None:
+                 store: ReviewStore | None, verify: bool = True) -> None:
         self.verify = verify  # False only for the eval baseline that measures the checker
         self.vcs = vcs
         self.registry = registry

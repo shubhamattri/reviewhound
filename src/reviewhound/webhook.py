@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -49,7 +50,8 @@ def handle_event(queue: JobQueue, event: str, payload: dict[str, Any]) -> tuple[
     return 202, f"job {job_id} {'queued' if created else 'already queued'}"
 
 
-def make_server(queue: JobQueue, secret: str, host: str, port: int) -> ThreadingHTTPServer:
+def make_server(queue: JobQueue, secret: str, host: str, port: int,
+                metrics: Callable[[], str] | None = None) -> ThreadingHTTPServer:
     if not secret:
         raise ValueError("webhook secret is required")
 
@@ -63,8 +65,24 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int) -> Threading
             self.wfile.write(data)
 
         def do_GET(self) -> None:
+            if self.path == "/metrics" and metrics is not None:
+                self._metrics(metrics)
+                return
             self._reply(200 if self.path == "/healthz" else 404, "ok" if self.path == "/healthz"
                         else "not found")
+
+        def _metrics(self, render: Callable[[], str]) -> None:
+            try:
+                data = render().encode()
+            except Exception as exc:  # noqa: BLE001 - a scrape failure is a 500, not a crash
+                log.error("metrics render failed", extra={"error": type(exc).__name__})
+                self._reply(500, "metrics unavailable")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def do_POST(self) -> None:
             if self.path != "/webhook":
