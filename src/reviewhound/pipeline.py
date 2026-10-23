@@ -126,6 +126,9 @@ def comments_in_body(review: ReviewPayload, limit: int = MAX_BODY_CHARS) -> Revi
     title = "\n\nGitHub could not place these comments on their lines:"
     body = review.body[:max(0, limit - len(title) - len(_more(len(blocks))))] + title
     for i, block in enumerate(blocks):
+        if len(body) + sum(len(b) for b in blocks[i:]) <= limit:
+            body += "".join(blocks[i:])
+            break
         if len(body) + len(block) + len(_more(len(blocks) - i - 1)) > limit:
             body += _more(len(blocks) - i)
             break
