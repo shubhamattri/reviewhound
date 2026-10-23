@@ -15,7 +15,7 @@ from reviewhound.vcs.base import PostedComment
 from reviewhound.vcs.github import GitHubError, GitHubVCS
 from reviewhound.vcs.memory import MemoryVCS
 from reviewhound.webhook import handle_event
-from tests.conftest import Backend, answer, make_pr
+from tests.conftest import Backend, answer, make_pr, spy
 from tests.test_pipeline import BASE, HEAD, REAL
 
 CFG = {".reviewhound.yml": "posting: true\n"}
@@ -152,18 +152,16 @@ def test_replies_by_the_app_itself_and_non_replies_are_ignored(backend: Backend)
                         app_id="77") == (202, "recorded reply")
 
 
-def test_feedback_store_failure_releases_the_event_for_redelivery(
+def test_reply_write_failure_leaves_no_claim_behind(
         backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
     _vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
     reviewer.review("acme/shop", 7, dry_run=False)
     q = backend.queue()
-
-    def broken(*a: Any, **k: Any) -> bool:
-        raise RuntimeError("disk full")
     with monkeypatch.context() as m:
-        m.setattr(store, "add_feedback", broken)
-        with pytest.raises(RuntimeError):
+        spy(m, store, "INSERT INTO feedback (", "DELETE FROM feedback_events")
+        with pytest.raises(RuntimeError, match="injected failure"):
             handle_event(q, "pull_request_review_comment", reply(1001), store)
+    assert store.feedback("acme/shop", 7) == []
     assert handle_event(q, "pull_request_review_comment", reply(1001), store) == (
         202, "recorded reply")
 
@@ -303,30 +301,28 @@ def test_redelivered_thread_event_is_applied_once(backend: Backend) -> None:
     reviewer.review("acme/shop", 7, dry_run=False)
     q = backend.queue()
     assert handle_event(q, "pull_request_review_thread", thread("resolved", 1001), store,
-                        delivery="d1") == (202, "recorded 1 resolved")
+                        body_sha256="b1") == (202, "recorded 1 resolved")
     assert handle_event(q, "pull_request_review_thread", thread("unresolved", 1001), store,
-                        delivery="d2") == (202, "recorded 1 reopened")
+                        body_sha256="b2") == (202, "recorded 1 reopened")
     assert handle_event(q, "pull_request_review_thread", thread("resolved", 1001), store,
-                        delivery="d1") == (202, "event already applied")
+                        body_sha256="b1") == (202, "event already applied")
     assert state_of(store) == "reopened"
     assert [f["kind"] for f in store.feedback("acme/shop", 7)] == ["resolved", "reopened"]
 
 
-def test_thread_write_failure_releases_the_delivery(backend: Backend,
+def test_thread_write_failure_leaves_no_claim_behind(backend: Backend,
                                                    monkeypatch: pytest.MonkeyPatch) -> None:
     _vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
     reviewer.review("acme/shop", 7, dry_run=False)
     q = backend.queue()
-
-    def broken(*a: Any, **k: Any) -> bool:
-        raise RuntimeError("disk full")
     with monkeypatch.context() as m:
-        m.setattr(store, "add_feedback", broken)
-        with pytest.raises(RuntimeError):
+        spy(m, store, "UPDATE findings SET state", "DELETE FROM feedback_events")
+        with pytest.raises(RuntimeError, match="injected failure"):
             handle_event(q, "pull_request_review_thread", thread("resolved", 1001), store,
-                         delivery="d1")
+                         body_sha256="b1")
+    assert (store.feedback("acme/shop", 7), state_of(store)) == ([], "posted")
     assert handle_event(q, "pull_request_review_thread", thread("resolved", 1001), store,
-                        delivery="d1") == (202, "recorded 1 resolved")
+                        body_sha256="b1") == (202, "recorded 1 resolved")
 
 
 def test_permanent_dismissal_failure_is_not_retried(backend: Backend) -> None:
@@ -356,13 +352,24 @@ def test_comment_links_hold_github_sized_ids_and_stay_per_repo(backend: Backend)
     store.link_comments("acme/shop", 7, "r3", [])
 
 
-def test_event_keys_are_claimed_once_until_released(backend: Backend) -> None:
-    store = backend.store()
-    assert store.claim_event("thread:d1") is True
-    assert store.claim_event("thread:d1") is False
-    assert store.claim_event("thread:d2") is True
-    store.release_event("thread:d1")
-    assert store.claim_event("thread:d1") is True
+def test_event_key_is_claimed_in_the_same_transaction_as_its_feedback(backend: Backend) -> None:
+    _vcs, reviewer, store = reviewer_on(backend, [answer(REAL, MINOR)])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    minor = next(f["fingerprint"] for f in store.findings("acme/shop", 7) if f["line"] == 12)
+    assert store.apply_feedback("thread:k1", "Acme/Shop", [
+        (7, FP, "resolved", ""), (7, "missing", "resolved", ""), (7, minor, "reply", "hi")]) == [
+        True, False, True]
+    assert store.apply_feedback("thread:k1", "acme/shop", [(7, FP, "reopened", "")]) is None
+    assert state_of(store) == "resolved"
+    assert store.apply_feedback("thread:k2", "acme/shop", []) == []
+    assert store.apply_feedback("thread:k2", "acme/shop", []) is None
+    with pytest.raises(ValueError, match="unknown feedback kind 'bogus'"):
+        store.apply_feedback("thread:k3", "acme/shop", [(7, FP, "bogus", "")])
+    assert store.apply_feedback("thread:k3", "acme/shop", [(7, FP, "reopened", "")]) == [True]
+    assert store.apply_feedback("", "acme/shop", [(7, FP, "declined", "")]) == [True]
+    assert store.apply_feedback("", "acme/shop", [(7, FP, "declined", "")]) == [True]
+    assert [(f["kind"], f["detail"]) for f in store.feedback("acme/shop", 7)] == [
+        ("resolved", ""), ("reply", "hi"), ("reopened", ""), ("declined", ""), ("declined", "")]
 
 
 def test_dismissal_states_decide_what_is_retried(backend: Backend) -> None:

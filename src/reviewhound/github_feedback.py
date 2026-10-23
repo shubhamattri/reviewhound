@@ -24,18 +24,20 @@ _NOT_OPEN = ("duplicate", "unverified", "developer ")
 
 
 def handle_feedback_event(store: ReviewStore, event: str, payload: dict[str, Any],
-                          app_id: str | None = None, delivery: str = "") -> tuple[int, str]:
-    """DB writes only: this runs inside the webhook request, so no GitHub calls here."""
+                          app_id: str | None = None, body_sha256: str = "") -> tuple[int, str]:
+    """DB writes only: this runs inside the webhook request, so no GitHub calls here.
+
+    `body_sha256` identifies the signed delivery; the unsigned X-GitHub-Delivery id never does."""
     repo = (payload.get("repository") or {}).get("full_name")
     if not isinstance(repo, str) or not repo:
         return 400, "missing repository"
     if event == "pull_request_review_thread":
-        return _thread_event(store, repo, payload, delivery)
+        return _thread_event(store, repo, payload, body_sha256)
     return _comment_event(store, repo, payload, app_id)
 
 
 def _thread_event(store: ReviewStore, repo: str, payload: dict[str, Any],
-                  delivery: str) -> tuple[int, str]:
+                  body_sha256: str) -> tuple[int, str]:
     action = payload.get("action")
     kind = THREAD_ACTIONS.get(str(action))
     if kind is None:
@@ -44,33 +46,22 @@ def _thread_event(store: ReviewStore, repo: str, payload: dict[str, Any],
         ids = [int(c["id"]) for c in (payload["thread"]["comments"] or [])]
     except (KeyError, TypeError, ValueError):
         return 400, "malformed review thread payload"
-    # A late redelivery of an old resolve must not undo a newer unresolve.
-    key = f"thread:{delivery}" if delivery else ""
-    if key and not store.claim_event(key):
-        return 202, "event already applied"
-    try:
-        return _apply_thread(store, repo, str(action), kind, ids)
-    except BaseException:
-        if key:
-            store.release_event(key)
-        raise
-
-
-def _apply_thread(store: ReviewStore, repo: str, action: str, kind: str,
-                  ids: list[int]) -> tuple[int, str]:
     links = store.linked_findings(repo, ids)
     unknown = [i for i in ids if i not in links]
     if unknown:
         log.info("thread comments not posted by us, ignored",
                  extra={"repo": repo, "comment_ids": unknown, "action": action})
-    recorded = 0
-    for pr, fingerprint in sorted(set(links.values())):
-        if store.add_feedback(repo, pr, fingerprint, kind):
-            recorded += 1
-        else:
+    targets = sorted(set(links.values()))
+    # A replayed old resolve must not undo a newer unresolve; the claim commits with the writes.
+    done = store.apply_feedback(f"thread:{body_sha256}" if body_sha256 else "", repo,
+                                [(pr, fingerprint, kind, "") for pr, fingerprint in targets])
+    if done is None:
+        return 202, "event already applied"
+    for (pr, fingerprint), ok in zip(targets, done, strict=True):
+        if not ok:
             log.warning("linked finding missing", extra={"repo": repo, "pr": pr,
                                                           "fingerprint": fingerprint})
-    return 202, f"recorded {recorded} {kind}"
+    return 202, f"recorded {sum(done)} {kind}"
 
 
 def _comment_event(store: ReviewStore, repo: str, payload: dict[str, Any],
@@ -96,17 +87,12 @@ def _comment_event(store: ReviewStore, repo: str, payload: dict[str, Any],
         log.info("reply to a comment not posted by us, ignored",
                  extra={"repo": repo, "comment_id": parent_id})
         return 202, "reply to unknown comment ignored"
-    key = f"reply:{repo.lower()}:{reply_id}"
-    if not store.claim_event(key):
-        return 202, "reply already recorded"
     pr, fingerprint = link
-    try:
-        ok = store.add_feedback(repo, pr, fingerprint, "reply",
-                                str(comment.get("body") or "")[:REPLY_MAX_CHARS])
-    except BaseException:
-        store.release_event(key)
-        raise
-    if not ok:
+    done = store.apply_feedback(f"reply:{repo.lower()}:{reply_id}", repo, [
+        (pr, fingerprint, "reply", str(comment.get("body") or "")[:REPLY_MAX_CHARS])])
+    if done is None:
+        return 202, "reply already recorded"
+    if done != [True]:
         log.warning("linked finding missing", extra={"repo": repo, "pr": pr,
                                                       "fingerprint": fingerprint})
         return 202, "linked finding missing"

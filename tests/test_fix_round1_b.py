@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import http.client
+import json
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -22,8 +24,12 @@ from reviewhound.store import ReviewRecord
 from reviewhound.vcs.base import DictSnapshot
 from reviewhound.vcs.github import GitHubVCS
 from reviewhound.vcs.memory import diff_file_maps
+from reviewhound.webhook import make_server
 from reviewhound.worker import is_retryable
-from tests.conftest import PG_URL, Backend
+from tests.conftest import PG_URL, Backend, answer, spy
+from tests.test_github_feedback import reviewer_on, state_of, thread
+from tests.test_pipeline import REAL
+from tests.test_webhook import SECRET, sign
 
 # B7: a blank line added or removed inside a quote must not anchor unchanged code.
 SPAN_BASE = {"m.py": "def f():\n    first_call_here()\n    second_call_here()\n    return 1\n"}
@@ -135,35 +141,6 @@ def test_semgrep_env_has_no_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     assert [env for _cmd, env in calls] == [SAFE]
 
 
-class SpyConn:
-    """Wraps a store connection: records each statement, and can fail one that matches."""
-
-    def __init__(self, conn: Any, log: list[tuple[str, Any]], fail_on: str | None) -> None:
-        self._c, self._log, self._fail_on = conn, log, fail_on
-
-    def execute(self, sql: str, *a: Any, **k: Any) -> Any:
-        if self._fail_on is not None and self._fail_on in sql:
-            raise RuntimeError("injected failure")
-        self._log.append((sql, a[0] if a else ()))
-        return self._c.execute(sql, *a, **k)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._c, name)
-
-
-def spy(monkeypatch: pytest.MonkeyPatch, store: Any,
-        fail_on: str | None = None) -> list[tuple[str, Any]]:
-    log: list[tuple[str, Any]] = []
-    real = store._tx
-
-    @contextmanager
-    def tx() -> Iterator[Any]:
-        with real() as c:
-            yield SpyConn(c, log, fail_on)
-    monkeypatch.setattr(store, "_tx", tx)
-    return log
-
-
 # B5: findings are upserted in fingerprint order, so two workers lock rows in the same order.
 
 def _f(quote: str) -> Finding:
@@ -247,3 +224,43 @@ def test_child_env_skips_unset_safe_keys(monkeypatch: pytest.MonkeyPatch) -> Non
     _leaky_env(monkeypatch)
     monkeypatch.delenv("LANG")
     assert child_env(EXTRA="1") == {"PATH": SAFE["PATH"], "HOME": SAFE["HOME"], "EXTRA": "1"}
+
+
+# B4: a feedback event is deduplicated by its signed body, not the unsigned delivery header.
+
+def _post(port: int, body: bytes, event: str, headers: dict[str, str] | None = None,
+          path: str = "/webhook") -> tuple[int, str]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", path, body, {"X-Hub-Signature-256": sign(body), "X-GitHub-Event": event,
+                                      "Content-Type": "application/json", **(headers or {})})
+    resp = conn.getresponse()
+    return resp.status, json.loads(resp.read())["message"]
+
+
+@contextmanager
+def serving(**kw: Any) -> Iterator[int]:
+    server = make_server(kw.pop("queue"), SECRET, "127.0.0.1", 0, **kw)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_replayed_signed_body_with_a_new_delivery_id_is_applied_once(backend: Backend) -> None:
+    _vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    resolve = json.dumps(thread("resolved", 1001)).encode()
+    unresolve = json.dumps(thread("unresolved", 1001)).encode()
+    ev = "pull_request_review_thread"
+    with serving(queue=backend.queue(), store=store) as port:
+        assert _post(port, resolve, ev, {"X-GitHub-Delivery": "d1"}) == (
+            202, "recorded 1 resolved")
+        assert _post(port, unresolve, ev, {"X-GitHub-Delivery": "d2"}) == (
+            202, "recorded 1 reopened")
+        assert _post(port, resolve, ev, {"X-GitHub-Delivery": "d3"}) == (
+            202, "event already applied")
+        assert _post(port, resolve, ev) == (202, "event already applied")
+    assert state_of(store) == "reopened"
+    assert [f["kind"] for f in store.feedback("acme/shop", 7)] == ["resolved", "reopened"]
