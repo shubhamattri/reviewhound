@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -440,6 +441,36 @@ def _junit_text(status: ReadStatus, data: str) -> str | None:
     return data
 
 
+class BudgetedRunner:
+    """Caps the total sandbox time of one review, whatever each repo's timeout_s asks for."""
+
+    def __init__(self, inner: SandboxRunner, total_s: float,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.total_s = total_s
+        self._clock = clock
+        self._spent = 0.0
+
+    def remaining(self) -> float:
+        return max(0.0, self.total_s - self._spent)
+
+    def exhausted(self) -> bool:
+        return self.remaining() < 1.0
+
+    def refusal(self) -> str:
+        return f"proof time budget of {self.total_s:g}s for this review is used up"
+
+    def run(self, files: Mapping[str, str], test_path: str, timeout_s: float) -> RunResult:
+        if self.exhausted():
+            return RunResult(None, None, error=self.refusal())
+        start = self._clock()
+        try:
+            return self.inner.run(files, test_path, min(timeout_s, self.remaining()))
+        finally:
+            self._spent += self._clock() - start
+
+
 @dataclass
 class ProofResult:
     verdict: ProofVerdict
@@ -516,6 +547,8 @@ class Prover:
         source = files.get(f.file)
         if source is None:
             return ProofResult("inconclusive", "file is not in the head snapshot")
+        if isinstance(self.runner, BudgetedRunner) and self.runner.exhausted():
+            return ProofResult("inconclusive", self.runner.refusal())
         d = index.enclosing_definition(f.file, f.line)
         function_src = "\n".join(source.splitlines()[d.start_line - 1:d.end_line]) if d else ""
         try:

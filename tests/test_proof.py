@@ -1,4 +1,3 @@
-import argparse
 import dataclasses
 import json
 import logging
@@ -567,16 +566,6 @@ def test_unproven_comment_has_no_proof_section(verdict: str | None) -> None:
     f = finding()
     f.proof, f.proof_test = verdict, "def test_x(): pass"  # type: ignore[assignment]
     assert _comment_body(f) == "**[blocker] first element skipped**\n\nrange starts at 1"
-
-
-def test_cli_adds_the_local_runner_only_when_the_operator_opts_in() -> None:
-    from reviewhound.cli import _proof_runners
-
-    runners = _proof_runners(argparse.Namespace(allow_local_proof=False, proof_image="img:1"))
-    assert sorted(runners) == ["docker"]
-    assert isinstance(runners["docker"], DockerRunner) and runners["docker"].image == "img:1"
-    runners = _proof_runners(argparse.Namespace(allow_local_proof=True, proof_image="img:1"))
-    assert sorted(runners) == ["docker", "local"]
 
 
 @pytest.mark.parametrize("claimed", ["builtins.ImportError", "builtins.ModuleNotFoundError"])

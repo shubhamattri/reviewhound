@@ -109,6 +109,25 @@ def test_worker_within_the_cap_completes(tmp_path: Path) -> None:
     assert after is not None and after.state == "done"
 
 
+def test_worker_cli_passes_the_job_time_cap(tmp_path: Path,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    from reviewhound.cli import main
+
+    seen: list[float] = []
+
+    def fake_run_one(queue: object, reviewer: object, metrics: object,
+                     max_job_seconds: float) -> None:
+        seen.append(max_job_seconds)
+    monkeypatch.setattr("reviewhound.worker.run_one", fake_run_one)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    monkeypatch.delenv("REVIEWHOUND_APP_ID", raising=False)
+    monkeypatch.delenv("REVIEWHOUND_APP_PRIVATE_KEY_PATH", raising=False)
+    monkeypatch.delenv("REVIEWHOUND_DATABASE_URL", raising=False)
+    assert main(["--home", str(tmp_path), "worker", "--once", "--max-job-seconds", "42"]) == 0
+    assert main(["--home", str(tmp_path), "worker", "--once"]) == 0
+    assert seen == [42.0, 1800.0]
+
+
 def test_pipeline_posts_nothing_when_should_post_says_no(tmp_path: Path) -> None:
     vcs, reviewer, store = setup([answer(REAL)], posting=True, tmp_path=tmp_path)
     result = reviewer.review("acme/shop", 7, dry_run=False, should_post=lambda: False)

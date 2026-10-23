@@ -200,7 +200,8 @@ def test_cli_app_factory_uses_installation_or_static_token(
     monkeypatch.setattr(app, "installation_token", lambda iid: f"ghs_{iid}")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     ns = argparse.Namespace(home=str(tmp_path), fake_answer=None, database_url=None,
-                            proof_image="img:1", allow_local_proof=True)
+                            proof_image="img:1", allow_local_proof_repo=["acme/shop"],
+                            max_proof_seconds=300.0)
     build = _app_reviewer_factory(ns, app)
     reviewer = build(job(42))
     assert sorted(reviewer.proof_runners) == ["docker", "local"]
