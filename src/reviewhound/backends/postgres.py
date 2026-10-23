@@ -18,7 +18,7 @@ from psycopg.rows import DictRow, dict_row
 
 from reviewhound.findings import Finding
 from reviewhound.queue import Job, LeaseLost, job_key
-from reviewhound.store import FEEDBACK_KINDS, ReviewRecord
+from reviewhound.store import FEEDBACK_KINDS, ReviewRecord, upsert_order
 
 # Separate DDL lists so a later column or table is one more statement, not an edit to a blob.
 QUEUE_DDL: list[str] = [
@@ -290,11 +290,8 @@ class PostgresStore(_Pg):
                  rec.cost_usd, json.dumps(rec.timings or {}), rec.error, now)).fetchone()
             if row is None:
                 raise RuntimeError("INSERT ... RETURNING returned no row")
-            new_state = "posted" if rec.posted else "stored"
-            for f in posted:
-                self._upsert(c, repo, rec.pr, rec.head_sha, f, new_state, None, now)
-            for f, reason in held:
-                self._upsert(c, repo, rec.pr, rec.head_sha, f, "held", reason, now)
+            for f, state, reason in upsert_order(rec, posted, held):
+                self._upsert(c, repo, rec.pr, rec.head_sha, f, state, reason, now)
             return int(row["id"])
 
     @staticmethod

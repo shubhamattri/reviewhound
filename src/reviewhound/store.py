@@ -85,6 +85,15 @@ class ReviewRecord:
     error: str = ""
 
 
+def upsert_order(rec: ReviewRecord, posted: list[Finding], held: list[tuple[Finding, str]]
+                 ) -> list[tuple[Finding, str, str | None]]:
+    """(finding, state, held reason) sorted by fingerprint, so concurrent writers lock rows in
+    one order and cannot deadlock. The sort is stable: posted stays ahead of held on a tie."""
+    new_state = "posted" if rec.posted else "stored"
+    rows = [(f, new_state, None) for f in posted] + [(f, "held", r) for f, r in held]
+    return sorted(rows, key=lambda row: row[0].fingerprint)
+
+
 class ReviewStore(Protocol):
     """What the pipeline and CLI need from a store; SQLite and Postgres both provide it."""
 
@@ -172,11 +181,8 @@ class Store:
                 (repo, rec.pr, rec.head_sha, rec.outcome, rec.tier, rec.model,
                  json.dumps(list(rec.providers)), rec.event, int(rec.posted), rec.post_id,
                  rec.cost_usd, json.dumps(rec.timings or {}), rec.error, now))
-            new_state = "posted" if rec.posted else "stored"
-            for f in posted:
-                self._upsert(c, repo, rec.pr, rec.head_sha, f, new_state, None, now)
-            for f, reason in held:
-                self._upsert(c, repo, rec.pr, rec.head_sha, f, "held", reason, now)
+            for f, state, reason in upsert_order(rec, posted, held):
+                self._upsert(c, repo, rec.pr, rec.head_sha, f, state, reason, now)
             return int(cur.lastrowid or 0)
 
     @staticmethod

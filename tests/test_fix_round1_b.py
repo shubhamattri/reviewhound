@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import base64
 import subprocess
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from reviewhound.checker import ClaimChecker
-from reviewhound.config import RepoConfig
+from reviewhound.config import RepoConfig, Severity
 from reviewhound.findings import Finding, ModelFinding
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.procenv import child_env
 from reviewhound.scanners import SemgrepScanner
+from reviewhound.store import ReviewRecord
 from reviewhound.vcs.base import DictSnapshot
 from reviewhound.vcs.github import GitHubVCS
 from reviewhound.vcs.memory import diff_file_maps
+from reviewhound.worker import is_retryable
+from tests.conftest import PG_URL, Backend
 
 # B7: a blank line added or removed inside a quote must not anchor unchanged code.
 SPAN_BASE = {"m.py": "def f():\n    first_call_here()\n    second_call_here()\n    return 1\n"}
@@ -127,6 +133,114 @@ def test_semgrep_env_has_no_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     assert scanner.scan(diff_file_maps({}, {"a.py": "x = 1\n"}),
                         DictSnapshot({"a.py": "x = 1\n"}), RepoConfig()) == []
     assert [env for _cmd, env in calls] == [SAFE]
+
+
+class SpyConn:
+    """Wraps a store connection: records each statement, and can fail one that matches."""
+
+    def __init__(self, conn: Any, log: list[tuple[str, Any]], fail_on: str | None) -> None:
+        self._c, self._log, self._fail_on = conn, log, fail_on
+
+    def execute(self, sql: str, *a: Any, **k: Any) -> Any:
+        if self._fail_on is not None and self._fail_on in sql:
+            raise RuntimeError("injected failure")
+        self._log.append((sql, a[0] if a else ()))
+        return self._c.execute(sql, *a, **k)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._c, name)
+
+
+def spy(monkeypatch: pytest.MonkeyPatch, store: Any,
+        fail_on: str | None = None) -> list[tuple[str, Any]]:
+    log: list[tuple[str, Any]] = []
+    real = store._tx
+
+    @contextmanager
+    def tx() -> Iterator[Any]:
+        with real() as c:
+            yield SpyConn(c, log, fail_on)
+    monkeypatch.setattr(store, "_tx", tx)
+    return log
+
+
+# B5: findings are upserted in fingerprint order, so two workers lock rows in the same order.
+
+def _f(quote: str) -> Finding:
+    return Finding(file="a.py", line=1, severity=Severity.MAJOR, category="c", title="t",
+                   body="b", evidence_quote=quote, source="model:m", verified=True)
+
+
+def test_findings_are_upserted_in_fingerprint_order(backend: Backend,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    store = backend.store()
+    posted = [_f(f"posted_quote_{i}") for i in range(6)]
+    held = [(_f(f"held_quote_{i}"), "unverified") for i in range(6)]
+    log = spy(monkeypatch, store)
+    store.record_review(ReviewRecord(repo="acme/shop", pr=7, head_sha="h1", outcome="posted",
+                                     posted=True, post_id="r1"), posted, held)
+    order = [params[2] for sql, params in log if sql.startswith("INSERT INTO findings")]
+    assert order == sorted(f.fingerprint for f in posted + [h for h, _ in held])
+    assert order != [f.fingerprint for f in posted + [h for h, _ in held]]  # input was unsorted
+    states = {f["fingerprint"]: f["state"] for f in store.findings("acme/shop", 7)}
+    assert states == {**{f.fingerprint: "posted" for f in posted},
+                      **{h.fingerprint: "held" for h, _ in held}}
+
+
+def test_same_fingerprint_posted_and_held_keeps_the_posted_state(backend: Backend) -> None:
+    store = backend.store()
+    f = _f("one_quote_here")
+    store.record_review(ReviewRecord(repo="acme/shop", pr=7, head_sha="h1", outcome="posted",
+                                     posted=True, post_id="r1"), [f], [(f, "duplicate")])
+    assert [(r["state"], r["held_reason"]) for r in store.findings("acme/shop", 7)] == [
+        ("posted", None)]
+    # As before the sort: with nothing posted, the held row is written last and wins.
+    store.record_review(ReviewRecord(repo="acme/shop", pr=8, head_sha="h1", outcome="shadow"),
+                        [f], [(f, "duplicate")])
+    assert [(r["state"], r["held_reason"]) for r in store.findings("acme/shop", 8)] == [
+        ("held", "duplicate")]
+
+
+def test_postgres_deadlock_and_serialization_failures_are_retryable() -> None:
+    import psycopg.errors as pge
+    assert is_retryable(pge.DeadlockDetected("d")) is True
+    assert is_retryable(pge.SerializationFailure("s")) is True
+    assert is_retryable(pge.UniqueViolation("u")) is False
+    assert is_retryable(pge.CheckViolation("c")) is False
+
+
+@pytest.mark.skipif(not PG_URL, reason="needs REVIEWHOUND_TEST_PG")
+def test_a_real_postgres_deadlock_is_classified_retryable() -> None:
+    import psycopg
+    with psycopg.connect(PG_URL, autocommit=True) as c:
+        c.execute("DROP TABLE IF EXISTS dl_probe")
+        c.execute("CREATE TABLE dl_probe (id INT PRIMARY KEY, v INT)")
+        c.execute("INSERT INTO dl_probe VALUES (1, 0), (2, 0)")
+    a, b = psycopg.connect(PG_URL), psycopg.connect(PG_URL)
+    errors: list[BaseException] = []
+    try:
+        a.execute("UPDATE dl_probe SET v=1 WHERE id=1")
+        b.execute("UPDATE dl_probe SET v=1 WHERE id=2")
+
+        def second() -> None:
+            try:
+                b.execute("UPDATE dl_probe SET v=2 WHERE id=1")
+            except psycopg.Error as exc:
+                errors.append(exc)
+        t = threading.Thread(target=second)
+        t.start()
+        try:
+            a.execute("UPDATE dl_probe SET v=2 WHERE id=2")
+        except psycopg.Error as exc:
+            errors.append(exc)
+        a.rollback()
+        t.join(10)
+        b.rollback()
+    finally:
+        a.close()
+        b.close()
+    assert [type(e).__name__ for e in errors] == ["DeadlockDetected"]
+    assert is_retryable(errors[0]) is True
 
 
 def test_child_env_skips_unset_safe_keys(monkeypatch: pytest.MonkeyPatch) -> None:
