@@ -181,28 +181,42 @@ def _remove_tree(path: Path) -> None:
     shutil.rmtree(path, onexc=report)
 
 
-def _tail(path: Path, limit: int = 2_000) -> str:
+_MISSING, _UNREADABLE = "missing", "unreadable"
+
+
+def _read_untrusted(path: Path, limit: int, tail: bool = False) -> bytes | str:
+    """Read at most `limit` bytes of a file the code under test could have replaced.
+
+    Returns the bytes, or _MISSING / _UNREADABLE. A symlink, FIFO or device is never opened for
+    reading: no-follow and non-blocking open, then only a regular file is read.
+    """
     try:
-        with path.open("rb") as fh:
-            fh.seek(max(0, path.stat().st_size - limit))
-            return fh.read().decode("utf-8", "replace")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return _MISSING
     except OSError:
-        return ""
+        return _UNREADABLE
+    with os.fdopen(fd, "rb") as fh:
+        info = os.fstat(fh.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            return _UNREADABLE
+        if tail:
+            fh.seek(max(0, info.st_size - limit))
+        return fh.read(limit)
+
+
+def _tail(path: Path, limit: int = 2_000) -> str:
+    data = _read_untrusted(path, limit, tail=True)
+    return data.decode("utf-8", "replace") if isinstance(data, bytes) else ""
 
 
 def _read_junit(path: Path) -> str | None:
     """The report is written by code under test, so it is untrusted and size-capped."""
-    try:
-        # No-follow and non-blocking: a planted symlink or FIFO must not hang or flood us.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
+    data = _read_untrusted(path, MAX_JUNIT_BYTES + 1)
+    if data == _MISSING:
         return None
-    except OSError:
+    if not isinstance(data, bytes):
         return "<unreadable-report/>"
-    with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-            return "<unreadable-report/>"
-        data = fh.read(MAX_JUNIT_BYTES + 1)
     if len(data) > MAX_JUNIT_BYTES:
         return "<oversized-report/>"
     return data.decode("utf-8", errors="replace")

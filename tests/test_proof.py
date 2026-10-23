@@ -491,3 +491,25 @@ def test_report_symlinked_to_a_regular_file_outside_is_not_followed(tmp_path: Pa
     link = tmp_path / "junit.xml"
     link.symlink_to(secret)
     assert _read_junit(link) == "<unreadable-report/>"
+
+
+def test_output_tail_refuses_fifo_and_symlink_and_caps_size(tmp_path: Path) -> None:
+    import threading
+
+    from reviewhound.proof import _tail
+
+    fifo = tmp_path / "fifo.txt"
+    os.mkfifo(fifo)
+    got: list[str] = []
+    reader = threading.Thread(target=lambda: got.append(_tail(fifo)), daemon=True)
+    reader.start()
+    reader.join(3)
+    assert got == [""], "reading a planted FIFO must not block"
+    secret = tmp_path / "server_secret.txt"
+    secret.write_text("TOKEN=abc")
+    link = tmp_path / "link.txt"
+    link.symlink_to(secret)
+    big = tmp_path / "big.txt"
+    big.write_text("a" * 5000 + "END")
+    assert (_tail(link), _tail(tmp_path / "missing.txt")) == ("", "")
+    assert _tail(big, limit=10) == "aaaaaaaEND"
