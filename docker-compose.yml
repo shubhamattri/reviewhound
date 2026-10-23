@@ -4,6 +4,9 @@
 #   docker compose --profile postgres up -d            # with the bundled Postgres
 #   docker compose up -d                               # with your own REVIEWHOUND_DATABASE_URL
 #   docker compose up -d --scale worker=3              # more workers
+#   docker compose -f docker-compose.yml -f docker-compose.app.yml up -d   # as a GitHub App
+#
+# Only the webhook port is published. It also serves /metrics: set REVIEWHOUND_METRICS_TOKEN.
 
 x-reviewhound: &reviewhound
   restart: unless-stopped
@@ -20,6 +23,8 @@ services:
     environment:
       REVIEWHOUND_DATABASE_URL: ${REVIEWHOUND_DATABASE_URL:?set REVIEWHOUND_DATABASE_URL}
       REVIEWHOUND_WEBHOOK_SECRET: ${REVIEWHOUND_WEBHOOK_SECRET:?set REVIEWHOUND_WEBHOOK_SECRET}
+      REVIEWHOUND_METRICS_TOKEN: ${REVIEWHOUND_METRICS_TOKEN:-}
+      REVIEWHOUND_ALLOWED_OWNERS: ${REVIEWHOUND_ALLOWED_OWNERS:-}
     ports:
       - "${REVIEWHOUND_PORT:-8787}:8787"
 
@@ -33,7 +38,8 @@ services:
     command: ["worker"]
     environment:
       REVIEWHOUND_DATABASE_URL: ${REVIEWHOUND_DATABASE_URL:?set REVIEWHOUND_DATABASE_URL}
-      GITHUB_TOKEN: ${GITHUB_TOKEN:?set GITHUB_TOKEN}
+      # Token mode. In App mode leave it unset; docker-compose.app.yml adds the App settings.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN}
     healthcheck:
       disable: true

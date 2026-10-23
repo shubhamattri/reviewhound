@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ ProofVerdict = Literal["proven", "not_proven", "inconclusive"]
 # A test that dies on these never reached the code under test.
 NOT_A_PROOF = frozenset({"ImportError", "ModuleNotFoundError", "SyntaxError", "IndentationError",
                          "TabError"})
-DEFAULT_IMAGE = "python:3.12-slim"
+DEFAULT_IMAGE = "reviewhound-proof:latest"  # built from Dockerfile.proof
 MAX_SNAPSHOT_BYTES = 20_000_000
 MAX_FILE_PROMPT_BYTES = 20_000
 MAX_JUNIT_BYTES = 5_000_000
@@ -181,28 +182,42 @@ def _remove_tree(path: Path) -> None:
     shutil.rmtree(path, onexc=report)
 
 
-def _tail(path: Path, limit: int = 2_000) -> str:
+_MISSING, _UNREADABLE = "missing", "unreadable"
+
+
+def _read_untrusted(path: Path, limit: int, tail: bool = False) -> bytes | str:
+    """Read at most `limit` bytes of a file the code under test could have replaced.
+
+    Returns the bytes, or _MISSING / _UNREADABLE. A symlink, FIFO or device is never opened for
+    reading: no-follow and non-blocking open, then only a regular file is read.
+    """
     try:
-        with path.open("rb") as fh:
-            fh.seek(max(0, path.stat().st_size - limit))
-            return fh.read().decode("utf-8", "replace")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return _MISSING
     except OSError:
-        return ""
+        return _UNREADABLE
+    with os.fdopen(fd, "rb") as fh:
+        info = os.fstat(fh.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            return _UNREADABLE
+        if tail:
+            fh.seek(max(0, info.st_size - limit))
+        return fh.read(limit)
+
+
+def _tail(path: Path, limit: int = 2_000) -> str:
+    data = _read_untrusted(path, limit, tail=True)
+    return data.decode("utf-8", "replace") if isinstance(data, bytes) else ""
 
 
 def _read_junit(path: Path) -> str | None:
     """The report is written by code under test, so it is untrusted and size-capped."""
-    try:
-        # No-follow and non-blocking: a planted symlink or FIFO must not hang or flood us.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
+    data = _read_untrusted(path, MAX_JUNIT_BYTES + 1)
+    if data == _MISSING:
         return None
-    except OSError:
+    if not isinstance(data, bytes):
         return "<unreadable-report/>"
-    with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-            return "<unreadable-report/>"
-        data = fh.read(MAX_JUNIT_BYTES + 1)
     if len(data) > MAX_JUNIT_BYTES:
         return "<oversized-report/>"
     return data.decode("utf-8", errors="replace")
@@ -283,18 +298,39 @@ CommandRunner = Callable[[list[str], float], "subprocess.CompletedProcess[str]"]
 
 
 def _run_command(cmd: list[str], timeout_s: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False,
-                          stdin=subprocess.DEVNULL)
+    # The output can come from code under test: never let a bad byte raise.
+    return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                          timeout=timeout_s, check=False, stdin=subprocess.DEVNULL)
 
 
-_DOCKER_SCRIPT = ('cp -r /src /tmp/work && cd /tmp/work && '
-                  'PYTHONPATH=/tmp/work:/tmp/work/src exec python -m pytest '
+_DOCKER_SCRIPT = ("printf '[pytest]\\n' > /out/pytest.ini && cp -r /src /tmp/work && "
+                  "cd /tmp/work && PYTHONPATH=/tmp/work:/tmp/work/src exec python -m pytest "
                   + " ".join(_PYTEST_FLAGS) + ' -c /out/pytest.ini --rootdir=/tmp/work '
                   '--junitxml=/out/junit.xml -- "$1" > /out/output.txt 2>&1')
+# Reads a file the test wrote, inside the container: regular files only, at most $2 bytes.
+# Exit 3: missing. Exit 4: a symlink, FIFO or device.
+_READ_SCRIPT = ('[ -e "$1" ] || [ -L "$1" ] || exit 3; [ -f "$1" ] && [ ! -L "$1" ] || exit 4; '
+                'exec "$3" -c "$2" "$1"')
+OUT_TMPFS = "16m"
+ReadStatus = Literal["ok", "missing", "unreadable"]
+
+
+def _make_readable(root: Path) -> None:
+    """The container runs as nobody, so the tree must not depend on the worker's umask."""
+    root.chmod(0o755)
+    for dirpath, dirs, names in os.walk(root):
+        for d in dirs:
+            (Path(dirpath) / d).chmod(0o755)
+        for n in names:
+            (Path(dirpath) / n).chmod(0o644)
 
 
 class DockerRunner:
-    """Runs the test in a throwaway container with no network and a read-only root."""
+    """Runs the test in a throwaway container: no network, read-only root, nobody user.
+
+    The only host mount is the tree, read-only. Output stays in a size-limited tmpfs inside the
+    container and is read back through `docker exec`, then the container is removed.
+    """
 
     name = "docker"
 
@@ -316,54 +352,123 @@ class DockerRunner:
             return "docker unavailable: the daemon is not running"
         return ""
 
-    def command(self, work: Path, out: Path, test_path: str, name: str) -> list[str]:
-        return [self.docker, "run", "--rm", "--name", name, "--network", "none", "--read-only",
+    def start_command(self, work: Path, name: str, keepalive_s: int) -> list[str]:
+        return [self.docker, "run", "-d", "--pull", "never", "--name", name,
+                "--user", "65534:65534", "--network", "none", "--read-only",
                 "--memory", "512m", "--cpus", "1", "--pids-limit", "128", "--cap-drop", "ALL",
-                "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,size=256m",
-                "-v", f"{work}:/src:ro", "-v", f"{out}:/out:rw", "-e", "HOME=/tmp",
-                "-e", "PYTHONDONTWRITEBYTECODE=1", "-w", "/tmp", self.image,
-                "sh", "-c", _DOCKER_SCRIPT, "sh", test_path]
+                "--security-opt", "no-new-privileges",
+                "--tmpfs", "/tmp:rw,size=256m,mode=1777",
+                "--tmpfs", f"/out:rw,noexec,nosuid,size={OUT_TMPFS},mode=1777",
+                "-v", f"{work}:/src:ro", "-e", "HOME=/tmp", "-e", "PYTHONDONTWRITEBYTECODE=1",
+                "-w", "/tmp", self.image, "sleep", str(keepalive_s)]
 
     def run(self, files: Mapping[str, str], test_path: str, timeout_s: float) -> RunResult:
         problem = self._unavailable()
         if problem:
             return RunResult(None, None, error=problem)
         tmp = Path(tempfile.mkdtemp(prefix="reviewhound-proof-")).resolve()
+        name = f"reviewhound-proof-{uuid.uuid4().hex[:12]}"
+        started = False
         try:
-            work, out = tmp / "work", tmp / "out"
+            work = tmp / "work"
             work.mkdir()
-            out.mkdir()
             _write_tree(files, work)
-            (out / "pytest.ini").write_text("[pytest]\n")
-            name = f"reviewhound-proof-{uuid.uuid4().hex[:12]}"
+            _make_readable(work)
+            started = True  # from here a container may exist, even if the CLI call fails
+            # The sleep outlives the test, so a container we fail to remove still ends itself.
+            keepalive = int(timeout_s + self.startup_grace_s + 60)
             try:
-                res = self._cmd(self.command(work, out, test_path, name),
-                                timeout_s + self.startup_grace_s)
+                res = self._cmd(self.start_command(work, name, keepalive), self.startup_grace_s)
             except subprocess.TimeoutExpired:
-                self._kill(name)
-                return RunResult(None, None, timed_out=True)
+                return RunResult(None, None, error=f"docker run did not start within "
+                                                   f"{self.startup_grace_s:g}s")
             except OSError as exc:
                 return RunResult(None, None, error=f"docker could not start: "
                                                    f"{type(exc).__name__}")
-            if res.returncode == 125:  # the docker CLI's own failure, e.g. a missing image
-                return RunResult(125, None, error="docker run failed: "
-                                                  + (res.stderr or "").strip()[-300:])
-            return RunResult(res.returncode, _read_junit(out / "junit.xml"),
-                             output_tail=_tail(out / "output.txt"))
+            if res.returncode != 0:
+                return RunResult(res.returncode, None, error="docker run failed: "
+                                 + (res.stderr or "").strip()[-300:])
+            try:
+                res = self._cmd([self.docker, "exec", name, "sh", "-c", _DOCKER_SCRIPT, "sh",
+                                 test_path], timeout_s + 10)
+            except subprocess.TimeoutExpired:
+                return RunResult(None, None, timed_out=True)
+            except OSError as exc:
+                return RunResult(None, None, error=f"docker exec failed: {type(exc).__name__}")
+            junit = self._read(name, "/out/junit.xml", MAX_JUNIT_BYTES + 1, "head")
+            status, tail = self._read(name, "/out/output.txt", 2_000, "tail")
+            return RunResult(res.returncode, _junit_text(*junit),
+                             output_tail=tail if status == "ok" else "")
         finally:
+            if started:
+                self._remove(name)
             _remove_tree(tmp)
 
-    def _kill(self, name: str) -> None:
-        # Killing the CLI on timeout leaves the container running; stop it by name.
+    def _read(self, name: str, path: str, limit: int, mode: str) -> tuple[ReadStatus, str]:
+        """At most `limit` bytes of a file inside the container, with how the read went."""
         try:
-            res = self._cmd([self.docker, "kill", name], 15)
+            res = self._cmd([self.docker, "exec", name, "sh", "-c", _READ_SCRIPT, "sh", path,
+                             str(limit), mode], 15)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            log.warning("could not kill timed-out proof container",
+            log.warning("could not read proof output", extra={"container": name, "path": path,
+                                                              "error": type(exc).__name__})
+            return "unreadable", ""
+        if res.returncode == 3:
+            return "missing", ""
+        if res.returncode != 0:
+            return "unreadable", ""
+        return "ok", res.stdout
+
+    def _remove(self, name: str) -> None:
+        try:
+            res = self._cmd([self.docker, "rm", "-f", name], 30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("could not remove proof container",
                         extra={"container": name, "error": type(exc).__name__})
             return
-        if res.returncode != 0:
-            log.warning("could not kill timed-out proof container",
+        if res.returncode != 0 and "No such container" not in (res.stderr or ""):
+            log.warning("could not remove proof container",
                         extra={"container": name, "returncode": res.returncode})
+
+
+def _junit_text(status: ReadStatus, data: str) -> str | None:
+    if status == "missing":
+        return None
+    if status == "unreadable":
+        return "<unreadable-report/>"
+    if len(data) > MAX_JUNIT_BYTES:
+        return "<oversized-report/>"
+    return data
+
+
+class BudgetedRunner:
+    """Caps the total sandbox time of one review, whatever each repo's timeout_s asks for."""
+
+    def __init__(self, inner: SandboxRunner, total_s: float,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.total_s = total_s
+        self._clock = clock
+        self._spent = 0.0
+
+    def remaining(self) -> float:
+        return max(0.0, self.total_s - self._spent)
+
+    def exhausted(self) -> bool:
+        return self.remaining() < 1.0
+
+    def refusal(self) -> str:
+        return f"proof time budget of {self.total_s:g}s for this review is used up"
+
+    def run(self, files: Mapping[str, str], test_path: str, timeout_s: float) -> RunResult:
+        if self.exhausted():
+            return RunResult(None, None, error=self.refusal())
+        start = self._clock()
+        try:
+            return self.inner.run(files, test_path, min(timeout_s, self.remaining()))
+        finally:
+            self._spent += self._clock() - start
 
 
 @dataclass
@@ -442,6 +547,8 @@ class Prover:
         source = files.get(f.file)
         if source is None:
             return ProofResult("inconclusive", "file is not in the head snapshot")
+        if isinstance(self.runner, BudgetedRunner) and self.runner.exhausted():
+            return ProofResult("inconclusive", self.runner.refusal())
         d = index.enclosing_definition(f.file, f.line)
         function_src = "\n".join(source.splitlines()[d.start_line - 1:d.end_line]) if d else ""
         try:
@@ -475,9 +582,16 @@ def select_runner(cfg: ProofConfig, runners: Mapping[str, SandboxRunner]) -> San
     return runners.get(cfg.runner)
 
 
+UNREPRODUCED = "after an unreproduced proof"
+
+
 def run_proof_stage(prover: Prover | None, decision: PolicyDecision, cfg: RepoConfig,
                     head: Snapshot, index: CodeIndex) -> None:
-    """Attach proofs to the findings about to be posted. Never raises."""
+    """Attach proofs to the findings about to be posted.
+
+    PR code runs in the same sandbox as the test and can forge its result, so a proof never
+    makes the review more lenient: the verdict computed before proofs is always kept.
+    """
     pc = cfg.proof
     candidates = eligible(pc, decision.post)
     if not candidates:
@@ -493,10 +607,12 @@ def run_proof_stage(prover: Prover | None, decision: PolicyDecision, cfg: RepoCo
         for f in candidates:
             _attach(f, ProofResult("inconclusive", str(exc)))
         return
+    verdict = decision.event
     try:
         _prove_each(prover, candidates, files, index, pc)
     finally:
-        _reapply_floor_and_event(decision, cfg)
+        _reapply_floor(decision, cfg)
+        decision.event = verdict
 
 
 def _prove_each(prover: Prover, candidates: list[Finding], files: Mapping[str, str],
@@ -523,16 +639,12 @@ def _attach(f: Finding, r: ProofResult) -> None:
     f.notes.append(f"proof {r.verdict}: {r.reason}")
 
 
-def _reapply_floor_and_event(decision: PolicyDecision, cfg: RepoConfig) -> None:
+def _reapply_floor(decision: PolicyDecision, cfg: RepoConfig) -> None:
     floor = Severity.parse(cfg.policy.min_severity_to_post)
     keep: list[Finding] = []
     for f in decision.post:
         if f.severity < floor:
-            decision.held.append((f, (f"below {cfg.policy.min_severity_to_post} after an "
-                                     "unreproduced proof")))
+            decision.held.append((f, f"below {cfg.policy.min_severity_to_post} {UNREPRODUCED}"))
         else:
             keep.append(f)
     decision.post = keep
-    blocking = Severity.parse(cfg.policy.blocking_severity)
-    decision.event = "REQUEST_CHANGES" if any(f.severity >= blocking for f in keep) \
-        else "COMMENT"

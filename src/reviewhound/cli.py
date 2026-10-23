@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -14,9 +15,16 @@ from typing import TYPE_CHECKING, Any
 
 from reviewhound.backends import open_metrics, open_queue, open_store
 from reviewhound.evals import run_eval
+from reviewhound.heartbeat import DEFAULT_MAX_JOB_SECONDS
 from reviewhound.metrics import BacklogAlarm, collect, render_prometheus, render_stats
 from reviewhound.pipeline import Reviewer
-from reviewhound.proof import DockerRunner, LocalRunner, SandboxRunner
+from reviewhound.proof import (
+    DEFAULT_IMAGE,
+    BudgetedRunner,
+    DockerRunner,
+    LocalRunner,
+    SandboxRunner,
+)
 from reviewhound.providers import ClaudeCliProvider, FakeProvider, Provider, ProviderRegistry
 from reviewhound.queue import Job
 from reviewhound.scanners import BuiltinScanner, Scanner, SemgrepScanner
@@ -24,6 +32,7 @@ from reviewhound.scanners import BuiltinScanner, Scanner, SemgrepScanner
 if TYPE_CHECKING:
     from reviewhound.vcs.github_app import GitHubApp
 
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DEFAULT_HOME = Path(os.environ.get("REVIEWHOUND_HOME", Path.home() / ".reviewhound"))
 
 
@@ -63,6 +72,23 @@ def _registry(args: argparse.Namespace) -> ProviderRegistry:
     return ProviderRegistry(providers)
 
 
+def _worker_reviewer_factory(args: argparse.Namespace) -> Callable[[Job], Reviewer]:
+    """One reviewer per job: proof runners and their time budget are per repo and per review."""
+    from reviewhound.vcs.github import GitHubVCS
+
+    home = Path(args.home)
+    home.mkdir(parents=True, exist_ok=True)
+    vcs = GitHubVCS(_github_token(args.gh_user), home / "checkouts")
+    store = open_store(home, args.database_url)
+    registry = _registry(args)
+    scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner()]
+
+    def build(job: Job) -> Reviewer:
+        return Reviewer(vcs, registry, scanners, store,
+                        proof_runners=_proof_runners(args, job.repo))
+    return build
+
+
 def _reviewer(args: argparse.Namespace, with_store: bool) -> Reviewer:
     from reviewhound.vcs.github import GitHubVCS
 
@@ -71,14 +97,34 @@ def _reviewer(args: argparse.Namespace, with_store: bool) -> Reviewer:
     vcs = GitHubVCS(_github_token(args.gh_user), home / "checkouts")
     store = open_store(home, args.database_url) if with_store else None
     return Reviewer(vcs, _registry(args), [BuiltinScanner(), SemgrepScanner()], store,
-                    proof_runners=_proof_runners(args))
+                    proof_runners=_proof_runners(args, args.repo))
 
 
-def _proof_runners(args: argparse.Namespace) -> dict[str, SandboxRunner]:
-    runners: dict[str, SandboxRunner] = {"docker": DockerRunner(image=args.proof_image)}
-    if args.allow_local_proof:  # runs PR code on this machine: trusted repos only
-        runners["local"] = LocalRunner()
+def _proof_runners(args: argparse.Namespace, repo: str) -> dict[str, SandboxRunner]:
+    """Fresh runners for one review. The local runner runs PR code on this machine, so only
+    repos the operator named get it; a repo's own config can never add it."""
+    total = args.max_proof_seconds
+    runners: dict[str, SandboxRunner] = {
+        "docker": BudgetedRunner(DockerRunner(image=args.proof_image), total)}
+    if repo.lower() in {r.lower() for r in args.allow_local_proof_repo}:
+        runners["local"] = BudgetedRunner(LocalRunner(), total)
     return runners
+
+
+def _repo_name(value: str) -> str:
+    if not _REPO_RE.match(value):
+        raise argparse.ArgumentTypeError(f"expected owner/name, got {value!r}")
+    return value
+
+
+def _positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of seconds, got {value!r}") from None
+    if not seconds > 0:
+        raise argparse.ArgumentTypeError(f"must be above 0, got {value!r}")
+    return seconds
 
 
 def _github_app() -> GitHubApp | None:
@@ -102,13 +148,13 @@ def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp) -> Callable[
     store = open_store(home, args.database_url)
     registry = _registry(args)
     scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner()]
-    runners = _proof_runners(args)
     client = httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
 
     def build(job: Job) -> Reviewer:
         # With an App every job uses an installation token, looked up by repo when missing.
         vcs = GitHubVCS(token_for_job(app, job, lambda: ""), home / "checkouts", client=client)
-        return Reviewer(vcs, registry, scanners, store, proof_runners=runners)
+        return Reviewer(vcs, registry, scanners, store,
+                        proof_runners=_proof_runners(args, job.repo))
     return build
 
 
@@ -167,15 +213,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
     queue = open_queue(Path(args.home), args.database_url)
     metrics = open_metrics(Path(args.home), args.database_url)
     app = _github_app()
-    reviewer: Reviewer | Callable[[Job], Reviewer] = (
-        _reviewer(args, with_store=True) if app is None else _app_reviewer_factory(args, app))
+    reviewer = _worker_reviewer_factory(args) if app is None else _app_reviewer_factory(args, app)
     if args.once:
-        job = run_one(queue, reviewer, metrics)
+        job = run_one(queue, reviewer, metrics, args.max_job_seconds)
         print("no job" if job is None else f"ran job {job.id}")
         return 0
     run_forever(queue, reviewer, metrics=metrics,
                 alarm=BacklogAlarm(queue, older_than_s=args.backlog_alarm_s,
-                                   interval_s=args.backlog_alarm_interval_s))
+                                   interval_s=args.backlog_alarm_interval_s),
+                max_job_seconds=args.max_job_seconds)
     return 0
 
 
@@ -215,10 +261,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="postgresql://... (default: $REVIEWHOUND_DATABASE_URL, else SQLite in --home)")
     p.add_argument("--backlog-alarm-s", type=float, default=600.0,
                    help="queued jobs older than this count as stuck")
-    p.add_argument("--allow-local-proof", action="store_true",
-                   help="let repos with proof.runner: local run generated tests on this machine")
-    p.add_argument("--proof-image", default="python:3.12-slim",
-                   help="docker image for proof runs; it must have pytest installed")
+    p.add_argument("--allow-local-proof-repo", action="append", default=[], type=_repo_name,
+                   metavar="OWNER/NAME",
+                   help="let this repo's proof.runner: local run generated tests on this "
+                        "machine (repeatable); no other repo can")
+    p.add_argument("--max-proof-seconds", type=_positive_seconds, default=300.0,
+                   help="total sandbox time for all proofs in one review")
+    p.add_argument("--proof-image", default=DEFAULT_IMAGE,
+                   help="docker image for proof runs (build it from Dockerfile.proof)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("review", help="review one PR")
@@ -245,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--fake-answer", default=None)
     w.add_argument("--backlog-alarm-interval-s", type=float, default=300.0,
                    help="log the backlog alarm at most once per this many seconds")
+    w.add_argument("--max-job-seconds", type=_positive_seconds, default=DEFAULT_MAX_JOB_SECONDS,
+                   help="after this a review stops renewing its lease, posts nothing and is "
+                        "retried")
     w.set_defaults(func=cmd_worker)
 
     q = sub.add_parser("enqueue", help="queue a review for a PR's current head")

@@ -99,3 +99,24 @@ def test_timed_out_process_is_killed_and_reaped(sandbox_tmp: Path,
     [proc] = started
     assert proc.returncode == -9
     assert list(sandbox_tmp.iterdir()) == []
+
+
+def _plant(kind: str) -> str:
+    # The generated test swaps the runner's own output file for a FIFO or a /dev/zero symlink.
+    make = "os.mkfifo(out)" if kind == "fifo" else "os.symlink('/dev/zero', out)"
+    return ("import os, sys\n\n\ndef test_plant():\n"
+            "    junit = next(a for a in sys.argv if a.startswith('--junitxml='))\n"
+            "    out = os.path.join(os.path.dirname(junit.split('=', 1)[1]), 'output.txt')\n"
+            f"    os.unlink(out)\n    {make}\n    assert False\n")
+
+
+@pytest.mark.parametrize("kind", ["fifo", "symlink"])
+def test_planted_output_file_does_not_hang_or_flood_the_host(sandbox_tmp: Path,
+                                                            kind: str) -> None:
+    started = time.monotonic()
+    res = LocalRunner().run({"test_plant.py": _plant(kind)}, "test_plant.py", 20)
+    assert time.monotonic() - started < 15
+    assert res.output_tail == ""
+    assert classify(res) == ("proven",
+                             "the generated test fails on the PR head with AssertionError")
+    assert list(sandbox_tmp.iterdir()) == []

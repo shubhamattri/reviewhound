@@ -1,7 +1,8 @@
-import argparse
 import dataclasses
 import json
+import logging
 import os
+import re
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -145,54 +146,102 @@ def test_write_tree_refuses_to_escape_the_sandbox(tmp_path: Path) -> None:
 # --- Docker runner with a fake command runner ----------------------------------------------
 
 class FakeDocker:
+    """Plays the docker CLI: a detached container, `exec` for the test and for reads, `rm -f`."""
+
     def __init__(self, info_rc: int = 0, run_rc: int = 1, junit: str | None = "assert",
-                 info_exc: Exception | None = None, run_exc: Exception | None = None) -> None:
+                 info_exc: Exception | None = None, run_exc: Exception | None = None,
+                 start_rc: int = 0, start_exc: Exception | None = None,
+                 files: dict[str, tuple[int, str]] | None = None, rm_rc: int = 0) -> None:
         self.calls: list[list[str]] = []
         self.timeouts: list[float] = []
         self.info_rc, self.run_rc, self.junit = info_rc, run_rc, junit
         self.info_exc, self.run_exc = info_exc, run_exc
+        self.start_rc, self.start_exc, self.rm_rc = start_rc, start_exc, rm_rc
+        # path in the container -> (exit code of the read script, stdout)
+        self.files = files if files is not None else {}
+        self.src_modes: dict[str, int] = {}
         self.workdirs: list[Path] = []
 
     def __call__(self, cmd: list[str], timeout_s: float) -> subprocess.CompletedProcess[str]:
         self.calls.append(cmd)
         self.timeouts.append(timeout_s)
-        if cmd[1] == "info":
+        verb = cmd[1]
+        if verb == "info":
             if self.info_exc:
                 raise self.info_exc
             return subprocess.CompletedProcess(cmd, self.info_rc, "27.0.1\n", "")
-        if cmd[1] == "kill":
-            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if verb == "rm":
+            return subprocess.CompletedProcess(cmd, self.rm_rc, "", "")
+        if verb == "run":
+            if self.start_exc:
+                raise self.start_exc
+            src = Path(cmd[cmd.index("-v") + 1].split(":")[0])
+            self.workdirs.append(src.parent)
+            assert (src / "pkg" / "mod.py").read_text() == "X = 1\n"
+            assert (src / "tests" / "test_p.py").read_text() == "def test_a(): assert 0\n"
+            for p in [src, *src.rglob("*")]:
+                self.src_modes[p.relative_to(src).as_posix()] = p.stat().st_mode & 0o777
+            return subprocess.CompletedProcess(cmd, self.start_rc, "abc123\n",
+                                               "no such image" if self.start_rc else "")
+        assert verb == "exec"
+        if cmd[-1] in ("head", "tail"):  # a capped read of a file inside the container
+            path = cmd[-3]
+            if path == "/out/junit.xml" and self.junit and path not in self.files:
+                return subprocess.CompletedProcess(
+                    cmd, 0, (JUNIT / f"{self.junit}.xml").read_text()[:int(cmd[-2])], "")
+            rc, out = self.files.get(path, (3, ""))
+            return subprocess.CompletedProcess(cmd, rc, out[:int(cmd[-2])], "")
         if self.run_exc:
             raise self.run_exc
-        mounts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-v"]
-        src, out = (Path(m.split(":")[0]) for m in mounts)
-        self.workdirs.append(src.parent)
-        assert (src / "pkg" / "mod.py").read_text() == "X = 1\n"
-        assert (src / "tests" / "test_p.py").read_text() == "def test_a(): assert 0\n"
-        if self.junit:
-            (out / "junit.xml").write_text((JUNIT / f"{self.junit}.xml").read_text())
-        return subprocess.CompletedProcess(cmd, self.run_rc, "", "boom" if self.run_rc else "")
+        return subprocess.CompletedProcess(cmd, self.run_rc, "", "")
 
 
 FILES = {"pkg/mod.py": "X = 1\n", "tests/test_p.py": "def test_a(): assert 0\n"}
 
 
+def _has(cmd: list[str], flag: list[str]) -> bool:
+    return any(cmd[i:i + len(flag)] == flag for i in range(len(cmd)))
+
+
 def test_docker_runner_uses_a_locked_down_container_and_cleans_up() -> None:
-    fake = FakeDocker()
+    fake = FakeDocker(files={"/out/output.txt": (0, "1 failed")})
     res = DockerRunner(command=fake, startup_grace_s=5).run(FILES, "tests/test_p.py", 60)
     assert classify(res) == ("proven",
                              "the generated test fails on the PR head with AssertionError")
-    run_cmd = fake.calls[1]
-    for flag in (["--rm"], ["--network", "none"], ["--read-only"], ["--memory", "512m"],
-                 ["--cpus", "1"], ["--pids-limit", "128"], ["--cap-drop", "ALL"],
-                 ["--tmpfs", "/tmp:rw,size=256m"]):
-        assert any(run_cmd[i:i + len(flag)] == flag for i in range(len(run_cmd))), flag
-    assert "python:3.12-slim" in run_cmd
-    assert [m.split(":", 1)[1] for m in (run_cmd[i + 1] for i, a in enumerate(run_cmd)
-                                         if a == "-v")] == ["/src:ro", "/out:rw"]
-    assert run_cmd[-2:] == ["sh", "tests/test_p.py"]  # the path is an argv, never shell text
-    assert fake.timeouts == [15, 65]
+    assert res.output_tail == "1 failed"
+    start = fake.calls[1]
+    name = start[start.index("--name") + 1]
+    assert name.startswith("reviewhound-proof-")
+    for flag in (["run", "-d"], ["--pull", "never"], ["--user", "65534:65534"],
+                 ["--network", "none"], ["--read-only"], ["--memory", "512m"], ["--cpus", "1"],
+                 ["--pids-limit", "128"], ["--cap-drop", "ALL"],
+                 ["--security-opt", "no-new-privileges"],
+                 ["--tmpfs", "/tmp:rw,size=256m,mode=1777"],
+                 ["--tmpfs", "/out:rw,noexec,nosuid,size=16m,mode=1777"]):
+        assert _has(start, flag), flag
+    assert "--rm" not in start
+    assert [start[i + 1] for i, a in enumerate(start) if a == "-v"] == [
+        f"{fake.workdirs[0] / 'work'}:/src:ro"]  # the only host mount, and it is read-only
+    assert start[-3:] == ["reviewhound-proof:latest", "sleep", "125"]
+    test_run = fake.calls[2]
+    assert test_run[:3] == ["docker", "exec", name]
+    assert test_run[-2:] == ["sh", "tests/test_p.py"]  # the path is an argv, never shell text
+    assert [c[-3:] for c in fake.calls[3:5]] == [["/out/junit.xml", "5000001", "head"],
+                                                 ["/out/output.txt", "2000", "tail"]]
+    assert fake.calls[5] == ["docker", "rm", "-f", name]
+    assert fake.timeouts == [15, 5, 70, 15, 15, 30]
     assert not fake.workdirs[0].exists()
+
+
+def test_tree_is_readable_by_the_unprivileged_container_user() -> None:
+    fake = FakeDocker()
+    old = os.umask(0o077)
+    try:
+        DockerRunner(command=fake).run(FILES, "tests/test_p.py", 60)
+    finally:
+        os.umask(old)
+    assert fake.src_modes == {".": 0o755, "pkg": 0o755, "pkg/mod.py": 0o644, "tests": 0o755,
+                              "tests/test_p.py": 0o644}
 
 
 @pytest.mark.parametrize("fake, reason", [
@@ -209,13 +258,27 @@ def test_docker_down_is_inconclusive_without_running_anything(fake: FakeDocker,
     assert [c[1] for c in fake.calls] == ["info"]
 
 
-def test_docker_timeout_kills_the_container_by_name() -> None:
-    fake = FakeDocker(run_exc=subprocess.TimeoutExpired("docker", 90))
+def test_docker_timeout_removes_the_container() -> None:
+    fake = FakeDocker(run_exc=subprocess.TimeoutExpired("docker", 70))
     res = DockerRunner(command=fake).run(FILES, "tests/test_p.py", 60)
     assert classify(res) == ("inconclusive", "test run timed out")
     name = fake.calls[1][fake.calls[1].index("--name") + 1]
-    assert name.startswith("reviewhound-proof-")
-    assert fake.calls[2] == ["docker", "kill", name]
+    assert [c[1] for c in fake.calls] == ["info", "run", "exec", "rm"]
+    assert fake.calls[-1] == ["docker", "rm", "-f", name]
+
+
+@pytest.mark.parametrize("fake, reason", [
+    (FakeDocker(start_rc=125), "docker run failed: no such image"),
+    (FakeDocker(start_exc=subprocess.TimeoutExpired("docker", 30)),
+     "docker run did not start within 30s"),
+    (FakeDocker(start_exc=FileNotFoundError("docker")),
+     "docker could not start: FileNotFoundError"),
+])
+def test_container_that_does_not_start_is_inconclusive_and_removed(fake: FakeDocker,
+                                                                   reason: str) -> None:
+    res = DockerRunner(command=fake).run(FILES, "tests/test_p.py", 60)
+    assert classify(res) == ("inconclusive", reason)
+    assert [c[1] for c in fake.calls] == ["info", "run", "rm"]
 
 
 def test_oversized_junit_written_by_the_test_is_not_parsed(
@@ -225,10 +288,75 @@ def test_oversized_junit_written_by_the_test_is_not_parsed(
     assert classify(res) == ("inconclusive", "unexpected junit root <oversized-report>")
 
 
-def test_docker_own_failure_is_inconclusive_not_a_test_result() -> None:
+@pytest.mark.parametrize("read, junit", [
+    ((4, ""), "<unreadable-report/>"),      # a FIFO, symlink or device: refused in the container
+    ((3, ""), None),                        # no report written
+    ((1, "partial"), "<unreadable-report/>"),  # the read itself failed
+])
+def test_report_read_inside_the_container_is_classified(read: tuple[int, str],
+                                                        junit: str | None) -> None:
+    fake = FakeDocker(files={"/out/junit.xml": read})
+    res = DockerRunner(command=fake).run(FILES, "tests/test_p.py", 60)
+    assert res.junit_xml == junit
+
+
+def test_the_in_container_read_script_refuses_links_and_fifos_and_caps(tmp_path: Path) -> None:
+    from reviewhound.proof import _READ_SCRIPT
+
+    def read(path: Path, limit: int, mode: str) -> tuple[int, str]:
+        res = subprocess.run(["sh", "-c", _READ_SCRIPT, "sh", str(path), str(limit), mode],
+                             capture_output=True, text=True, timeout=10, check=False)
+        return res.returncode, res.stdout
+    report = tmp_path / "junit.xml"
+    report.write_text("0123456789")
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    link = tmp_path / "link"
+    link.symlink_to(report)
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    assert read(report, 4, "head") == (0, "0123")
+    assert read(report, 4, "tail") == (0, "6789")
+    assert [read(p, 4, "head")[0] for p in (fifo, link, dangling, tmp_path / "missing")] == [
+        4, 4, 4, 3]
+
+
+def test_a_report_read_that_hangs_is_unreadable_and_the_container_still_removed() -> None:
+    class HangingRead(FakeDocker):
+        def __call__(self, cmd: list[str], timeout_s: float
+                     ) -> subprocess.CompletedProcess[str]:
+            if cmd[-1] == "head":
+                self.calls.append(cmd)
+                raise subprocess.TimeoutExpired("docker", timeout_s)
+            return super().__call__(cmd, timeout_s)
+    fake = HangingRead()
+    res = DockerRunner(command=fake).run(FILES, "tests/test_p.py", 60)
+    assert res.junit_xml == "<unreadable-report/>"
+    assert fake.calls[-1][1:3] == ["rm", "-f"]
+
+
+def test_container_left_behind_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="reviewhound.proof")
+    fake = FakeDocker(rm_rc=1)
+    DockerRunner(command=fake).run(FILES, "tests/test_p.py", 60)
+    name = fake.calls[1][fake.calls[1].index("--name") + 1]
+    assert [(r.getMessage(), getattr(r, "container", None)) for r in caplog.records] == [
+        ("could not remove proof container", name)]
+
+
+def test_docker_test_failure_with_exit_125_is_not_a_cli_failure() -> None:
+    # exec returns the test's own exit code; only the start step can be the CLI's failure.
     res = DockerRunner(command=FakeDocker(run_rc=125, junit=None)).run(FILES, "tests/test_p.py",
                                                                        60)
-    assert classify(res) == ("inconclusive", "docker run failed: boom")
+    assert classify(res) == ("inconclusive", "no junit report (exit 125)")
+
+
+def test_default_proof_image_is_the_pinned_reviewhound_image() -> None:
+    from reviewhound.cli import main as _main  # noqa: F401 - the CLI must import cleanly
+    assert DockerRunner().image == "reviewhound-proof:latest"
+    dockerfile = (Path(__file__).parent.parent / "Dockerfile.proof").read_text()
+    assert "FROM python:3.12-slim" in dockerfile
+    assert re.search(r"pytest==\d+\.\d+\.\d+", dockerfile)
 
 
 # --- prover and the proof stage with fakes -------------------------------------------------
@@ -353,7 +481,8 @@ def test_not_proven_blocker_is_downgraded_only_when_configured() -> None:
     f = finding()
     decision, _ = stage([f], RecordingRunner(sample("pass", 0)), [GOOD],
                         "proof:\n  enabled: true\n  downgrade_unproven: true\n")
-    assert (f.proof, f.severity, decision.event) == ("not_proven", Severity.MAJOR, "COMMENT")
+    assert (f.proof, f.severity, decision.event) == ("not_proven", Severity.MAJOR,
+                                                     "REQUEST_CHANGES")
     assert decision.post == [f]
     g = finding()
     decision, _ = stage([g], RecordingRunner(sample("pass", 0)), [GOOD],
@@ -369,7 +498,7 @@ def test_downgrade_below_the_posting_floor_holds_the_finding() -> None:
                         "proof:\n  enabled: true\n  downgrade_unproven: true\n")
     assert decision.post == []
     assert decision.held == [(f, "below blocker after an unreproduced proof")]
-    assert decision.event == "COMMENT"
+    assert decision.event == "REQUEST_CHANGES"
 
 
 def test_inconclusive_and_proven_never_change_severity() -> None:
@@ -412,7 +541,7 @@ def test_proven_comment_says_so_and_folds_the_test_in_details() -> None:
     f.proof, f.proof_test = "proven", "def test_x():\n    s = '```'\n    assert s == ''\n"
     body = _comment_body(f)
     assert body == ("**[blocker] first element skipped**\n\nrange starts at 1\n\n"
-                    "**Proven:** a generated test fails on this PR's head.\n\n"
+                    "**Reproduced by a generated test:** it fails on this PR's head.\n\n"
                     "<details><summary>Failing test</summary>\n\n````python\n"
                     "def test_x():\n    s = '```'\n    assert s == ''\n````\n\n</details>")
 
@@ -427,7 +556,7 @@ def test_body_only_findings_say_proven_and_skipped_files_follow() -> None:
                           not_reviewed=[("big.bin", "diff too large for GitHub to return")])
     assert review.comments == []
     assert review.body.splitlines()[2:] == [
-        "- `calc/stats.py:3` [blocker] first element skipped (proven by a failing test)",
+        "- `calc/stats.py:3` [blocker] first element skipped (reproduced by a generated test)",
         "- `calc/stats.py:3` [blocker] other",
         "- not reviewed: big.bin (diff too large for GitHub to return)"]
 
@@ -437,16 +566,6 @@ def test_unproven_comment_has_no_proof_section(verdict: str | None) -> None:
     f = finding()
     f.proof, f.proof_test = verdict, "def test_x(): pass"  # type: ignore[assignment]
     assert _comment_body(f) == "**[blocker] first element skipped**\n\nrange starts at 1"
-
-
-def test_cli_adds_the_local_runner_only_when_the_operator_opts_in() -> None:
-    from reviewhound.cli import _proof_runners
-
-    runners = _proof_runners(argparse.Namespace(allow_local_proof=False, proof_image="img:1"))
-    assert sorted(runners) == ["docker"]
-    assert isinstance(runners["docker"], DockerRunner) and runners["docker"].image == "img:1"
-    runners = _proof_runners(argparse.Namespace(allow_local_proof=True, proof_image="img:1"))
-    assert sorted(runners) == ["docker", "local"]
 
 
 @pytest.mark.parametrize("claimed", ["builtins.ImportError", "builtins.ModuleNotFoundError"])
@@ -480,7 +599,7 @@ def test_floor_and_verdict_are_reapplied_even_if_proving_crashes(
     decision = PolicyDecision(post=[f], event="REQUEST_CHANGES")
     with pytest.raises(MemoryError):
         run_proof_stage(p, decision, cfg, DictSnapshot(HEAD), CodeIndex.build(HEAD))
-    assert (decision.post, decision.event) == ([f], "COMMENT")
+    assert (decision.post, decision.event) == ([f], "REQUEST_CHANGES")
 
 
 def test_report_symlinked_to_a_regular_file_outside_is_not_followed(tmp_path: Path) -> None:
@@ -491,3 +610,25 @@ def test_report_symlinked_to_a_regular_file_outside_is_not_followed(tmp_path: Pa
     link = tmp_path / "junit.xml"
     link.symlink_to(secret)
     assert _read_junit(link) == "<unreadable-report/>"
+
+
+def test_output_tail_refuses_fifo_and_symlink_and_caps_size(tmp_path: Path) -> None:
+    import threading
+
+    from reviewhound.proof import _tail
+
+    fifo = tmp_path / "fifo.txt"
+    os.mkfifo(fifo)
+    got: list[str] = []
+    reader = threading.Thread(target=lambda: got.append(_tail(fifo)), daemon=True)
+    reader.start()
+    reader.join(3)
+    assert got == [""], "reading a planted FIFO must not block"
+    secret = tmp_path / "server_secret.txt"
+    secret.write_text("TOKEN=abc")
+    link = tmp_path / "link.txt"
+    link.symlink_to(secret)
+    big = tmp_path / "big.txt"
+    big.write_text("a" * 5000 + "END")
+    assert (_tail(link), _tail(tmp_path / "missing.txt")) == ("", "")
+    assert _tail(big, limit=10) == "aaaaaaaEND"

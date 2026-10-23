@@ -8,6 +8,7 @@ import re
 from reviewhound.diff import Diff
 from reviewhound.findings import Finding
 from reviewhound.policy import PolicyDecision
+from reviewhound.proof import UNREPRODUCED
 from reviewhound.vcs.base import ReviewComment, ReviewPayload
 
 
@@ -24,7 +25,7 @@ def _proof_section(f: Finding) -> str:
         return ""
     longest = max((len(m) for m in re.findall(r"`+", f.proof_test)), default=0)
     fence = "`" * max(3, longest + 1)  # a fence the test code itself cannot close
-    return ("\n\n**Proven:** a generated test fails on this PR's head."
+    return ("\n\n**Reproduced by a generated test:** it fails on this PR's head."
             f"\n\n<details><summary>Failing test</summary>\n\n{fence}python\n"
             f"{f.proof_test.rstrip()}\n{fence}\n\n</details>")
 
@@ -50,8 +51,13 @@ def build_review(head_sha: str, decision: PolicyDecision, diff: Diff, tier: str,
     else:
         lines.append(f"{len(decision.post)} issue(s) found.")
     for f in body_only:
-        proven = " (proven by a failing test)" if f.proof == "proven" else ""
+        proven = " (reproduced by a generated test)" if f.proof == "proven" else ""
         lines.append(f"- `{f.file}:{f.line}` [{f.severity.name.lower()}] {f.title}{proven}")
+    for f, reason in decision.held:
+        if reason.endswith(UNREPRODUCED):
+            lines.append(f"- `{f.file}:{f.line}` [{f.severity.name.lower()}] {f.title} (held: a "
+                         "generated test passed on this head; the verdict was set before the "
+                         "proof and is kept)")
     for path, reason in not_reviewed or []:
         lines.append(f"- not reviewed: {path} ({reason})")
     return ReviewPayload(head_sha=head_sha, event=decision.event, body="\n".join(lines),
