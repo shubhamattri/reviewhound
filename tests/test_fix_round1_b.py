@@ -6,6 +6,7 @@ import base64
 import http.client
 import json
 import logging
+import socket
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -22,12 +23,13 @@ from reviewhound.github_feedback import DISMISS_MESSAGE, open_reason
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.pipeline import comments_in_body
 from reviewhound.procenv import child_env
+from reviewhound.queue import SQLiteQueue
 from reviewhound.scanners import SemgrepScanner, secret_identity
 from reviewhound.store import ReviewRecord
 from reviewhound.vcs.base import DictSnapshot, PullRequest, ReviewComment, ReviewPayload
 from reviewhound.vcs.github import GitHubError, GitHubVCS
 from reviewhound.vcs.memory import diff_file_maps
-from reviewhound.webhook import make_server
+from reviewhound.webhook import allowed_owners_from, handle_event, make_server
 from reviewhound.worker import is_retryable
 from tests.conftest import PG_URL, Backend, answer, spy
 from tests.test_github_feedback import FIXED, push, reviewer_on, state_of, thread
@@ -527,3 +529,156 @@ def test_held_lease_posts_as_before(backend: Backend) -> None:
     vcs, reviewer, _store = reviewer_on(backend, [answer(REAL)])
     result = reviewer.review("acme/shop", 7, dry_run=False, should_post=lambda: True)
     assert (result.outcome, len(vcs.posted)) == ("posted", 1)
+
+
+# B1: only allowed repository owners get jobs or feedback writes.
+
+ALLOWED = frozenset({"acme"})
+
+
+def pr_body(owner: str = "acme") -> dict[str, Any]:
+    return {"action": "opened", "repository": {"full_name": f"{owner}/shop"},
+            "pull_request": {"number": 7, "draft": False, "head": {"sha": "abc"}}}
+
+
+def test_event_from_another_owner_is_ignored_and_queues_nothing(backend: Backend) -> None:
+    q = backend.queue()
+    assert handle_event(q, "pull_request", pr_body("mallory"), allowed_owners=ALLOWED) == (
+        202, "ignored: owner not allowed")
+    assert q.claim() is None
+    assert handle_event(q, "pull_request", pr_body("ACME"), allowed_owners=ALLOWED) == (
+        202, "job 1 queued")
+    assert handle_event(q, "ping", {}, allowed_owners=ALLOWED) == (200, "pong")
+
+
+def test_unset_allowlist_allows_every_owner(backend: Backend) -> None:
+    q = backend.queue()
+    assert handle_event(q, "pull_request", pr_body("anyone"), allowed_owners=None) == (
+        202, "job 1 queued")
+    assert handle_event(q, "pull_request", pr_body("other"), allowed_owners=frozenset()) == (
+        202, "job 2 queued")
+
+
+def test_feedback_from_another_owner_writes_nothing(backend: Backend) -> None:
+    _vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    foreign = {**thread("resolved", 1001), "repository": {"full_name": "mallory/shop"}}
+    assert handle_event(backend.queue(), "pull_request_review_thread", foreign, store,
+                        allowed_owners=ALLOWED) == (202, "ignored: owner not allowed")
+    assert store.feedback("mallory/shop", 7) == []
+    assert state_of(store) == "posted"
+
+
+def test_http_post_from_another_owner_creates_no_job(backend: Backend) -> None:
+    q = backend.queue()
+    with serving(queue=q, allowed_owners=ALLOWED) as port:
+        assert _post(port, json.dumps(pr_body("mallory")).encode(), "pull_request") == (
+            202, "ignored: owner not allowed")
+        assert q.claim() is None
+        assert _post(port, json.dumps(pr_body("Acme")).encode(), "pull_request") == (
+            202, "job 1 queued")
+
+
+def test_serve_passes_env_and_flag_owners_to_the_server(tmp_path: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    import reviewhound.webhook as wh
+    from reviewhound.cli import main
+    seen: dict[str, Any] = {}
+
+    class Idle:
+        def serve_forever(self) -> None:
+            pass
+
+    def fake_make_server(*a: Any, **kw: Any) -> Idle:
+        seen.update(kw)
+        return Idle()
+    monkeypatch.setattr(wh, "make_server", fake_make_server)
+    monkeypatch.setenv("REVIEWHOUND_WEBHOOK_SECRET", "s")
+    monkeypatch.setenv("REVIEWHOUND_ALLOWED_OWNERS", "Acme")
+    monkeypatch.delenv("REVIEWHOUND_DATABASE_URL", raising=False)
+    assert main(["--home", str(tmp_path), "serve", "--allowed-owner", "Beta"]) == 0
+    assert seen["allowed_owners"] == frozenset({"acme", "beta"})
+
+
+def test_allowed_owners_come_from_env_and_flags() -> None:
+    assert allowed_owners_from(" Acme, beta ,,", ["Gamma"]) == frozenset({"acme", "beta", "gamma"})
+    assert allowed_owners_from("", []) is None
+    assert allowed_owners_from(" , ", []) is None
+
+
+# B6: /metrics needs the bearer token when one is set; slow bodies time out.
+
+def _get(port: int, headers: dict[str, str] | None = None) -> tuple[int, str]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/metrics", headers=headers or {})
+    resp = conn.getresponse()
+    return resp.status, resp.read().decode()
+
+
+@pytest.mark.parametrize(("headers", "want"), [
+    ({}, (401, '{"message": "metrics need a bearer token"}')),
+    ({"Authorization": "Bearer nope"}, (401, '{"message": "metrics need a bearer token"}')),
+    ({"Authorization": "bearer t0ken"}, (401, '{"message": "metrics need a bearer token"}')),
+    ({"Authorization": "t0ken"}, (401, '{"message": "metrics need a bearer token"}')),
+    ({"Authorization": "Bearer t0ken"}, (200, "m 1\n")),
+])
+def test_metrics_need_the_bearer_token_when_set(tmp_path: Path, headers: dict[str, str],
+                                                want: tuple[int, str]) -> None:
+    with serving(queue=SQLiteQueue(tmp_path / "q.db"), metrics=lambda: "m 1\n",
+                 metrics_token="t0ken") as port:
+        assert _get(port, headers) == want
+
+
+def test_metrics_token_is_read_from_the_environment(tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REVIEWHOUND_METRICS_TOKEN", "envtok")
+    with serving(queue=SQLiteQueue(tmp_path / "q.db"), metrics=lambda: "m 1\n") as port:
+        assert _get(port)[0] == 401
+        assert _get(port, {"Authorization": "Bearer envtok"}) == (200, "m 1\n")
+
+
+def test_unset_metrics_token_stays_open_and_warns_loudly(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    monkeypatch.delenv("REVIEWHOUND_METRICS_TOKEN", raising=False)
+    caplog.set_level(logging.WARNING, logger="reviewhound.webhook")
+    with serving(queue=SQLiteQueue(tmp_path / "q.db"), metrics=lambda: "m 1\n") as port:
+        assert _get(port) == (200, "m 1\n")
+    assert [r.msg for r in caplog.records] == [
+        "/metrics is UNAUTHENTICATED: set REVIEWHOUND_METRICS_TOKEN",
+        ("no owner allowlist: events from ANY repository owner are accepted; "
+         "set REVIEWHOUND_ALLOWED_OWNERS")]
+
+
+def test_metrics_token_compare_is_constant_time(monkeypatch: pytest.MonkeyPatch,
+                                                tmp_path: Path) -> None:
+    import reviewhound.webhook as wh
+    seen: list[tuple[bytes, bytes]] = []
+    real = wh.hmac.compare_digest
+
+    def spy_compare(a: bytes, b: bytes) -> bool:
+        seen.append((a, b))
+        return real(a, b)
+    monkeypatch.setattr(wh.hmac, "compare_digest", spy_compare)
+    with serving(queue=SQLiteQueue(tmp_path / "q.db"), metrics=lambda: "m 1\n",
+                 metrics_token="t0ken") as port:
+        assert _get(port, {"Authorization": "Bearer nope"})[0] == 401
+    assert seen == [(b"Bearer nope", b"Bearer t0ken")]
+
+
+def test_slow_body_times_out_and_queues_nothing(tmp_path: Path) -> None:
+    q = SQLiteQueue(tmp_path / "q.db")
+    with serving(queue=q, read_timeout_s=0.3) as port:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+        sock.sendall(b"POST /webhook HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+        assert sock.recv(1024) == b""  # the server gave up and closed the connection
+        sock.close()
+    assert q.claim() is None
+
+
+def test_default_read_timeout_is_ten_seconds(tmp_path: Path) -> None:
+    server = make_server(SQLiteQueue(tmp_path / "q.db"), SECRET, "127.0.0.1", 0)
+    try:
+        assert server.RequestHandlerClass.timeout == 10.0
+    finally:
+        server.server_close()
