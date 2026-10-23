@@ -175,7 +175,7 @@ def test_cli_app_factory_uses_installation_or_static_token(
     app = GitHubApp("1", PEM)
     monkeypatch.setattr(app, "installation_token", lambda iid: f"ghs_{iid}")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    build = _app_reviewer_factory(argparse.Namespace(home=str(tmp_path), fake_answer=None), app)
+    build = _app_reviewer_factory(argparse.Namespace(home=str(tmp_path), fake_answer=None, database_url=None), app)
     vcs = build(job(42)).vcs
     assert isinstance(vcs, GitHubVCS) and vcs._token() == "ghs_42"
     with pytest.raises(ConfigError, match="no installation id and GITHUB_TOKEN is not set"):

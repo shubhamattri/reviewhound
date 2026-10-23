@@ -12,13 +12,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from reviewhound.backends import open_metrics, open_queue, open_store
 from reviewhound.config import ConfigError
 from reviewhound.evals import run_eval
+from reviewhound.metrics import BacklogAlarm, collect, render_prometheus, render_stats
 from reviewhound.pipeline import Reviewer
 from reviewhound.providers import ClaudeCliProvider, FakeProvider, Provider, ProviderRegistry
-from reviewhound.queue import Job, SQLiteQueue
+from reviewhound.queue import Job
 from reviewhound.scanners import BuiltinScanner, Scanner, SemgrepScanner
-from reviewhound.store import Store
 
 if TYPE_CHECKING:
     from reviewhound.vcs.github_app import GitHubApp
@@ -68,7 +69,7 @@ def _reviewer(args: argparse.Namespace, with_store: bool) -> Reviewer:
     home = Path(args.home)
     home.mkdir(parents=True, exist_ok=True)
     vcs = GitHubVCS(_github_token(args.gh_user), home / "checkouts")
-    store = Store(home / "reviewhound.db") if with_store else None
+    store = open_store(home, args.database_url) if with_store else None
     return Reviewer(vcs, _registry(args), [BuiltinScanner(), SemgrepScanner()], store)
 
 
@@ -90,7 +91,7 @@ def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp) -> Callable[
 
     home = Path(args.home)
     home.mkdir(parents=True, exist_ok=True)
-    store = Store(home / "reviewhound.db")
+    store = open_store(home, args.database_url)
     registry = _registry(args)
     scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner()]
     client = httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
@@ -143,10 +144,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     secret = os.environ.get("REVIEWHOUND_WEBHOOK_SECRET", "")
     if not secret:
         raise SystemExit("Set REVIEWHOUND_WEBHOOK_SECRET to the GitHub App webhook secret.")
-    Path(args.home).mkdir(parents=True, exist_ok=True)
-    server = make_server(SQLiteQueue(Path(args.home) / "queue.db"), secret, args.host, args.port,
-                         store=Store(Path(args.home) / "reviewhound.db"),
-                         app_id=os.environ.get("REVIEWHOUND_APP_ID") or None)
+    home = Path(args.home)
+    queue = open_queue(home, args.database_url)
+    metrics = open_metrics(home, args.database_url)
+    server = make_server(queue, secret, args.host, args.port,
+                         store=open_store(home, args.database_url),
+                         app_id=os.environ.get("REVIEWHOUND_APP_ID") or None,
+                         metrics=lambda: render_prometheus(
+                             collect(queue, metrics, args.backlog_alarm_s)))
     print(f"listening on {args.host}:{args.port}")
     server.serve_forever()
     return 0
@@ -155,15 +160,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_worker(args: argparse.Namespace) -> int:
     from reviewhound.worker import run_forever, run_one
 
-    queue = SQLiteQueue(Path(args.home) / "queue.db")
+    queue = open_queue(Path(args.home), args.database_url)
+    metrics = open_metrics(Path(args.home), args.database_url)
     app = _github_app()
     reviewer: Reviewer | Callable[[Job], Reviewer] = (
         _reviewer(args, with_store=True) if app is None else _app_reviewer_factory(args, app))
     if args.once:
-        job = run_one(queue, reviewer)
+        job = run_one(queue, reviewer, metrics)
         print("no job" if job is None else f"ran job {job.id}")
         return 0
-    run_forever(queue, reviewer)
+    run_forever(queue, reviewer, metrics=metrics,
+                alarm=BacklogAlarm(queue, older_than_s=args.backlog_alarm_s,
+                                   interval_s=args.backlog_alarm_interval_s))
     return 0
 
 
@@ -171,8 +179,7 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     """Manual enqueue, also what the missed-PR sweep calls."""
     from reviewhound.vcs.github import GitHubVCS
 
-    Path(args.home).mkdir(parents=True, exist_ok=True)
-    queue = SQLiteQueue(Path(args.home) / "queue.db")
+    queue = open_queue(Path(args.home), args.database_url)
     vcs = GitHubVCS(_github_token(args.gh_user), Path(args.home) / "checkouts")
     pr = vcs.get_pull(args.repo, args.pr)
     job_id, created = queue.enqueue(args.repo, args.pr, pr.head_sha)
@@ -181,10 +188,18 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
 
 
 def cmd_feedback(args: argparse.Namespace) -> int:
-    store = Store(Path(args.home) / "reviewhound.db")
+    store = open_store(Path(args.home), args.database_url)
     ok = store.add_feedback(args.repo, args.pr, args.fingerprint, args.kind, args.detail or "")
     print("recorded" if ok else "no such finding")
     return 0 if ok else 1
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    home = Path(args.home)
+    queue = open_queue(home, args.database_url)
+    snap = collect(queue, open_metrics(home, args.database_url), args.backlog_alarm_s)
+    print(render_prometheus(snap) if args.prometheus else render_stats(snap))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -192,6 +207,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--home", default=str(DEFAULT_HOME), help="state directory")
     p.add_argument("--gh-user", default=None, help="gh account to take the token from")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--database-url", default=None,
+                   help="postgresql://... (default: $REVIEWHOUND_DATABASE_URL, else SQLite in --home)")
+    p.add_argument("--backlog-alarm-s", type=float, default=600.0,
+                   help="queued jobs older than this count as stuck")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("review", help="review one PR")
@@ -216,12 +235,18 @@ def main(argv: list[str] | None = None) -> int:
     w = sub.add_parser("worker", help="run the review worker")
     w.add_argument("--once", action="store_true")
     w.add_argument("--fake-answer", default=None)
+    w.add_argument("--backlog-alarm-interval-s", type=float, default=300.0,
+                   help="log the backlog alarm at most once per this many seconds")
     w.set_defaults(func=cmd_worker)
 
     q = sub.add_parser("enqueue", help="queue a review for a PR's current head")
     q.add_argument("repo")
     q.add_argument("pr", type=int)
     q.set_defaults(func=cmd_enqueue)
+
+    st = sub.add_parser("stats", help="print review, cost, failure and backlog numbers")
+    st.add_argument("--prometheus", action="store_true", help="print the /metrics text instead")
+    st.set_defaults(func=cmd_stats)
 
     f = sub.add_parser("feedback", help="record a developer reaction to a finding")
     f.add_argument("repo")

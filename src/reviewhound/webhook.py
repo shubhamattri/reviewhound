@@ -6,12 +6,13 @@ import hashlib
 import hmac
 import json
 import logging
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from reviewhound.github_feedback import FEEDBACK_EVENTS, handle_feedback_event
 from reviewhound.queue import JobQueue
-from reviewhound.store import Store
+from reviewhound.store import ReviewStore
 
 log = logging.getLogger(__name__)
 PR_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
@@ -26,7 +27,7 @@ def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
 
 
 def handle_event(queue: JobQueue, event: str, payload: dict[str, Any],
-                 store: Store | None = None, app_id: str | None = None,
+                 store: ReviewStore | None = None, app_id: str | None = None,
                  delivery: str = "") -> tuple[int, str]:
     """Return (HTTP status, message). Pure so it can be tested without a socket."""
     if event == "ping":
@@ -63,8 +64,9 @@ def handle_event(queue: JobQueue, event: str, payload: dict[str, Any],
     return 202, f"job {job_id} {'queued' if created else 'already queued'}"
 
 
-def make_server(queue: JobQueue, secret: str, host: str, port: int, store: Store | None = None,
-                app_id: str | None = None) -> ThreadingHTTPServer:
+def make_server(queue: JobQueue, secret: str, host: str, port: int,
+                store: ReviewStore | None = None, app_id: str | None = None,
+                metrics: Callable[[], str] | None = None) -> ThreadingHTTPServer:
     if not secret:
         raise ValueError("webhook secret is required")
 
@@ -78,8 +80,24 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int, store: Store
             self.wfile.write(data)
 
         def do_GET(self) -> None:
+            if self.path == "/metrics" and metrics is not None:
+                self._metrics(metrics)
+                return
             self._reply(200 if self.path == "/healthz" else 404, "ok" if self.path == "/healthz"
                         else "not found")
+
+        def _metrics(self, render: Callable[[], str]) -> None:
+            try:
+                data = render().encode()
+            except Exception as exc:  # noqa: BLE001 - a scrape failure is a 500, not a crash
+                log.error("metrics render failed", extra={"error": type(exc).__name__})
+                self._reply(500, "metrics unavailable")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def do_POST(self) -> None:
             if self.path != "/webhook":

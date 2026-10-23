@@ -7,7 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from reviewhound.config import PolicyConfig, Severity
-from reviewhound.store import Store
+from reviewhound.store import ReviewStore
 from reviewhound.vcs.base import VCS, ReviewThreads
 from reviewhound.vcs.github import GitHubError
 
@@ -23,7 +23,7 @@ DISMISS_MESSAGE = "Superseded: Reviewhound found no blocking issues on the lates
 _NOT_OPEN = ("duplicate", "unverified", "developer ")
 
 
-def handle_feedback_event(store: Store, event: str, payload: dict[str, Any],
+def handle_feedback_event(store: ReviewStore, event: str, payload: dict[str, Any],
                           app_id: str | None = None, delivery: str = "") -> tuple[int, str]:
     """DB writes only: this runs inside the webhook request, so no GitHub calls here."""
     repo = (payload.get("repository") or {}).get("full_name")
@@ -34,7 +34,7 @@ def handle_feedback_event(store: Store, event: str, payload: dict[str, Any],
     return _comment_event(store, repo, payload, app_id)
 
 
-def _thread_event(store: Store, repo: str, payload: dict[str, Any],
+def _thread_event(store: ReviewStore, repo: str, payload: dict[str, Any],
                   delivery: str) -> tuple[int, str]:
     action = payload.get("action")
     kind = THREAD_ACTIONS.get(str(action))
@@ -56,7 +56,7 @@ def _thread_event(store: Store, repo: str, payload: dict[str, Any],
         raise
 
 
-def _apply_thread(store: Store, repo: str, action: str, kind: str,
+def _apply_thread(store: ReviewStore, repo: str, action: str, kind: str,
                   ids: list[int]) -> tuple[int, str]:
     links = store.linked_findings(repo, ids)
     unknown = [i for i in ids if i not in links]
@@ -73,7 +73,7 @@ def _apply_thread(store: Store, repo: str, action: str, kind: str,
     return 202, f"recorded {recorded} {kind}"
 
 
-def _comment_event(store: Store, repo: str, payload: dict[str, Any],
+def _comment_event(store: ReviewStore, repo: str, payload: dict[str, Any],
                    app_id: str | None) -> tuple[int, str]:
     action = payload.get("action")
     if action != "created":
@@ -113,7 +113,7 @@ def _comment_event(store: Store, repo: str, payload: dict[str, Any],
     return 202, "recorded reply"
 
 
-def after_post(vcs: VCS, store: Store, result: ReviewResult, policy: PolicyConfig) -> None:
+def after_post(vcs: VCS, store: ReviewStore, result: ReviewResult, policy: PolicyConfig) -> None:
     """Follow-ups once a review is posted and recorded. They never fail the review."""
     if not isinstance(vcs, ReviewThreads):
         log.info("VCS cannot read back comments; feedback loop off", extra={"pr": result.pr.number})
@@ -127,7 +127,7 @@ def after_post(vcs: VCS, store: Store, result: ReviewResult, policy: PolicyConfi
                                                       "error": type(exc).__name__})
 
 
-def link_comments(vcs: ReviewThreads, store: Store, result: ReviewResult,
+def link_comments(vcs: ReviewThreads, store: ReviewStore, result: ReviewResult,
                   policy: PolicyConfig) -> None:
     pr = result.pr
     posted = result.decision.post if result.decision else []
@@ -154,7 +154,7 @@ def has_open_blocker(result: ReviewResult, policy: PolicyConfig) -> bool:
                for f, reason in result.decision.held)
 
 
-def dismiss_stale_verdicts(vcs: ReviewThreads, store: Store, result: ReviewResult,
+def dismiss_stale_verdicts(vcs: ReviewThreads, store: ReviewStore, result: ReviewResult,
                            policy: PolicyConfig) -> None:
     if has_open_blocker(result, policy):
         return

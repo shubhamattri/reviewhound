@@ -1,0 +1,59 @@
+# Webhook server + worker sharing one Postgres. Every secret comes from the environment
+# (or a .env file next to this one that is never committed). See docs/deploy.md.
+#
+#   docker compose --profile postgres up -d            # with the bundled Postgres
+#   docker compose up -d                               # with your own REVIEWHOUND_DATABASE_URL
+#   docker compose up -d --scale worker=3              # more workers
+
+x-reviewhound: &reviewhound
+  restart: unless-stopped
+  volumes:
+    - reviewhound-data:/data
+
+services:
+  serve:
+    <<: *reviewhound
+    image: reviewhound:latest
+    build:
+      context: .
+    command: ["serve", "--host", "0.0.0.0", "--port", "8787"]
+    environment:
+      REVIEWHOUND_DATABASE_URL: ${REVIEWHOUND_DATABASE_URL:?set REVIEWHOUND_DATABASE_URL}
+      REVIEWHOUND_WEBHOOK_SECRET: ${REVIEWHOUND_WEBHOOK_SECRET:?set REVIEWHOUND_WEBHOOK_SECRET}
+    ports:
+      - "${REVIEWHOUND_PORT:-8787}:8787"
+
+  worker:
+    <<: *reviewhound
+    image: reviewhound-worker:latest
+    build:
+      context: .
+      args:
+        INSTALL_CLAUDE_CLI: "1"
+    command: ["worker"]
+    environment:
+      REVIEWHOUND_DATABASE_URL: ${REVIEWHOUND_DATABASE_URL:?set REVIEWHOUND_DATABASE_URL}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?set GITHUB_TOKEN}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN}
+    healthcheck:
+      disable: true
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reviewhound
+      POSTGRES_DB: reviewhound
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reviewhound -d reviewhound"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  reviewhound-data:
+  postgres-data:

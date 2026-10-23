@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from reviewhound.metrics import MetricsLog, SQLiteMetrics
+from reviewhound.queue import SQLiteQueue, WorkerQueue
+from reviewhound.store import ReviewStore, Store
 from reviewhound.vcs.base import PullRequest
 
 
@@ -19,6 +25,53 @@ class FakeClock:
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock()
+
+
+PG_URL = os.environ.get("REVIEWHOUND_TEST_PG", "")
+_PG_TABLES = "jobs, reviews, findings, posts, feedback, metric_counters"
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def backend(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Backend]:
+    """Every behavioural queue/store/metrics test runs once per backend, so they cannot drift."""
+    if request.param == "sqlite":
+        yield Backend("sqlite", tmp_path, None)
+        return
+    if not PG_URL:
+        pytest.skip("set REVIEWHOUND_TEST_PG=postgresql://... to run the Postgres backend")
+    import psycopg
+
+    with psycopg.connect(PG_URL, autocommit=True) as c:
+        c.execute(f"DROP TABLE IF EXISTS {_PG_TABLES}")
+    yield Backend("postgres", tmp_path, PG_URL)
+
+
+class Backend:
+    def __init__(self, name: str, home: Path, url: str | None) -> None:
+        self.name = name
+        self.home = home
+        self.url = url
+
+    def queue(self, **kw: Any) -> WorkerQueue:
+        if self.url is None:
+            return SQLiteQueue(self.home / "q.db", **kw)
+        from reviewhound.backends.postgres import PostgresQueue
+
+        return PostgresQueue(self.url, **kw)
+
+    def store(self, **kw: Any) -> ReviewStore:
+        if self.url is None:
+            return Store(self.home / "s.db", **kw)
+        from reviewhound.backends.postgres import PostgresStore
+
+        return PostgresStore(self.url, **kw)
+
+    def metrics(self) -> MetricsLog:
+        if self.url is None:
+            return SQLiteMetrics(self.home / "q.db")
+        from reviewhound.backends.postgres import PostgresMetrics
+
+        return PostgresMetrics(self.url)
 
 
 def make_pr(head: str = "h1", base: str = "b1", **kw: Any) -> PullRequest:
