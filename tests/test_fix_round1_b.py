@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import logging
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -19,11 +20,12 @@ from reviewhound.config import RepoConfig, Severity
 from reviewhound.findings import Finding, ModelFinding
 from reviewhound.github_feedback import DISMISS_MESSAGE, open_reason
 from reviewhound.index.treesitter import CodeIndex
+from reviewhound.pipeline import comments_in_body
 from reviewhound.procenv import child_env
 from reviewhound.scanners import SemgrepScanner, secret_identity
 from reviewhound.store import ReviewRecord
-from reviewhound.vcs.base import DictSnapshot, PullRequest, ReviewPayload
-from reviewhound.vcs.github import GitHubVCS
+from reviewhound.vcs.base import DictSnapshot, PullRequest, ReviewComment, ReviewPayload
+from reviewhound.vcs.github import GitHubError, GitHubVCS
 from reviewhound.vcs.memory import diff_file_maps
 from reviewhound.webhook import make_server
 from reviewhound.worker import is_retryable
@@ -398,3 +400,130 @@ def _row(**kw: Any) -> dict[str, Any]:
 def test_open_reason_needs_positive_evidence(row: dict[str, Any], files: dict[str, str],
                                              changed: list[str], reason: str | None) -> None:
     assert open_reason(row, _Head(files), changed) == reason
+
+
+# B3: a refused post is retried once with every comment in the body; a lost lease posts nothing.
+
+def scripted_posts(vcs: Any, monkeypatch: pytest.MonkeyPatch,
+                   *outcomes: Exception | None) -> list[ReviewPayload]:
+    """Each post raises the next outcome, or really posts when it is None."""
+    real_post = vcs.post_review
+    calls: list[ReviewPayload] = []
+
+    def post(pr: PullRequest, review: ReviewPayload) -> str:
+        calls.append(review)
+        outcome = outcomes[len(calls) - 1]
+        if outcome is not None:
+            raise outcome
+        return str(real_post(pr, review))
+    monkeypatch.setattr(vcs, "post_review", post)
+    return calls
+
+
+REJECTED = GitHubError("POST /x -> HTTP 422: line could not be resolved", 422)
+
+
+def test_rejected_anchor_is_retried_once_with_comments_in_the_body(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL, SECOND)])
+    calls = scripted_posts(vcs, monkeypatch, REJECTED, None)
+    result = reviewer.review("acme/shop", 7, dry_run=False)
+    assert (result.outcome, result.post_id) == ("posted", "memory-review-1")
+    assert result.error == "inline comments refused (HTTP 422); posted them in the review body"
+    assert [len(c.comments) for c in calls] == [2, 0]
+    assert [c.event for c in calls] == ["REQUEST_CHANGES", "REQUEST_CHANGES"]
+    first, retry = calls
+    want = [first.body, "", "GitHub could not place these comments on their lines:",
+            "", "**`app/admin.py:11`**", "", first.comments[0].body,
+            "", "**`app/admin.py:12`**", "", first.comments[1].body]
+    assert retry.body.split("\n") == "\n".join(want).split("\n")
+    assert [(r["outcome"], r["posted"], r["post_id"]) for r in store.reviews("acme/shop", 7)] == [
+        ("posted", 1, "memory-review-1")]
+    assert store.claim_post("acme/shop", 7, "h1") is False
+
+
+def test_left_comment_moved_to_the_body_says_it_is_a_deleted_line() -> None:
+    review = ReviewPayload(head_sha="h", event="COMMENT", body="B", comments=[
+        ReviewComment(path="a.py", line=3, body="gone", side="LEFT")])
+    assert comments_in_body(review) == ReviewPayload(
+        head_sha="h", event="COMMENT", comments=[],
+        body="B\n\nGitHub could not place these comments on their lines:\n\n"
+             "**`a.py:3` (deleted line)**\n\ngone")
+
+
+def test_rejected_twice_is_rejected_and_frees_the_head(backend: Backend,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    calls = scripted_posts(vcs, monkeypatch, REJECTED, GitHubError("HTTP 403: nope", 403))
+    result = reviewer.review("acme/shop", 7, dry_run=False)
+    assert (result.outcome, result.error) == ("post-rejected", "HTTP 403: nope")
+    assert [len(c.comments) for c in calls] == [1, 0]
+    assert store.claim_post("acme/shop", 7, "h1") is True
+
+
+def test_retry_that_times_out_is_uncertain_and_keeps_the_claim(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    scripted_posts(vcs, monkeypatch, REJECTED, TimeoutError("socket"))
+    result = reviewer.review("acme/shop", 7, dry_run=False)
+    assert (result.outcome, result.error) == ("post-uncertain", "TimeoutError")
+    assert [(r["outcome"], r["posted"]) for r in store.reviews("acme/shop", 7)] == [
+        ("post-uncertain", 1)]
+    assert store.claim_post("acme/shop", 7, "h1") is False
+
+
+@pytest.mark.parametrize("first", [GitHubError("HTTP 502", 502), GitHubError("HTTP 429", 429),
+                                   TimeoutError("socket")])
+def test_only_a_refusal_is_retried(backend: Backend, monkeypatch: pytest.MonkeyPatch,
+                                   first: Exception) -> None:
+    vcs, reviewer, _store = reviewer_on(backend, [answer(REAL)])
+    calls = scripted_posts(vcs, monkeypatch, first, None)
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "post-uncertain"
+    assert len(calls) == 1
+
+
+def test_refusal_of_a_review_without_inline_comments_is_not_retried(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer()])
+    calls = scripted_posts(vcs, monkeypatch, REJECTED, None)
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "post-rejected"
+    assert len(calls) == 1
+    assert store.claim_post("acme/shop", 7, "h1") is True
+
+
+def test_uncertain_post_skips_linking_and_says_so(backend: Backend,
+                                                  monkeypatch: pytest.MonkeyPatch,
+                                                  caplog: pytest.LogCaptureFixture) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    scripted_posts(vcs, monkeypatch, TimeoutError("socket"))
+    caplog.set_level(logging.WARNING, logger="reviewhound.pipeline")
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "post-uncertain"
+    assert [(r.msg, r.pr, r.head) for r in caplog.records] == [  # type: ignore[attr-defined]
+        ("post outcome uncertain; comments not linked, verdicts not dismissed", 7, "h1")]
+    assert store.linked_findings("acme/shop", [1001]) == {}
+
+
+def test_lost_lease_posts_nothing_and_leaves_the_head_free(backend: Backend) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    result = reviewer.review("acme/shop", 7, dry_run=False, should_post=lambda: False)
+    assert (result.outcome, vcs.posted) == ("lease-lost", [])
+    assert [(r["outcome"], r["posted"]) for r in store.reviews("acme/shop", 7)] == [
+        ("lease-lost", 0)]
+    assert [f["state"] for f in store.findings("acme/shop", 7)] == ["stored"]
+    assert store.claim_post("acme/shop", 7, "h1") is True
+
+
+def test_lease_lost_after_a_refusal_skips_the_retry(backend: Backend,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
+    calls = scripted_posts(vcs, monkeypatch, REJECTED, None)
+    answers = iter([True, False])
+    result = reviewer.review("acme/shop", 7, dry_run=False, should_post=lambda: next(answers))
+    assert (result.outcome, len(calls)) == ("lease-lost", 1)
+    assert store.claim_post("acme/shop", 7, "h1") is True
+
+
+def test_held_lease_posts_as_before(backend: Backend) -> None:
+    vcs, reviewer, _store = reviewer_on(backend, [answer(REAL)])
+    result = reviewer.review("acme/shop", 7, dry_run=False, should_post=lambda: True)
+    assert (result.outcome, len(vcs.posted)) == ("posted", 1)
