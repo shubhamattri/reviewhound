@@ -97,6 +97,8 @@ class Finding:
     verified: bool = False
     claim_results: list[ClaimResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    proof: Literal["proven", "not_proven", "inconclusive"] | None = None
+    proof_test: str = ""  # the generated test code, when the model produced one
 
     @property
     def fingerprint(self) -> str:
