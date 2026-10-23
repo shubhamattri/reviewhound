@@ -13,6 +13,7 @@ from typing import Any
 
 from reviewhound.evals import run_eval
 from reviewhound.pipeline import Reviewer
+from reviewhound.proof import DockerRunner, LocalRunner, SandboxRunner
 from reviewhound.providers import ClaudeCliProvider, FakeProvider, Provider, ProviderRegistry
 from reviewhound.queue import SQLiteQueue
 from reviewhound.scanners import BuiltinScanner, SemgrepScanner
@@ -64,7 +65,15 @@ def _reviewer(args: argparse.Namespace, with_store: bool) -> Reviewer:
     home.mkdir(parents=True, exist_ok=True)
     vcs = GitHubVCS(_github_token(args.gh_user), home / "checkouts")
     store = Store(home / "reviewhound.db") if with_store else None
-    return Reviewer(vcs, _registry(args), [BuiltinScanner(), SemgrepScanner()], store)
+    return Reviewer(vcs, _registry(args), [BuiltinScanner(), SemgrepScanner()], store,
+                    proof_runners=_proof_runners(args))
+
+
+def _proof_runners(args: argparse.Namespace) -> dict[str, SandboxRunner]:
+    runners: dict[str, SandboxRunner] = {"docker": DockerRunner(image=args.proof_image)}
+    if args.allow_local_proof:  # runs PR code on this machine: trusted repos only
+        runners["local"] = LocalRunner()
+    return runners
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -148,6 +157,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--home", default=str(DEFAULT_HOME), help="state directory")
     p.add_argument("--gh-user", default=None, help="gh account to take the token from")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--allow-local-proof", action="store_true",
+                   help="let repos with proof.runner: local run generated tests on this machine")
+    p.add_argument("--proof-image", default="python:3.12-slim",
+                   help="docker image for proof runs; it must have pytest installed")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("review", help="review one PR")
