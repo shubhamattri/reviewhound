@@ -98,6 +98,7 @@ class Finding:
     claim_results: list[ClaimResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     identity: str = ""  # scanner-set short hash that tells apart same-looking findings
+    side: Literal["LEFT", "RIGHT"] = "RIGHT"  # LEFT: `line` is a base line this PR deleted
 
     @property
     def fingerprint(self) -> str:

@@ -148,6 +148,24 @@ def test_language_turned_off_in_config_gives_unknown_claims_not_dropped_findings
         ("svc/a.go", "unverified", "unknown")]
 
 
+def test_removed_guard_is_posted_on_the_deleted_line(tmp_path: Path) -> None:
+    head = {"app/admin.py": BASE["app/admin.py"].replace('    require_role(req, "admin")\n', ""),
+            ".reviewhound.yml": "posting: true\n"}
+    base = {**BASE, ".reviewhound.yml": "posting: true\n"}
+    removed = {"file": "app/admin.py", "line": 5, "severity": "blocker", "category": "auth",
+               "title": "Role check removed", "body": "get_user is now open to everyone.",
+               "evidence_quote": 'require_role(req, "admin")',
+               "claims": [{"kind": "not_calls", "caller": "get_user", "callee": "require_role"}]}
+    vcs = MemoryVCS(make_pr(head="h1"), base, head)
+    reviewer = Reviewer(vcs, ProviderRegistry([FakeProvider([answer(removed)])]), [],
+                        Store(tmp_path / "s.db"))
+    result = reviewer.review("acme/shop", 7, dry_run=False)
+    assert (result.outcome, result.dropped) == ("posted", [])
+    assert [(c.path, c.line, c.side) for c in vcs.posted[0].comments] == [
+        ("app/admin.py", 6, "LEFT")]
+    assert vcs.posted[0].event == "REQUEST_CHANGES"
+
+
 def test_closed_pr_is_skipped_without_model_call(tmp_path: Path) -> None:
     vcs = MemoryVCS(make_pr(head="h1", state="closed"), BASE, HEAD)
     reviewer = Reviewer(vcs, ProviderRegistry([FakeProvider([])]), [], None)

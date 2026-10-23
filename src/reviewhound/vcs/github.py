@@ -141,7 +141,7 @@ class GitHubVCS:
 
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str:
         payload = {"commit_id": review.head_sha, "event": review.event, "body": review.body,
-                   "comments": [{"path": c.path, "line": c.line, "side": "RIGHT", "body": c.body}
+                   "comments": [{"path": c.path, "line": c.line, "side": c.side, "body": c.body}
                                 for c in review.comments]}
         d = self._request("POST", f"/repos/{pr.repo}/pulls/{pr.number}/reviews",
                           json=payload).json()

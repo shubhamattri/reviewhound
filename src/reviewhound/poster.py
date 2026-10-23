@@ -24,8 +24,11 @@ def build_review(head_sha: str, decision: PolicyDecision, diff: Diff, tier: str,
     body_only: list[Finding] = []
     for f in decision.post:
         fd = diff.files.get(f.file)
-        if fd is not None and f.line in fd.commentable_lines:
-            comments.append(ReviewComment(path=f.file, line=f.line, body=_comment_body(f)))
+        anchors = set() if fd is None else \
+            fd.deleted_lines if f.side == "LEFT" else fd.commentable_lines
+        if f.line in anchors:
+            comments.append(ReviewComment(path=f.file, line=f.line, body=_comment_body(f),
+                                          side=f.side))
         else:
             body_only.append(f)
     ran = ", ".join(reviewers) if reviewers else "none"
@@ -42,7 +45,7 @@ def build_review(head_sha: str, decision: PolicyDecision, diff: Diff, tier: str,
 
 def render_dry_run(review: ReviewPayload, decision: PolicyDecision) -> str:
     payload = {"commit_id": review.head_sha, "event": review.event, "body": review.body,
-               "comments": [{"path": c.path, "line": c.line, "side": "RIGHT", "body": c.body}
+               "comments": [{"path": c.path, "line": c.line, "side": c.side, "body": c.body}
                             for c in review.comments]}
     out = ["=== Review that would be posted ===", json.dumps(payload, indent=2)]
     if decision.held:

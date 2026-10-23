@@ -6,13 +6,16 @@ wording-specific rules here: only general checks against the index and the PR he
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from reviewhound.config import Severity
-from reviewhound.diff import Diff
+from reviewhound.diff import Diff, FileDiff
 from reviewhound.findings import Claim, ClaimResult, Finding, ModelFinding
 from reviewhound.index.treesitter import CodeIndex
 
+log = logging.getLogger(__name__)
 MIN_EVIDENCE_CHARS = 8  # a quote like "x" or "}" matches anywhere and proves nothing
 
 
@@ -53,11 +56,52 @@ class CheckOutcome:
     dropped: list[tuple[Finding, str]] = field(default_factory=list)
 
 
+class _BaseReadError(Exception):
+    pass
+
+
 class ClaimChecker:
-    def __init__(self, diff: Diff, index: CodeIndex, snap_distance: int = 3) -> None:
+    def __init__(self, diff: Diff, index: CodeIndex, snap_distance: int = 3,
+                 base_reader: Callable[[str], str | None] | None = None) -> None:
         self.diff = diff
         self.index = index
         self.snap_distance = snap_distance
+        self.base_reader = base_reader  # reads a file at the PR base; None disables LEFT findings
+        self._base: dict[str, str | None | _BaseReadError] = {}
+
+    def _base_source(self, path: str) -> str | None:
+        """Base text of `path`, read at most once. Raises _BaseReadError when the read failed."""
+        if self.base_reader is None:
+            return None
+        if path not in self._base:
+            try:
+                self._base[path] = self.base_reader(path)
+            except Exception as exc:  # noqa: BLE001 - any read failure only costs this finding
+                log.warning("base file read failed", extra={"path": path,
+                                                            "error": type(exc).__name__})
+                self._base[path] = _BaseReadError(type(exc).__name__)
+        got = self._base[path]
+        if isinstance(got, _BaseReadError):
+            raise got
+        return got
+
+    def _locate_deleted(self, f: Finding, fd: FileDiff) -> tuple[int | None, str]:
+        """Find the quote on base lines this PR deleted: (base line, note) or (None, reason)."""
+        nowhere = "evidence quote does not exist at head or on deleted lines"
+        try:
+            base = self._base_source(fd.old_path or f.file)
+        except _BaseReadError as exc:
+            return None, f"base version of {f.file} could not be read ({exc})"
+        spans = find_quote_spans(base, f.evidence_quote) if base is not None else []
+        if not spans:
+            return None, nowhere
+        deleted = fd.deleted_lines
+        for start, end in sorted(spans, key=lambda q: abs(q[0] - f.line)):
+            hit = [n for n in range(start, end + 1) if n in deleted]
+            if hit:
+                best = min(hit, key=lambda n: abs(n - f.line))
+                return best, f"on deleted base line {best}"
+        return None, "evidence quote is only in code this PR did not change"
 
     def _uncovered(self, claim: Claim, path: str) -> ClaimResult:
         return ClaimResult(claim, "unknown", f"{path} is not in a language the index covers")
@@ -142,24 +186,31 @@ class ClaimChecker:
         """Return the finding and a drop reason (None when it survives)."""
         f = Finding.from_model(mf, source)
         fd = self.diff.files.get(f.file)
-        if fd is None or fd.status == "deleted":
+        if fd is None:
             return f, f"{f.file} is not a changed file in this PR"
-        src = self.index.sources.get(f.file)
-        if src is None:
-            return f, f"{f.file} could not be read at head"
-
-        quote_spans: list[tuple[int, int]] = []
         if not is_meaningful(f.evidence_quote):
             f.evidence_quote = ""
+        src = self.index.sources.get(f.file) if fd.status != "deleted" else ""
+        if src is None:
+            return f, f"{f.file} could not be read at head"
+        if fd.status == "deleted" and not f.evidence_quote:
+            return f, f"{f.file} is deleted by this PR and the finding quotes nothing from it"
+
+        quote_spans: list[tuple[int, int]] = []
         if f.evidence_quote:
             quote_spans = find_quote_spans(src, f.evidence_quote)
-            if not quote_spans:
-                return f, "evidence quote does not exist at head"
-
-        line, how = self._locate(f, quote_spans)
-        if line is None:
-            return f, how
-        if line != f.line:
+        if f.evidence_quote and not quote_spans:
+            line, how = self._locate_deleted(f, fd)
+            if line is None:
+                return f, how
+            f.side = "LEFT"
+            has_evidence = True
+        else:
+            line, how = self._locate(f, quote_spans)
+            if line is None:
+                return f, how
+            has_evidence = bool(quote_spans)
+        if line != f.line or f.side == "LEFT":
             f.notes.append(how)
             f.line = line
 
@@ -169,7 +220,6 @@ class ClaimChecker:
             if r.verdict == "false":
                 return f, f"false claim: {r.reason}"
 
-        has_evidence = bool(quote_spans)
         all_true = all(r.verdict == "true" for r in f.claim_results)
         f.verified = has_evidence and all_true
         if not has_evidence:

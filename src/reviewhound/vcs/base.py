@@ -28,6 +28,7 @@ class ReviewComment:
     path: str
     line: int
     body: str
+    side: str = "RIGHT"  # LEFT comments sit on base lines the PR deleted
 
 
 @dataclass

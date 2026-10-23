@@ -69,7 +69,7 @@ def test_one_false_claim_drops_the_finding(claim: Claim, why: str) -> None:
 
 def test_invented_evidence_quote_drops_the_finding() -> None:
     _, reason = checker().check(mf(evidence_quote="store.purge(i)"), "model:x")
-    assert reason == "evidence quote does not exist at head"
+    assert reason == "evidence quote does not exist at head or on deleted lines"
 
 
 def test_evidence_only_in_unchanged_code_is_dropped_even_if_line_is_changed() -> None:
@@ -209,6 +209,78 @@ def test_index_limited_to_configured_languages_treats_others_as_uncovered() -> N
     idx.add("a.go", "package a\n\nfunc Run() {}\n")
     assert (idx.covers("a.go"), idx.covers("a.py"), idx.is_defined("Run")) == (False, True, False)
     assert idx.sources["a.go"] == "package a\n\nfunc Run() {}\n"
+
+
+DEL_BASE = {"h.py": '''def delete_user(req, uid):
+    require_role(req, "admin")
+    audit(uid)
+    db.delete(uid)
+''', "gone.py": "def legacy_guard(req):\n    require_role(req, \"admin\")\n"}
+DEL_HEAD = {"h.py": '''def delete_user(req, uid):
+    audit(uid)
+    db.delete(uid)
+'''}
+
+
+def del_checker(reader: Any = None) -> ClaimChecker:
+    return ClaimChecker(diff_file_maps(DEL_BASE, DEL_HEAD), CodeIndex.build(DEL_HEAD),
+                        base_reader=reader or DEL_BASE.get)
+
+
+def test_quote_only_on_deleted_base_lines_is_kept_on_the_left_side() -> None:
+    f, reason = del_checker().check(mf(file="h.py", line=2, severity="blocker",
+                                       evidence_quote='require_role(req, "admin")'), "m")
+    assert (reason, f.side, f.line, f.verified) == (None, "LEFT", 2, True)
+    assert f.notes == ["on deleted base line 2"]
+
+
+def test_quote_in_a_deleted_file_is_kept_on_the_left_side() -> None:
+    f, reason = del_checker().check(mf(file="gone.py", line=1,
+                                       evidence_quote='require_role(req, "admin")'), "m")
+    assert (reason, f.side, f.line) == (None, "LEFT", 2)
+
+
+def test_quote_found_nowhere_is_still_dropped_and_head_quotes_stay_right() -> None:
+    _, reason = del_checker().check(mf(file="h.py", line=2, evidence_quote="require_staff(req)"),
+                                    "m")
+    assert reason == "evidence quote does not exist at head or on deleted lines"
+    _, reason = del_checker().check(mf(file="h.py", line=2, evidence_quote="db.delete(uid)"), "m")
+    assert reason == "evidence quote is only in code this PR did not change"
+    _, reason = del_checker().check(mf(file="gone.py", line=1, evidence_quote=""), "m")
+    assert reason == "gone.py is deleted by this PR and the finding quotes nothing from it"
+
+
+def test_base_quote_counts_only_where_it_touches_a_deleted_line() -> None:
+    base = {"k.py": "alpha = 1\nbeta = 2\ngamma = 3\n"}
+    head = {"k.py": "alpha = 1\ngamma = 3\ndelta = 4\n"}
+    c = ClaimChecker(diff_file_maps(base, head), CodeIndex.build(head), base_reader=base.get)
+    f, reason = c.check(mf(file="k.py", line=1, evidence_quote="alpha = 1\nbeta = 2"), "m")
+    assert (reason, f.side, f.line) == (None, "LEFT", 2)
+    base = {"j.py": "first = 1\nsecond = 2\n"}
+    head = {"j.py": "first = 1\nmiddle = 0\nsecond = 2\n"}
+    c = ClaimChecker(diff_file_maps(base, head), CodeIndex.build(head), base_reader=base.get)
+    _, reason = c.check(mf(file="j.py", line=2, evidence_quote="first = 1\nsecond = 2"), "m")
+    assert reason == "evidence quote is only in code this PR did not change"
+
+
+def test_base_read_failure_drops_with_a_reason_and_reads_each_path_once() -> None:
+    calls: list[str] = []
+
+    def broken(path: str) -> str | None:
+        calls.append(path)
+        raise TimeoutError("network")
+    c = del_checker(broken)
+    for _ in range(2):
+        _, reason = c.check(mf(file="h.py", line=2, evidence_quote='require_role(req, "admin")'),
+                            "m")
+        assert reason == "base version of h.py could not be read (TimeoutError)"
+    assert calls == ["h.py"]
+
+
+def test_without_a_base_reader_deleted_line_quotes_are_dropped() -> None:
+    c = ClaimChecker(diff_file_maps(DEL_BASE, DEL_HEAD), CodeIndex.build(DEL_HEAD))
+    _, reason = c.check(mf(file="h.py", line=2, evidence_quote='require_role(req, "admin")'), "m")
+    assert reason == "evidence quote does not exist at head or on deleted lines"
 
 
 def test_trivial_quote_counts_as_no_evidence() -> None:

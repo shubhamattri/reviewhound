@@ -140,7 +140,8 @@ class Reviewer:
         with t.stage("model"):
             answer = self._ask_model(prompt, rt, result)
         with t.stage("verify"):
-            checker = ClaimChecker(diff, index, cfg.policy.snap_distance)
+            checker = ClaimChecker(diff, index, cfg.policy.snap_distance,
+                                   base_reader=lambda p: self.vcs.read_file(repo, pr.base_sha, p))
             if self.verify:
                 outcome = checker.check_all(answer.findings, f"model:{rt.model}")
             else:
