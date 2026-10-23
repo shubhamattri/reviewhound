@@ -16,6 +16,7 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
+from reviewhound.config import ConfigError
 from reviewhound.vcs.github import API, GitHubError
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,10 @@ _RETRY_STATUS = {429, 500, 502, 503, 504}
 
 class GitHubAppConfigError(ValueError):
     """App credentials are missing, half-set, or unreadable."""
+
+
+class AppNotInstalledError(ConfigError):
+    """The App has no installation on the repository: retrying will not help."""
 
 
 class GitHubApp:
@@ -86,25 +91,50 @@ class GitHubApp:
     def token_provider(self, installation_id: int) -> Callable[[], str]:
         return lambda: self.installation_token(installation_id)
 
+    def installation_for_repo(self, repo: str) -> int:
+        """The App's installation id on `repo`, for jobs queued without one (manual, sweep)."""
+        url = f"/repos/{repo}/installation"
+        try:
+            resp = self._call("GET", url)
+        except GitHubError as exc:
+            if exc.status == 404:
+                raise AppNotInstalledError(f"GitHub App {self.app_id} is not installed on {repo} "
+                                           f"(GET {url} -> 404)") from exc
+            raise
+        try:
+            installation = resp.json()["id"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise GitHubError(f"GET {url}: malformed installation response") from exc
+        if isinstance(installation, bool) or not isinstance(installation, int):
+            raise GitHubError(f"GET {url}: malformed installation response")
+        log.info("installation looked up", extra={"repo": repo, "installation": installation})
+        return installation
+
     def _exchange(self, installation_id: int) -> tuple[str, float]:
         url = f"/app/installations/{installation_id}/access_tokens"
+        return self._parse(self._call("POST", url), url)
+
+    def _call(self, method: str, url: str) -> httpx.Response:
+        """An App-JWT request; 429/5xx and transport errors are retried, other 4xx are not."""
         for attempt in range(1, self.max_attempts + 1):
             try:
-                resp = self._http.post(url, headers={"Authorization": f"Bearer {self.jwt()}",
-                                                     "Accept": "application/vnd.github+json",
-                                                     "X-GitHub-Api-Version": "2022-11-28"})
+                resp = self._http.request(method, url, headers={
+                    "Authorization": f"Bearer {self.jwt()}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28"})
             except httpx.TransportError as exc:
                 if attempt == self.max_attempts:
-                    raise GitHubError(f"POST {url} failed: {type(exc).__name__}") from exc
+                    raise GitHubError(f"{method} {url} failed: {type(exc).__name__}") from exc
             else:
                 if resp.status_code < 400:
-                    return self._parse(resp, url)
+                    return resp
                 if resp.status_code not in _RETRY_STATUS or attempt == self.max_attempts:
-                    raise GitHubError(f"POST {url} -> HTTP {resp.status_code}", resp.status_code)
-            log.warning("installation token request failed, retrying",
-                        extra={"installation": installation_id, "attempt": attempt})
+                    raise GitHubError(f"{method} {url} -> HTTP {resp.status_code}",
+                                      resp.status_code)
+            log.warning("GitHub App request failed, retrying",
+                        extra={"method": method, "url": url, "attempt": attempt})
             self._sleep(2.0 ** (attempt - 1))
-        raise GitHubError(f"POST {url} exhausted retries")
+        raise GitHubError(f"{method} {url} exhausted retries")
 
     @staticmethod
     def _parse(resp: httpx.Response, url: str) -> tuple[str, float]:
@@ -121,12 +151,19 @@ class GitHubApp:
 
 class _HasInstallation(Protocol):
     @property
+    def repo(self) -> str: ...
+
+    @property
     def installation_id(self) -> int | None: ...
 
 
 def token_for_job(app: GitHubApp | None, job: _HasInstallation,
                   static_token: Callable[[], str]) -> str | Callable[[], str]:
-    """The job's installation token when an App is configured, else the static token."""
-    if app is not None and job.installation_id is not None:
-        return app.token_provider(job.installation_id)
-    return static_token()
+    """With an App, the job's installation token (looked up by repo if the job has no id);
+    without one, the static token."""
+    if app is None:
+        return static_token()
+    installation = job.installation_id
+    if installation is None:
+        installation = app.installation_for_repo(job.repo)
+    return app.token_provider(installation)

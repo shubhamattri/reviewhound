@@ -110,7 +110,7 @@ of one person's token, and developers' reactions on GitHub flow back as feedback
 | `REVIEWHOUND_WEBHOOK_SECRET` | `serve` | The App's webhook secret. Required. |
 | `REVIEWHOUND_APP_ID` | `serve`, `worker` | The App id. `serve` uses it to ignore the App's own replies. |
 | `REVIEWHOUND_APP_PRIVATE_KEY_PATH` | `worker` | Path to the App's private key (`.pem`). |
-| `GITHUB_TOKEN` | `worker`, optional | Fallback for jobs with no installation id (manual `enqueue`). |
+| `GITHUB_TOKEN` | `enqueue` | Reads the PR head for a manual `enqueue`. The worker does not use it in App mode: a job with no installation id (manual `enqueue`, sweep) looks the installation up by repo, and a repo without the App installed fails the job at once. |
 
 ```bash
 REVIEWHOUND_WEBHOOK_SECRET=... REVIEWHOUND_APP_ID=123456 uv run reviewhound serve --port 8787

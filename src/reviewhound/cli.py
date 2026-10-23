@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from reviewhound.backends import open_metrics, open_queue, open_store
-from reviewhound.config import ConfigError
 from reviewhound.evals import run_eval
 from reviewhound.metrics import BacklogAlarm, collect, render_prometheus, render_stats
 from reviewhound.pipeline import Reviewer
@@ -96,14 +95,9 @@ def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp) -> Callable[
     scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner()]
     client = httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
 
-    def static_token() -> str:
-        token = os.environ.get("GITHUB_TOKEN", "")
-        if not token:
-            raise ConfigError("job has no installation id and GITHUB_TOKEN is not set")
-        return token
-
     def build(job: Job) -> Reviewer:
-        vcs = GitHubVCS(token_for_job(app, job, static_token), home / "checkouts", client=client)
+        # With an App every job uses an installation token, looked up by repo when missing.
+        vcs = GitHubVCS(token_for_job(app, job, lambda: ""), home / "checkouts", client=client)
         return Reviewer(vcs, registry, scanners, store)
     return build
 
