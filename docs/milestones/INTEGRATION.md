@@ -118,3 +118,131 @@ Each mutation was applied alone, and the listed test files were run with Postgre
 | W2 | review not run under the heartbeat | `test_long_review_keeps_its_lease_against_a_second_worker[sqlite]` |
 | W3 | `serve` without the store | `test_serve_wires_queue_store_app_id_and_metrics_together` |
 | W4 | `serve` without the metrics renderer | `test_serve_wires_queue_store_app_id_and_metrics_together` |
+
+## Merge 2: milestone 5 (`worktree-agent-a610e0e7b76d1bfd8`), merge commit `42d0ce2`
+
+### Conflicts
+
+None in the text: `pipeline.py`, `vcs/base.py`, `vcs/github.py`, `uv.lock`, `README.md` and
+`pyproject.toml` all merged on their own. Each one was read against both sides. `pipeline.py`
+keeps M6's `ReviewStore` and M3's `after_post` after `_finish`, and adds M5's
+`CodeIndex(cfg.languages)`, `not_reviewed`, `base_reader` and `not_reviewed=` passed to
+`build_review`. `vcs/github.py` keeps M3's token provider and M6's atomic checkout, and adds
+M5's `side` in the post payload and `Diff.skipped`. `uv lock --check` passed as merged.
+
+### A semantic clash fixed in the merge commit
+
+M3 linked posted comments to findings by `(file, line)`. With M5, a LEFT comment (on a deleted
+base line) and a RIGHT comment (a head line) can share a line number in the same file, and
+policy dedupes by `(file, side, line)` only. Both comments would then have been linked to one
+fingerprint, so thread and reply feedback would have landed on the wrong finding. Now:
+- `PostedComment` has `side` (default `RIGHT`).
+- `GitHubVCS.review_comments` reads GitHub's `side`.
+- `MemoryVCS` passes it through.
+- `link_comments` keys by `(file, side, line)`.
+
+Test: `test_left_and_right_comments_on_the_same_line_number_link_to_their_own_findings`
+(both backends). The read-back test also asserts `side`.
+
+### Ported to Postgres
+
+Nothing: M5 adds no stored column. M5 does not persist `side`; matching uses the fingerprint.
+
+### Suite after merge 2
+
+- SQLite only: `258 passed, 60 skipped` (204 + M5's 53 + 1 new).
+- With Postgres: `318 passed`.
+- mypy clean (36 files). ruff clean.
+- Recorded eval: `cases: 32  precision: 1.00  recall: 1.00  dropped by claim checker: 32`.
+- No-checker baseline: `precision: 0.47  recall: 0.93`. This is the same as M5 alone.
+
+### Mutations (merge 2)
+
+| # | Mutation | Killed by |
+|---|---|---|
+| X1 | link key ignores side | `test_left_and_right_comments_on_the_same_line_number_link_to_their_own_findings[sqlite]` |
+| X2 | GitHub read-back drops `side` | `test_github_review_comments_and_dismissal_requests` |
+| X3 | memory read-back drops `side` | `test_left_and_right_comments_on_the_same_line_number_link_to_their_own_findings[sqlite]` |
+
+## Merge 3: milestone 4 (`worktree-agent-a937ef95e41497549`), merge commit `988017d`
+
+### Conflicts and how each was resolved
+
+| File | Resolution (both sides kept) |
+|---|---|
+| `pipeline.py` | `Reviewer(..., store: ReviewStore \| None, verify, proof_runners)`. M4 had moved the "False only for the eval baseline" comment onto the runners line; it is back on `verify`. The proof stage runs after `apply_policy` and before `build_review(..., not_reviewed=unseen)`. `after_post` stays after `_finish`, so the dismissal logic sees the decision after any proof downgrade. |
+| `poster.py` | A body-only line gets M4's "(proven by a failing test)" suffix, then M5's `- not reviewed:` lines follow. `_comment_body` (M4's proof section) and the `side` anchor (M5) auto-merged. |
+| `findings.py` | `identity`, `side` (M5), `proof`, `proof_test` (M4). |
+| `cli.py` | `_reviewer` uses `open_store` and `proof_runners`. Top-level flags cover both sides: `--database-url`, `--backlog-alarm-s`, `--allow-local-proof`, `--proof-image`. **Silent drop fixed:** M3's App reviewer factory (auto-merged) built `Reviewer` without `proof_runners`, so App-mode workers would fall back to the default Docker runner and ignore `--allow-local-proof`/`--proof-image`. It now passes `_proof_runners(args)`. |
+| `evals/build_cases.py` | M5's `go()`, JS/Go constants and `NEW_CASES`, then M4's `PROOF_*`/pricing/clamp constants. `CASES` = the 12 originals, `*NEW_CASES` (13-32), then M4's cases renamed **33**-py-proof-proven-discount and **34**-py-proof-not-reproduced. `main(root)` keeps M5's `_tree`/LEFT handling and writes M4's `recorded_proofs`/`expected_proofs` (it now uses `case["head"]`, since M4's local `head` variable no longer exists). `evals/cases` was regenerated: M4's old `13-`/`14-` proof directories are gone and `33-`/`34-` were written. `test_committed_cases_match_what_the_generator_writes` passes. |
+| `tests/test_evals.py` | Both sides' tests, with the proof case names updated to 33/34. Counts are below. |
+| `README.md` | Both sections, the proof-case numbers updated to 33/34, "34 small PRs", and the "not in milestone 1" list marks proof (M4), feedback/App (M3) and deleted lines (M5) as done. |
+| `uv.lock` | Took ours, then ran `uv lock` (added defusedxml, types-defusedxml). |
+
+### Eval counts, and why each one changed
+
+These numbers were worked out from each branch's own report first, then checked against the run:
+- Cases: 32 (M5) + 2 (M4) = **34**.
+- Expected findings: 27 (M5) + 1 (case 33; case 34 expects none) = **28**.
+- Dropped by the checker: still **32**. M4's base→M4 delta was 8→8, so its two cases drop nothing.
+- No-checker baseline: M5's (53 reported, 25 true) plus M4's two cases. M4 moved the baseline
+  from 10/15 to 11/16, so the two cases add 1 reported and 1 true: **(54, 26)**, precision
+  **0.48** (26/54 = 0.481).
+- Recall stays 0.93.
+
+### A semantic clash fixed in the merge commit
+
+M4's `eligible()` sent any verified Python model blocker for proof. A LEFT finding (M5) has a
+*base* line number. The prompt would then name the wrong line, and
+`index.enclosing_definition(file, line)` would pick the wrong head function. LEFT findings are
+now not eligible. Test: `test_findings_on_deleted_lines_are_not_sent_for_proof`.
+
+### Ported to Postgres
+
+Nothing: M4 stores no proof state (its own note says proof verdicts are not persisted).
+
+### Suite after merge 3 (final)
+
+- SQLite only: `352 passed, 60 skipped`.
+- With Postgres: `412 passed`.
+- mypy: `Success: no issues found in 37 source files`. ruff: `All checks passed!`
+- Recorded eval: `cases: 34  precision: 1.00  recall: 1.00  dropped by claim checker: 32`,
+  with no proof mismatches.
+- No-checker baseline: `cases: 34  precision: 0.48  recall: 0.93`.
+
+### Mutations (merge 3)
+
+| # | Mutation | Killed by |
+|---|---|---|
+| Y1 | LEFT findings sent for proof | `test_findings_on_deleted_lines_are_not_sent_for_proof` |
+| Y2 | App factory drops the proof runners | `test_cli_app_factory_uses_installation_or_static_token` |
+| Y3 | pipeline stops passing `not_reviewed` | `test_pipeline_puts_skipped_files_in_the_review_body` |
+| Y4 | proof stage not called | `test_real_bug_is_proven_posted_with_the_test_and_timed` |
+| Y5 | poster drops the not-reviewed lines | `test_review_body_lists_files_that_were_not_reviewed` |
+| Y6 | poster drops the "proven" suffix on body-only lines | `test_body_only_findings_say_proven_and_skipped_files_follow`. It **survived** at first, because neither branch tested that line; the test was added and the mutation re-run. |
+| Y7 | `after_post` never runs | `test_posted_comments_are_linked_to_findings[sqlite]` |
+
+All 35 mutations across the three merges were restored byte-identical (`filecmp`).
+
+## Open risks
+
+- **App mode no longer uses `GITHUB_TOKEN` in the worker.** A job without an installation id
+  looks the installation up. A repo where the App is not installed now fails the job at once
+  with a clear error, where it used to fall back to a user token. This was intended, and the
+  README is updated. A deployment that relied on the fallback will see those jobs go `dead`.
+- **The installation lookup is not cached.** It costs one extra App-JWT request per job that
+  has no id (manual or sweep). The found id is not written back onto the job.
+- **The `cmd_worker` wiring is not covered end to end.** It picks the App factory or the
+  reviewer, plus metrics and the alarm. `serve` wiring is now tested; the factory is tested
+  directly.
+- **`side` is not persisted in `findings`** (either backend). Linking uses the comment read
+  back from GitHub, so this is fine today.
+- **LEFT findings never get a proof.** A removed guard could in principle be proven by a test
+  on head. That needs base-line-aware prompting.
+- **Docker image build and Docker proof runs are still unverified.** No daemon was running, the
+  same as for M4 and M6.
+- **Postgres was tested on 14.20 only, over TCP.** The Unix socket path in the scratch dir was
+  too long for macOS.
+- Every milestone's own documented risks still apply: M3 dismissal identity, M4 forgeable
+  verdicts and `LocalRunner` not being a sandbox, M5 LEFT accepted on its quote and secret
+  fingerprints changing on upgrade, and M6 `/metrics` being unauthenticated.
