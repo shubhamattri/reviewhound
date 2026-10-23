@@ -8,7 +8,7 @@ to one rule: it must not lower precision on the eval set.
 ```bash
 uv sync
 uv run pytest -q
-uv run mypy && uv run ruff check src tests evals
+uv run mypy && uv run ruff check src tests evals qa
 uv run reviewhound eval
 ```
 

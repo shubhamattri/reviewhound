@@ -14,19 +14,15 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
-from reviewhound.pipeline import Reviewer
-from reviewhound.providers import ClaudeCliProvider, ProviderRegistry
-from reviewhound.scanners import BuiltinScanner
-from reviewhound.store import Store
-from reviewhound.vcs.github import GitHubVCS
-
 QA_HOME = Path.home() / ".reviewhound" / "qa"
+SUMMARY_PREFIX = "Reviewhound ("
 LOGIN_HELP = ("No saved GitHub login for Playwright. Run once, log in, then close the window:\n"
               f"  uv run playwright open --save-storage={QA_HOME}/github-state.json "
               "https://github.com/login")
@@ -57,14 +53,8 @@ class QAResult:
         return bool(self.checks) and all(c.ok for c in self.checks)
 
 
-def _token(user: str | None) -> str:
-    if os.environ.get("GITHUB_TOKEN"):
-        return os.environ["GITHUB_TOKEN"]
-    cmd = ["gh", "auth", "token"] + (["-u", user] if user else [])
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
-    if res.returncode != 0 or not res.stdout.strip():
-        sys.exit("No GitHub token: set GITHUB_TOKEN or log in with gh.")
-    return res.stdout.strip()
+class Api(Protocol):
+    def call(self, method: str, url: str, **kw: Any) -> Any: ...
 
 
 class GitHub:
@@ -79,90 +69,193 @@ class GitHub:
         return r.json() if r.content else None
 
 
-def open_fresh_pr(gh: GitHub, repo: str, head_ref: str, base: str, tag: str) -> tuple[int, str, str]:
-    sha = gh.call("GET", f"/repos/{repo}/git/ref/heads/{head_ref}")["object"]["sha"]
-    branch = f"qa/{tag}"
-    gh.call("POST", f"/repos/{repo}/git/refs", json={"ref": f"refs/heads/{branch}", "sha": sha})
-    pr = gh.call("POST", f"/repos/{repo}/pulls", json={
-        "title": f"QA run {tag}", "head": branch, "base": base,
-        "body": "Automated QA run for Reviewhound. Closed when the run ends."})
-    return int(pr["number"]), pr["html_url"], branch
+def _token(user: str | None) -> str:
+    if os.environ.get("GITHUB_TOKEN"):
+        return os.environ["GITHUB_TOKEN"]
+    cmd = ["gh", "auth", "token"] + (["-u", user] if user else [])
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    if res.returncode != 0 or not res.stdout.strip():
+        sys.exit("No GitHub token: set GITHUB_TOKEN or log in with gh.")
+    return res.stdout.strip()
 
 
-def close_pr(gh: GitHub, repo: str, number: int, branch: str) -> None:
-    gh.call("PATCH", f"/repos/{repo}/pulls/{number}", json={"state": "closed"})
-    gh.call("DELETE", f"/repos/{repo}/git/refs/heads/{branch}")
+def _in_range(c: dict[str, Any], e: dict[str, Any]) -> bool:
+    return (c["path"] == e["file"] and c["line"] is not None
+            and e["lines"][0] <= c["line"] <= e["lines"][1])
 
 
-def api_checks(gh: GitHub, repo: str, number: int, expected: list[dict[str, Any]]
-               ) -> tuple[list[Check], list[dict[str, Any]]]:
-    comments = gh.call("GET", f"/repos/{repo}/pulls/{number}/comments", params={"per_page": 100})
-    posted = [{"path": c["path"], "line": c.get("line"), "title": c["body"].split("\n", 1)[0]}
-              for c in comments]
-    checks = []
+def fetch_bot_review(gh: Api, repo: str, number: int, head: str,
+                     timeout_s: float = 60, sleep: Callable[[float], None] = time.sleep
+                     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """The review this run posted (on `head`, with our summary) and only its comments.
+
+    GitHub can list a new review a few seconds late, so poll until it shows up.
+    """
+    waited = 0.0
+    while True:
+        reviews = gh.call("GET", f"/repos/{repo}/pulls/{number}/reviews",
+                          params={"per_page": 100})
+        ours = [r for r in reviews if r.get("commit_id") == head
+                and (r.get("body") or "").startswith(SUMMARY_PREFIX)]
+        if ours:
+            review = ours[-1]
+            comments = gh.call("GET", f"/repos/{repo}/pulls/{number}/reviews/{review['id']}"
+                                      "/comments", params={"per_page": 100})
+            posted = [{"id": c["id"], "path": c["path"], "line": c.get("line"),
+                       "title": c["body"].split("\n", 1)[0].replace("**", "").strip()}
+                      for c in comments]
+            return review, posted
+        if waited >= timeout_s:
+            return None, []
+        sleep(5)
+        waited += 5
+
+
+def api_checks(review: dict[str, Any] | None, posted: list[dict[str, Any]],
+               expected: list[dict[str, Any]]) -> list[Check]:
+    checks = [Check("API: review by Reviewhound on this head", review is not None,
+                    str(review["id"]) if review else "no review on this head")]
     for e in expected:
-        hit = [p for p in posted if p["path"] == e["file"] and p["line"] is not None
-               and e["lines"][0] <= p["line"] <= e["lines"][1]]
+        hit = [c for c in posted if _in_range(c, e)]
         checks.append(Check(f"API: comment for {e['bug']}", bool(hit),
                             f"{e['file']}:{e['lines']} -> {[h['line'] for h in hit]}"))
-    unexpected = [p for p in posted if not any(
-        p["path"] == e["file"] and p["line"] is not None and
-        e["lines"][0] <= p["line"] <= e["lines"][1] for e in expected)]
-    checks.append(Check("API: no comments outside planted bugs", not unexpected,
-                        json.dumps(unexpected)))
-    return checks, posted
+    stray = [c for c in posted if not any(_in_range(c, e) for e in expected)]
+    checks.append(Check("API: no comments outside planted bugs", not stray, json.dumps(stray)))
+    untitled = [c["id"] for c in posted if not c["title"]]
+    checks.append(Check("API: every comment has a title", not untitled, str(untitled)))
+    return checks
 
 
-def browser_checks(pr_url: str, posted: list[dict[str, Any]], out: Path,
-                   result: QAResult) -> list[Check]:
+def browser_checks(pr_url: str, review: dict[str, Any], posted: list[dict[str, Any]],
+                   out: Path, result: QAResult) -> list[Check]:
+    from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
-    state = QA_HOME / "github-state.json"
     checks: list[Check] = []
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        ctx = browser.new_context(storage_state=str(state), viewport={"width": 1440, "height": 900},
-                                  record_video_dir=str(out), record_video_size={"width": 1440,
-                                                                                "height": 900})
+        ctx = browser.new_context(storage_state=str(QA_HOME / "github-state.json"),
+                                  viewport={"width": 1440, "height": 900},
+                                  record_video_dir=str(out),
+                                  record_video_size={"width": 1440, "height": 900})
         page = ctx.new_page()
-        page.goto(pr_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)
-        signed_in = page.locator("meta[name='user-login']").get_attribute("content") or ""
-        checks.append(Check("Browser: signed in to GitHub", bool(signed_in), signed_in or
-                            "not signed in; refresh the saved login"))
-        summary = page.get_by_text("Reviewhound (").first
-        checks.append(Check("Browser: review summary visible on Conversation tab",
-                            summary.count() > 0 and summary.is_visible()))
-        if summary.count():
-            summary.scroll_into_view_if_needed()
-            page.wait_for_timeout(1500)
-        shot = out / "conversation.png"
-        page.screenshot(path=str(shot), full_page=True)
-        result.screenshots.append(str(shot))
-
-        page.goto(pr_url + "/files", wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
-        for c in posted:
-            title = c["title"].replace("**", "").split("] ", 1)[-1].strip()
-            loc = page.get_by_text(title, exact=False).first
-            visible = loc.count() > 0
-            if visible:
-                loc.scroll_into_view_if_needed()
+        try:
+            page.goto(f"{pr_url}#pullrequestreview-{review['id']}", wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            login = page.locator("meta[name='user-login']")
+            user = login.get_attribute("content", timeout=5000) if login.count() else ""
+            checks.append(Check("Browser: signed in to GitHub", bool(user),
+                                user or "saved login expired; run the login command again"))
+            summary_line = (review.get("body") or "").splitlines()[0]
+            block = page.locator(f"#pullrequestreview-{review['id']}")
+            shown = block.count() > 0 and summary_line in (block.first.inner_text() or "")
+            if shown:
+                block.first.scroll_into_view_if_needed()
                 page.wait_for_timeout(1500)
-                visible = loc.is_visible()
-            checks.append(Check(f"Browser: '{title[:60]}' shown on {c['path']}:{c['line']}",
-                                visible))
-        shot = out / "files.png"
-        page.screenshot(path=str(shot), full_page=True)
-        result.screenshots.append(str(shot))
-        video = page.video
-        ctx.close()
-        browser.close()
-        if video is not None:
-            final = out / "walkthrough.webm"
-            Path(video.path()).rename(final)
-            result.video = str(final)
+            checks.append(Check("Browser: review summary shown in its own review block", shown,
+                                summary_line))
+            page.screenshot(path=str(out / "conversation.png"))
+            result.screenshots.append(str(out / "conversation.png"))
+            for c in posted:
+                checks.append(_comment_check(page, pr_url, c, out, result))
+        except PlaywrightError as exc:
+            checks.append(Check("Browser: run finished without errors", False, type(exc).__name__))
+            page.screenshot(path=str(out / "error.png"))
+            result.screenshots.append(str(out / "error.png"))
+        finally:
+            video = page.video
+            ctx.close()  # finalises the video file
+            browser.close()
+            if video is not None:
+                final = out / "walkthrough.webm"
+                Path(video.path()).rename(final)
+                result.video = str(final)
     return checks
+
+
+def _comment_check(page: Any, pr_url: str, c: dict[str, Any], out: Path,
+                   result: QAResult) -> Check:
+    anchor = f"discussion_r{c['id']}"
+    page.goto(f"{pr_url}#{anchor}", wait_until="domcontentloaded")
+    page.wait_for_timeout(2500)
+    el = page.locator(f"#{anchor}")
+    if el.count() == 0 or not el.first.is_visible():
+        return Check(f"Browser: comment {c['id']} visible", False, "anchor not on page")
+    el.first.scroll_into_view_if_needed()
+    has_title = c["title"] in el.first.inner_text()
+    # The file path sits in the thread header a few levels above the comment body.
+    has_path = el.first.evaluate(
+        "(e, path) => { for (let x = e, i = 0; x && i < 8; x = x.parentElement, i++)"
+        " { if ((x.innerText || '').includes(path)) return true; } return false; }", c["path"])
+    shot = out / f"comment-{c['id']}.png"
+    page.screenshot(path=str(shot))
+    result.screenshots.append(str(shot))
+    return Check(f"Browser: '{c['title'][:60]}' shown on {c['path']}:{c['line']}",
+                 bool(has_title and has_path), f"title={has_title} path={has_path}")
+
+
+def _cleanup(gh: Api, repo: str, number: int, branch: str) -> list[Check]:
+    checks = []
+    if number:
+        try:
+            gh.call("PATCH", f"/repos/{repo}/pulls/{number}", json={"state": "closed"})
+        except RuntimeError as exc:
+            checks.append(Check("Cleanup: QA PR closed", False, str(exc)))
+    try:
+        gh.call("DELETE", f"/repos/{repo}/git/refs/heads/{branch}")
+    except RuntimeError as exc:
+        checks.append(Check("Cleanup: QA branch deleted", False, str(exc)))
+    return checks
+
+
+def run(args: argparse.Namespace, gh: Api, token: str, out: Path,
+        review_pr: Callable[[str, int, str], Any]) -> QAResult:
+    expected = json.loads(Path(args.expected).read_text())
+    result = QAResult(milestone=args.milestone, repo=args.repo)
+    branch = f"qa/{out.name}"
+    created_branch = False
+    try:
+        sha = gh.call("GET", f"/repos/{args.repo}/git/ref/heads/{args.head_ref}")["object"]["sha"]
+        gh.call("POST", f"/repos/{args.repo}/git/refs",
+                json={"ref": f"refs/heads/{branch}", "sha": sha})
+        created_branch = True
+        pr = gh.call("POST", f"/repos/{args.repo}/pulls", json={
+            "title": f"QA run {out.name}", "head": branch, "base": args.base,
+            "body": "Automated QA run for Reviewhound. Closed when the run ends."})
+        result.pr, result.pr_url = int(pr["number"]), pr["html_url"]
+        review = review_pr(args.repo, result.pr, token)
+        result.head, result.outcome = review.pr.head_sha, review.outcome
+        result.cost_usd = review.cost_usd
+        result.checks.append(Check("Pipeline: review posted", review.outcome == "posted",
+                                   review.outcome + (f" ({review.error})" if review.error else "")))
+        if review.outcome == "posted":
+            bot_review, posted = fetch_bot_review(gh, args.repo, result.pr, result.head)
+            result.checks.extend(api_checks(bot_review, posted, expected))
+            if bot_review is not None:
+                result.checks.extend(browser_checks(result.pr_url, bot_review, posted, out,
+                                                    result))
+    except Exception as exc:  # noqa: BLE001 - any failure is a FAIL in the report, never a crash
+        result.checks.append(Check("Run finished without errors", False,
+                                   f"{type(exc).__name__}: {exc}"))
+    finally:
+        if created_branch and not args.keep_pr:
+            result.checks.extend(_cleanup(gh, args.repo, result.pr, branch))
+        (out / "result.json").write_text(json.dumps({**asdict(result), "passed": result.passed},
+                                                    indent=2))
+    return result
+
+
+def _review_with_reviewhound(repo: str, number: int, token: str) -> Any:
+    from reviewhound.pipeline import Reviewer
+    from reviewhound.providers import ClaudeCliProvider, ProviderRegistry
+    from reviewhound.scanners import BuiltinScanner
+    from reviewhound.store import Store
+    from reviewhound.vcs.github import GitHubVCS
+
+    store = Store(QA_HOME / "runs" / f"pr-{number}-store.db")
+    reviewer = Reviewer(GitHubVCS(token, QA_HOME / "checkouts"),
+                        ProviderRegistry([ClaudeCliProvider()]), [BuiltinScanner()], store)
+    return reviewer.review(repo, number, dry_run=False)
 
 
 def main() -> int:
@@ -178,37 +271,11 @@ def main() -> int:
 
     if not (QA_HOME / "github-state.json").exists():
         sys.exit(LOGIN_HELP)
-    tag = f"{args.milestone}-{time.strftime('%Y%m%d-%H%M%S')}"
-    out = QA_HOME / "runs" / tag
+    out = QA_HOME / "runs" / f"{args.milestone}-{time.strftime('%Y%m%d-%H%M%S')}"
     out.mkdir(parents=True)
-    expected = json.loads(Path(args.expected).read_text())
     token = _token(args.gh_user)
-    gh = GitHub(token)
-    result = QAResult(milestone=args.milestone, repo=args.repo)
-
-    number, url, branch = open_fresh_pr(gh, args.repo, args.head_ref, args.base, tag)
-    result.pr, result.pr_url = number, url
-    try:
-        reviewer = Reviewer(GitHubVCS(token, QA_HOME / "checkouts"),
-                            ProviderRegistry([ClaudeCliProvider()]), [BuiltinScanner()],
-                            Store(out / "store.db"))
-        review = reviewer.review(args.repo, number, dry_run=False)
-        result.head, result.outcome, result.cost_usd = (review.pr.head_sha, review.outcome,
-                                                        review.cost_usd)
-        result.checks.append(Check("Pipeline: review posted", review.outcome == "posted",
-                                   review.outcome + (f" ({review.error})" if review.error else "")))
-        if review.outcome == "posted":
-            time.sleep(3)  # GitHub can take a moment to list new review comments
-            checks, posted = api_checks(gh, args.repo, number, expected)
-            result.checks.extend(checks)
-            result.checks.extend(browser_checks(url, posted, out, result))
-    finally:
-        if not args.keep_pr:
-            close_pr(gh, args.repo, number, branch)
-
-    (out / "result.json").write_text(json.dumps({**asdict(result), "passed": result.passed},
-                                                indent=2))
-    print(f"QA {args.milestone}: {'PASS' if result.passed else 'FAIL'}  PR {url}")
+    result = run(args, GitHub(token), token, out, _review_with_reviewhound)
+    print(f"QA {args.milestone}: {'PASS' if result.passed else 'FAIL'}  PR {result.pr_url}")
     for c in result.checks:
         print(f"  [{'PASS' if c.ok else 'FAIL'}] {c.name}" + (f"  ({c.detail})" if c.detail else ""))
     print(f"  video: {result.video or 'none'}\n  evidence: {out}")
