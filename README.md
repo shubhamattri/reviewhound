@@ -166,7 +166,7 @@ proof verdict differs from `expected_proofs`.
 - **Live eval** (`reviewhound eval --live`): asks the real model on the same cases, so it
   measures model plus checker. This is the number to quote.
 
-  Live eval on 2026-10-24 (real model through `claude -p`, checker on, 36 cases): precision 1.00, recall 0.97 (29 of 30 planted bugs; the miss was a JavaScript loop that skips its first row, which the model did not report), about $0.018 per PR. Two proof cases were skipped because no Docker sandbox was available. Live results vary from run to run; earlier runs on the same code line scored recall 0.86 to 1.00.
+  Live eval on 2026-10-24 (real model through `claude -p`, checker on, 36 cases): precision 1.00, recall 0.97 (29 of 30 planted bugs; the miss was a JavaScript loop that skips its first row, which the model did not report), about $0.018 per PR. Two proof cases were skipped because no Docker sandbox was available. Live results vary from run to run; runs during development scored recall between 0.86 and 1.00 as the checker changed.
 
 ### Alternative fair anchors
 
