@@ -417,6 +417,21 @@ def test_proven_comment_says_so_and_folds_the_test_in_details() -> None:
                     "def test_x():\n    s = '```'\n    assert s == ''\n````\n\n</details>")
 
 
+def test_body_only_findings_say_proven_and_skipped_files_follow() -> None:
+    from reviewhound.diff import Diff
+    from reviewhound.poster import build_review
+    proven, plain = finding(), dataclasses.replace(finding(), title="other")
+    proven.proof = "proven"
+    decision = PolicyDecision(post=[proven, plain], event="REQUEST_CHANGES")
+    review = build_review("h1", decision, Diff(), "standard", ["fake"],
+                          not_reviewed=[("big.bin", "diff too large for GitHub to return")])
+    assert review.comments == []
+    assert review.body.splitlines()[2:] == [
+        "- `calc/stats.py:3` [blocker] first element skipped (proven by a failing test)",
+        "- `calc/stats.py:3` [blocker] other",
+        "- not reviewed: big.bin (diff too large for GitHub to return)"]
+
+
 @pytest.mark.parametrize("verdict", ["not_proven", "inconclusive", None])
 def test_unproven_comment_has_no_proof_section(verdict: str | None) -> None:
     f = finding()
