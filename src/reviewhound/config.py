@@ -69,7 +69,8 @@ class RepoConfig(_Strict):
     posting: bool = False  # shadow mode until a repo opts in
     languages: list[str] = Field(default_factory=lambda: ["python", "typescript"])
     ignore_paths: list[str] = Field(
-        default_factory=lambda: ["**/*.lock", "**/package-lock.json", "**/dist/**", "**/vendor/**"]
+        default_factory=lambda: ["**/*.lock", "**/package-lock.json", "**/dist/**", "**/vendor/**",
+                                 "**/node_modules/**", "**/.venv/**", "**/*.min.js"]
     )
     risk_paths: list[RiskPathRule] = Field(
         default_factory=lambda: [

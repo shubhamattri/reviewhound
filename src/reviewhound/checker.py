@@ -13,6 +13,12 @@ from reviewhound.diff import Diff
 from reviewhound.findings import Claim, ClaimResult, Finding, ModelFinding
 from reviewhound.index.treesitter import CodeIndex
 
+MIN_EVIDENCE_CHARS = 8  # a quote like "x" or "}" matches anywhere and proves nothing
+
+
+def is_meaningful(quote: str) -> bool:
+    return len("".join(quote.split())) >= MIN_EVIDENCE_CHARS
+
 
 def _norm(line: str) -> str:
     return " ".join(line.split())
@@ -113,7 +119,9 @@ class ClaimChecker:
             return f, f"{f.file} could not be read at head"
 
         quote_lines: list[int] = []
-        if f.evidence_quote.strip():
+        if not is_meaningful(f.evidence_quote):
+            f.evidence_quote = ""
+        if f.evidence_quote:
             quote_lines = find_quote(src, f.evidence_quote)
             if not quote_lines:
                 return f, "evidence quote does not exist at head"

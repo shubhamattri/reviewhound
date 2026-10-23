@@ -114,3 +114,10 @@ def test_unknown_claim_keeps_finding_but_unverified() -> None:
     assert reason is None
     assert f.claim_results[0].verdict == "unknown"
     assert f.verified is False
+
+
+def test_trivial_quote_counts_as_no_evidence() -> None:
+    f, reason = checker().check(mf(line=11, evidence_quote="i)", severity="major"), "model:x")
+    assert reason is None
+    assert f.verified is False
+    assert f.severity is Severity.MINOR
