@@ -16,7 +16,7 @@ from reviewhound.metrics import (
     failure_increments,
     review_increments,
 )
-from reviewhound.pipeline import Reviewer
+from reviewhound.pipeline import PostRefused, RecordAfterPostError, Reviewer
 from reviewhound.providers import ProviderError
 from reviewhound.queue import Job, LeaseLost, WorkerQueue
 from reviewhound.vcs.github import GitHubError
@@ -24,9 +24,14 @@ from reviewhound.vcs.github import GitHubError
 log = logging.getLogger(__name__)
 
 
+POST_RETRYABLE_HTTP = (401, 403, 408)  # an expired token or a timeout can pass on a later try
+
+
 def is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, ProviderError):
+    if isinstance(exc, (ProviderError, RecordAfterPostError)):
         return True
+    if isinstance(exc, PostRefused):
+        return exc.status in POST_RETRYABLE_HTTP
     if isinstance(exc, GitHubError):
         return exc.status is None or exc.status >= 500 or exc.status == 429
     if isinstance(exc, ConfigError):
@@ -87,6 +92,11 @@ def run_one(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
     if result.outcome == "lease-lost":
         # Nothing was posted: hand the job back (or to dead after max attempts), never done.
         _fail(queue, job, LEASE_LOST_ERROR, True, "LeaseLost")
+        _record(metrics, review_increments(result.outcome, result.timings, result.cost_usd), job)
+        return job
+    if result.outcome == "post-rejected":
+        # GitHub refused the review even with its comments in the body: a retry cannot help.
+        _fail(queue, job, f"post-rejected: {result.error}", False, "PostRejected")
         _record(metrics, review_increments(result.outcome, result.timings, result.cost_usd), job)
         return job
     try:

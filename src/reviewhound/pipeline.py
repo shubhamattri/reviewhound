@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from reviewhound.checker import CheckOutcome, ClaimChecker
-from reviewhound.config import CONFIG_FILENAME, RepoConfig, load_config
+from reviewhound.config import CONFIG_FILENAME, PolicyConfig, RepoConfig, Severity, load_config
 from reviewhound.context import build_context
 from reviewhound.diff import Diff
 from reviewhound.findings import Finding, FindingsParseError, ModelReview, parse_model_review
@@ -25,12 +25,22 @@ from reviewhound.proof import DockerRunner, Prover, SandboxRunner, run_proof_sta
 from reviewhound.providers import ProviderError, ProviderRegistry
 from reviewhound.router import Route, route
 from reviewhound.scanners import Scanner
-from reviewhound.store import ReviewRecord, ReviewStore
+from reviewhound.store import Blocker, ReviewRecord, ReviewStore
 from reviewhound.vcs.base import VCS, PullRequest, ReviewPayload, Snapshot
 from reviewhound.vcs.github import GitHubError
 
 log = logging.getLogger(__name__)
 MAX_INDEX_FILES = 5_000
+MAX_BODY_CHARS = 60_000  # GitHub refuses a review body over 65,536 characters
+RETRY_IN_BODY = (400, 422)  # GitHub could not place an inline comment
+
+
+class RecordAfterPostError(RuntimeError):
+    """The review is on GitHub but its record is not: retry, and the retry records it."""
+
+
+class PostRefused(GitHubError):
+    """GitHub refused the review POST with a status the body retry cannot fix. Nothing landed."""
 
 
 @dataclass
@@ -49,6 +59,13 @@ class ReviewResult:
     post_id: str = ""
     snapshot: Snapshot | None = None  # the head this run reviewed, for follow-ups
     changed_paths: list[str] = field(default_factory=list)
+    head_sources: Mapping[str, str] = field(default_factory=dict)  # the head index's files
+    blockers: list[Blocker] = field(default_factory=list)  # as decided before any proof
+
+
+@dataclass
+class _Claim:
+    keep: bool = False  # a POST was sent, so it may have landed: never free the head again
 
 
 class _Timer:
@@ -94,20 +111,40 @@ def not_reviewed(diff: Diff, head: Snapshot, ignore_paths: list[str]) -> list[tu
     return sorted((p, r) for p, r in out.items() if not matches_any(p, ignore_paths))
 
 
-def comments_in_body(review: ReviewPayload) -> ReviewPayload:
-    """The same review with every inline comment moved into the body, for a refused anchor."""
-    parts = [review.body, "", "GitHub could not place these comments on their lines:"]
+def _more(n: int) -> str:
+    return f"\n\n{n} more findings not shown." if n else ""
+
+
+def comments_in_body(review: ReviewPayload, limit: int = MAX_BODY_CHARS) -> ReviewPayload:
+    """The same review with its inline comments moved into the body, for a refused anchor.
+
+    The body stays within `limit` characters; comments that do not fit are counted instead."""
+    blocks = []
     for c in review.comments:
         deleted = " (deleted line)" if c.side == "LEFT" else ""
-        parts += ["", f"**`{c.path}:{c.line}`{deleted}**", "", c.body]
-    return ReviewPayload(head_sha=review.head_sha, event=review.event, body="\n".join(parts),
-                         comments=[])
+        blocks.append(f"\n\n**`{c.path}:{c.line}`{deleted}**\n\n{c.body}")
+    title = "\n\nGitHub could not place these comments on their lines:"
+    body = review.body[:max(0, limit - len(title) - len(_more(len(blocks))))] + title
+    for i, block in enumerate(blocks):
+        if len(body) + len(block) + len(_more(len(blocks) - i - 1)) > limit:
+            body += _more(len(blocks) - i)
+            break
+        body += block
+    return ReviewPayload(head_sha=review.head_sha, event=review.event, body=body, comments=[])
 
 
 def _refused(exc: Exception) -> bool:
     """GitHub answered 4xx (not 429): nothing landed, so this head may be posted again."""
     return (isinstance(exc, GitHubError) and exc.status is not None
             and 400 <= exc.status < 500 and exc.status != 429)
+
+
+def blocking_snapshot(decision: PolicyDecision, policy: PolicyConfig) -> list[Blocker]:
+    """The blockers behind a REQUEST_CHANGES verdict, copied before a proof can change them."""
+    if decision.event != "REQUEST_CHANGES":
+        return []
+    blocking = Severity.parse(policy.blocking_severity)
+    return [Blocker.of(f) for f in decision.post if f.severity >= blocking]
 
 
 class Reviewer:
@@ -167,6 +204,7 @@ class Reviewer:
             result.snapshot = head = self.vcs.snapshot(repo, pr.head_sha)
             result.changed_paths = list(diff.changed_paths)
             index = build_index(head, diff, cfg)
+            result.head_sources = index.sources
             churn = self.vcs.churn(repo, pr.head_sha)
             conv = learn_conventions(index, churn, cfg.auth.guard_functions)
             unseen = not_reviewed(diff, head, cfg.ignore_paths)
@@ -203,6 +241,7 @@ class Reviewer:
         known = self.store.known_state(repo, number) if self.store else {}
         decision = apply_policy(outcome.kept + scanned, cfg.policy, known)
         result.decision = decision
+        result.blockers = blocking_snapshot(decision, cfg.policy)
         if cfg.proof.enabled:
             with t.stage("proof"):
                 self._prove(decision, cfg, rt, head, index, result)
@@ -215,16 +254,9 @@ class Reviewer:
                 result.outcome = "dry-run"
             elif not cfg.posting:
                 result.outcome = "shadow"
-            elif self.vcs.current_head(repo, number) != pr.head_sha:
-                result.outcome = "head-moved"
-            elif should_post is not None and not should_post():
-                result.outcome = "lease-lost"
             elif self.store is not None and not self.store.claim_post(repo, number, pr.head_sha):
-                result.outcome = "already-posted"
+                self._already_posted(pr, result)
             else:
-                if result.review.event != "COMMENT" and pr.author and \
-                        pr.author == self.vcs.viewer_login():
-                    result.review = own_pr_review(result.review)
                 self._post(pr, result, should_post)
         done = self._finish(result, t, decision.post,
                             [(f, r) for f, r in decision.held if r != "duplicate"])
@@ -235,42 +267,86 @@ class Reviewer:
             after_post(self.vcs, self.store, done, cfg.policy)
         return done
 
+    def _already_posted(self, pr: PullRequest, result: ReviewResult) -> None:
+        """Another run holds this head. If its post landed but was never recorded, record it."""
+        assert self.store is not None
+        post_id = self.store.unrecorded_post(pr.repo, pr.number, pr.head_sha)
+        if post_id is None:
+            result.outcome = "already-posted"
+            return
+        result.outcome, result.post_id = "posted", post_id
+        result.error = "recovered: an earlier attempt posted this review but did not record it"
+        log.warning("recording a review an earlier attempt posted",
+                    extra={"pr": pr.number, "head": pr.head_sha, "post_id": post_id})
+
     def _post(self, pr: PullRequest, result: ReviewResult,
               should_post: Callable[[], bool] | None) -> None:
-        """Post once; on a refusal of inline comments, once more with them in the body."""
+        """Holds the claim from claim_post: freed unless a POST was sent, whatever is raised."""
+        claim = _Claim()
+        try:
+            self._send(pr, result, should_post, claim)
+        finally:
+            if not claim.keep and self.store is not None:
+                self.store.release_post(pr.repo, pr.number, pr.head_sha)
+
+    def _blocked(self, pr: PullRequest, should_post: Callable[[], bool] | None) -> str:
+        """Checked right before every POST: a lost lease or a moved head posts nothing."""
+        if should_post is not None and not should_post():
+            return "lease-lost"
+        if self.vcs.current_head(pr.repo, pr.number) != pr.head_sha:
+            return "head-moved"
+        return ""
+
+    def _send(self, pr: PullRequest, result: ReviewResult,
+              should_post: Callable[[], bool] | None, claim: _Claim) -> None:
+        """Post once; on a refusal of inline comments (400/422), once more with them in the body.
+        Any other refusal raises its GitHubError for the worker to classify."""
         assert result.review is not None
+        if result.review.event != "COMMENT" and pr.author and \
+                pr.author == self.vcs.viewer_login():
+            result.review = own_pr_review(result.review)
         payload = result.review
+        status: int | None = None
         for attempt in (1, 2):
+            blocked = self._blocked(pr, should_post)
+            if blocked:
+                result.outcome, result.error = blocked, ""
+                return
+            claim.keep = True
             try:
-                result.post_id = self.vcs.post_review(pr, payload)
-            except Exception as exc:  # noqa: BLE001 - every outcome is classified below
+                post_id = self.vcs.post_review(pr, payload)
+            except Exception as exc:  # every outcome is classified below
                 if not _refused(exc):
                     result.outcome = "post-uncertain"  # it may have landed
                     result.error = str(exc) if isinstance(exc, GitHubError) else \
                         type(exc).__name__
                     return
-                result.outcome, result.error = "post-rejected", str(exc)
+                claim.keep = False  # GitHub refused it: nothing landed
                 status = exc.status if isinstance(exc, GitHubError) else None
+                if status not in RETRY_IN_BODY:
+                    raise PostRefused(str(exc), status) from exc
+                result.outcome, result.error = "post-rejected", str(exc)
                 if attempt == 2 or not payload.comments:
-                    break
-                if should_post is not None and not should_post():
-                    result.outcome = "lease-lost"
-                    break
+                    return
                 log.warning("inline comments refused; retrying with them in the body",
                             extra={"pr": pr.number, "status": status})
                 payload = comments_in_body(payload)
                 continue
-            result.outcome = "posted"
-            if attempt == 2:
-                result.review = payload
-                result.error = (f"inline comments refused (HTTP {status}); "
-                                "posted them in the review body")
-            else:
-                result.error = ""
+            result.outcome, result.post_id, result.review = "posted", post_id, payload
+            result.error = "" if attempt == 1 else (f"inline comments refused (HTTP {status}); "
+                                                    "posted them in the review body")
+            self._mark_posted(pr, post_id)
             return
-        # Refused, so nothing landed: free this head for a later run.
-        if self.store is not None:
-            self.store.release_post(pr.repo, pr.number, pr.head_sha)
+
+    def _mark_posted(self, pr: PullRequest, post_id: str) -> None:
+        if self.store is None:
+            return
+        try:
+            self.store.mark_posted(pr.repo, pr.number, pr.head_sha, post_id)
+        except Exception as exc:  # noqa: BLE001 - the review record below still carries the id
+            log.error("could not record the post id on the claim",
+                      extra={"pr": pr.number, "head": pr.head_sha, "post_id": post_id,
+                             "error": type(exc).__name__})
 
     def _prove(self, decision: PolicyDecision, cfg: RepoConfig, rt: Route, head: Snapshot,
                index: CodeIndex, result: ReviewResult) -> None:
@@ -291,17 +367,29 @@ class Reviewer:
         log.info("review finished", extra={"repo": result.pr.repo, "pr": result.pr.number,
                                            "head": result.pr.head_sha, "outcome": result.outcome,
                                            "timings": t.timings, "cost_usd": result.cost_usd})
-        if self.store is not None and result.outcome != "dry-run":
-            rt = result.route
-            self.store.record_review(
-                ReviewRecord(repo=result.pr.repo, pr=result.pr.number,
-                             head_sha=result.pr.head_sha, outcome=result.outcome,
-                             tier=rt.tier if rt else "", model=rt.model if rt else "",
-                             providers=tuple(result.reviewers),
-                             event=result.review.event if result.review else "",
-                             # An uncertain post may have landed: never risk posting it twice.
-                             posted=result.outcome in ("posted", "post-uncertain"),
-                             post_id=result.post_id, cost_usd=result.cost_usd,
-                             timings=t.timings, error=result.error),
-                posted, held)
+        if self.store is None or result.outcome == "dry-run":
+            return result
+        try:
+            self._record(result, t, posted, held)
+        except Exception as exc:
+            if result.outcome == "posted":
+                raise RecordAfterPostError(f"review {result.post_id} posted but not recorded: "
+                                           f"{type(exc).__name__}") from exc
+            raise
         return result
+
+    def _record(self, result: ReviewResult, t: _Timer, posted: list[Finding],
+                held: list[tuple[Finding, str]]) -> None:
+        assert self.store is not None
+        rt = result.route
+        self.store.record_review(
+            ReviewRecord(repo=result.pr.repo, pr=result.pr.number,
+                         head_sha=result.pr.head_sha, outcome=result.outcome,
+                         tier=rt.tier if rt else "", model=rt.model if rt else "",
+                         providers=tuple(result.reviewers),
+                         event=result.review.event if result.review else "",
+                         # An uncertain post may have landed: never risk posting it twice.
+                         posted=result.outcome in ("posted", "post-uncertain"),
+                         post_id=result.post_id, cost_usd=result.cost_usd,
+                         timings=t.timings, error=result.error),
+            posted, held, result.blockers)

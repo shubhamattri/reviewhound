@@ -401,7 +401,7 @@ def _row(**kw: Any) -> dict[str, Any]:
 ])
 def test_open_reason_needs_positive_evidence(row: dict[str, Any], files: dict[str, str],
                                              changed: list[str], reason: str | None) -> None:
-    assert open_reason(row, _Head(files), changed) == reason
+    assert open_reason(row, _Head(files), changed, {}) == reason
 
 
 # B3: a refused post is retried once with every comment in the body; a lost lease posts nothing.
@@ -456,9 +456,9 @@ def test_left_comment_moved_to_the_body_says_it_is_a_deleted_line() -> None:
 def test_rejected_twice_is_rejected_and_frees_the_head(backend: Backend,
                                                        monkeypatch: pytest.MonkeyPatch) -> None:
     vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
-    calls = scripted_posts(vcs, monkeypatch, REJECTED, GitHubError("HTTP 403: nope", 403))
+    calls = scripted_posts(vcs, monkeypatch, REJECTED, GitHubError("HTTP 400: still no", 400))
     result = reviewer.review("acme/shop", 7, dry_run=False)
-    assert (result.outcome, result.error) == ("post-rejected", "HTTP 403: nope")
+    assert (result.outcome, result.error) == ("post-rejected", "HTTP 400: still no")
     assert [len(c.comments) for c in calls] == [1, 0]
     assert store.claim_post("acme/shop", 7, "h1") is True
 

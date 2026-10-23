@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS findings (
 );
 CREATE TABLE IF NOT EXISTS posts (
     repo TEXT NOT NULL, pr INTEGER NOT NULL, head_sha TEXT NOT NULL, created_at REAL NOT NULL,
+    post_id TEXT,
     PRIMARY KEY (repo, pr, head_sha)
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -69,6 +70,12 @@ CREATE TABLE IF NOT EXISTS review_findings (
     category TEXT NOT NULL, evidence_quote TEXT NOT NULL, identity TEXT NOT NULL,
     PRIMARY KEY (repo, pr, review_id, fingerprint)
 );
+CREATE TABLE IF NOT EXISTS review_blockers (
+    repo TEXT NOT NULL, pr INTEGER NOT NULL, review_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+    file TEXT NOT NULL, side TEXT NOT NULL, category TEXT NOT NULL,
+    evidence_quote TEXT NOT NULL, identity TEXT NOT NULL,
+    PRIMARY KEY (repo, pr, review_id, fingerprint)
+);
 """
 
 FEEDBACK_KINDS = {"resolved", "fixed", "declined", "reply", "reopened"}
@@ -79,7 +86,7 @@ class ReviewRecord:
     repo: str
     pr: int
     head_sha: str
-    outcome: str  # posted | shadow | dry-run | skipped | head-moved | failed | post-uncertain
+    outcome: str  # posted | shadow | skipped | head-moved | lease-lost | post-rejected | ...
     tier: str = ""
     model: str = ""
     providers: tuple[str, ...] = ()
@@ -89,6 +96,29 @@ class ReviewRecord:
     cost_usd: float = 0.0
     timings: dict[str, float] | None = None
     error: str = ""
+
+
+@dataclass(frozen=True)
+class Blocker:
+    """A blocking finding of a REQUEST_CHANGES review, as decided before any proof changed it."""
+
+    fingerprint: str
+    file: str
+    side: str
+    category: str
+    evidence_quote: str
+    identity: str
+
+    @classmethod
+    def of(cls, f: Finding) -> Blocker:
+        return cls(f.fingerprint, f.file, f.side, f.category, f.evidence_quote, f.identity)
+
+
+def blocker_rows(rec: ReviewRecord, blockers: Sequence[Blocker]) -> list[tuple[Any, ...]]:
+    if rec.outcome != "posted" or not rec.post_id:
+        return []
+    return [(rec.repo.lower(), rec.pr, rec.post_id, b.fingerprint, b.file, b.side, b.category,
+             b.evidence_quote, b.identity) for b in blockers]
 
 
 def upsert_order(rec: ReviewRecord, posted: list[Finding], held: list[tuple[Finding, str]]
@@ -120,11 +150,18 @@ class ReviewStore(Protocol):
     def known_state(self, repo: str, pr: int) -> dict[str, str]: ...
 
     def record_review(self, rec: ReviewRecord, posted: list[Finding],
-                      held: list[tuple[Finding, str]]) -> int: ...
+                      held: list[tuple[Finding, str]],
+                      blockers: Sequence[Blocker] = ()) -> int: ...
 
     def claim_post(self, repo: str, pr: int, head_sha: str) -> bool: ...
 
     def release_post(self, repo: str, pr: int, head_sha: str) -> None: ...
+
+    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str) -> None: ...
+
+    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> str | None: ...
+
+    def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]: ...
 
     def add_feedback(self, repo: str, pr: int, fingerprint: str, kind: str,
                      detail: str = "") -> bool: ...
@@ -166,6 +203,14 @@ class Store:
             c.executescript(_GITHUB_SCHEMA)
         finally:
             c.close()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns newer than the DB file. BEGIN IMMEDIATE keeps two processes from racing."""
+        with self._tx() as c:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(posts)")}
+            if "post_id" not in cols:
+                c.execute("ALTER TABLE posts ADD COLUMN post_id TEXT")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -190,8 +235,9 @@ class Store:
         return {r["fingerprint"]: r["state"] for r in rows}
 
     def record_review(self, rec: ReviewRecord, posted: list[Finding],
-                      held: list[tuple[Finding, str]]) -> int:
-        """Write the review and every finding in one transaction."""
+                      held: list[tuple[Finding, str]],
+                      blockers: Sequence[Blocker] = ()) -> int:
+        """Write the review, every finding and the review's blockers in one transaction."""
         now = self._clock()
         repo = rec.repo.lower()
         with self._tx() as c:
@@ -207,6 +253,9 @@ class Store:
             c.executemany("INSERT OR IGNORE INTO review_findings (repo, pr, review_id, fingerprint, "
                           "file, line, side, severity, category, evidence_quote, identity) "
                           "VALUES (?,?,?,?,?,?,?,?,?,?,?)", review_finding_rows(rec, posted))
+            c.executemany("INSERT OR IGNORE INTO review_blockers (repo, pr, review_id, fingerprint, "
+                          "file, side, category, evidence_quote, identity) "
+                          "VALUES (?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
             return int(cur.lastrowid or 0)
 
     @staticmethod
@@ -239,6 +288,31 @@ class Store:
         with self._tx() as c:
             c.execute("DELETE FROM posts WHERE repo=? AND pr=? AND head_sha=?",
                       (repo.lower(), pr, head_sha))
+
+    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str) -> None:
+        """Record the GitHub review id on the claim the moment the post lands."""
+        with self._tx() as c:
+            c.execute("INSERT INTO posts (repo, pr, head_sha, created_at, post_id) "
+                      "VALUES (?,?,?,?,?) ON CONFLICT (repo, pr, head_sha) DO UPDATE "
+                      "SET post_id=excluded.post_id",
+                      (repo.lower(), pr, head_sha, self._clock(), post_id))
+
+    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> str | None:
+        """The review id of a post that landed for this head but has no posted review record."""
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT p.post_id FROM posts p WHERE p.repo=? AND p.pr=? AND p.head_sha=? "
+                "AND p.post_id IS NOT NULL AND p.post_id != '' AND NOT EXISTS (SELECT 1 FROM "
+                "reviews r WHERE r.repo=p.repo AND r.pr=p.pr AND r.post_id=p.post_id "
+                "AND r.outcome='posted')", (repo.lower(), pr, head_sha)).fetchone()
+        return None if row is None else str(row["post_id"])
+
+    def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
+        with self._tx() as c:
+            rows = c.execute("SELECT fingerprint, file, side, category, evidence_quote, identity "
+                             "FROM review_blockers WHERE repo=? AND pr=? AND review_id=? "
+                             "ORDER BY file, fingerprint", (repo.lower(), pr, review_id)).fetchall()
+        return [dict(r) for r in rows]
 
     def add_feedback(self, repo: str, pr: int, fingerprint: str, kind: str,
                      detail: str = "") -> bool:

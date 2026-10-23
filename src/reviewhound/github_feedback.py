@@ -145,11 +145,12 @@ def has_open_blocker(result: ReviewResult, policy: PolicyConfig) -> bool:
                for f, reason in result.decision.held)
 
 
-def open_reason(row: Mapping[str, Any], head: Snapshot, changed: list[str]) -> str | None:
+def open_reason(row: Mapping[str, Any], head: Snapshot, changed: list[str],
+                sources: Mapping[str, str]) -> str | None:
     """Why an old blocker may still be in the code at `head`; None only when it is positively gone.
 
-    Gone means its quote (or, for a secret, the secret's identity) is absent from its file, the file
-    is deleted, and it did not move into another changed file."""
+    Gone means its quote (or, for a secret, the secret's identity) is absent from its own file and
+    from every other file in the head index (`sources`) and every changed file."""
     path, quote = str(row["file"]), str(row["evidence_quote"])
     if row["side"] == "LEFT":
         return "a deleted-line finding cannot be shown gone"
@@ -161,10 +162,11 @@ def open_reason(row: Mapping[str, Any], head: Snapshot, changed: list[str]) -> s
     def present(text: str) -> bool:
         return row["identity"] in secret_identities(text) if secret else bool(find_quote(text, quote))
     src = head.read(path)
-    if src is not None:
-        return f"{what} is still in {path}" if present(src) else None
-    for other in [path, *(p for p in changed if p != path)]:
-        text = head.read(other)
+    if src is not None and present(src):
+        return f"{what} is still in {path}"
+    others = sorted((set(sources) | set(changed)) - {path})
+    for other in ([] if src is not None else [path]) + others:
+        text = sources.get(other) if other in sources else head.read(other)
         skip = head.skip_reason(other) if text is None else None
         if skip is not None:
             return f"{other} could not be read at head ({skip})"
@@ -181,9 +183,12 @@ def dismiss_stale_verdicts(vcs: ThreadedVCS, store: ReviewStore, result: ReviewR
     pr = result.pr
     blocking = Severity.parse(policy.blocking_severity)
     for review_id in store.blocking_reviews_to_dismiss(pr.repo, pr.number, result.post_id):
-        blockers = [r for r in store.posted_findings(pr.repo, pr.number, review_id)
-                    if r["severity"] >= blocking]
-        reasons = [open_reason(r, result.snapshot, result.changed_paths) for r in blockers]
+        # Reviews recorded before review_blockers existed fall back to their posted findings.
+        blockers = store.review_blockers(pr.repo, pr.number, review_id) or [
+            r for r in store.posted_findings(pr.repo, pr.number, review_id)
+            if r["severity"] >= blocking]
+        reasons = [open_reason(r, result.snapshot, result.changed_paths, result.head_sources)
+                   for r in blockers]
         kept = [r for r in reasons if r is not None] if blockers else [
             "no blocking finding recorded for it"]
         if kept:

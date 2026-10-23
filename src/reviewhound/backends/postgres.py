@@ -7,18 +7,32 @@ never take the same job. Times are epoch seconds from the injected clock, as in 
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, TypeVar
 
 import psycopg
 from psycopg.rows import DictRow, dict_row
 
 from reviewhound.findings import Finding
 from reviewhound.queue import Job, LeaseLost, job_key
-from reviewhound.store import ReviewRecord, check_kinds, review_finding_rows, upsert_order
+from reviewhound.store import (
+    Blocker,
+    ReviewRecord,
+    blocker_rows,
+    check_kinds,
+    review_finding_rows,
+    upsert_order,
+)
+
+log = logging.getLogger(__name__)
+T = TypeVar("T")
+Conn = psycopg.Connection[DictRow]
+# deadlock_detected, serialization_failure: Postgres rolled the transaction back; rerunning is safe.
+RETRY_SQLSTATES = ("40P01", "40001")
 
 # Separate DDL lists so a later column or table is one more statement, not an edit to a blob.
 QUEUE_DDL: list[str] = [
@@ -68,6 +82,7 @@ STORE_DDL: list[str] = [
         repo TEXT NOT NULL, pr INTEGER NOT NULL, head_sha TEXT NOT NULL,
         created_at DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (repo, pr, head_sha))""",
+    "ALTER TABLE posts ADD COLUMN IF NOT EXISTS post_id TEXT",
     """CREATE TABLE IF NOT EXISTS feedback (
         id BIGSERIAL PRIMARY KEY,
         repo TEXT NOT NULL, pr INTEGER NOT NULL, fingerprint TEXT NOT NULL,
@@ -90,6 +105,11 @@ STORE_DDL: list[str] = [
         side TEXT NOT NULL, severity INTEGER NOT NULL, category TEXT NOT NULL,
         evidence_quote TEXT NOT NULL, identity TEXT NOT NULL,
         PRIMARY KEY (repo, pr, review_id, fingerprint))""",
+    """CREATE TABLE IF NOT EXISTS review_blockers (
+        repo TEXT NOT NULL, pr INTEGER NOT NULL, review_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL, file TEXT NOT NULL, side TEXT NOT NULL,
+        category TEXT NOT NULL, evidence_quote TEXT NOT NULL, identity TEXT NOT NULL,
+        PRIMARY KEY (repo, pr, review_id, fingerprint))""",
 ]
 
 METRICS_DDL: list[str] = [
@@ -107,17 +127,32 @@ class _Pg:
         self.connect_timeout_s = connect_timeout_s
 
     @contextmanager
-    def _tx(self) -> Iterator[psycopg.Connection[DictRow]]:
+    def _tx(self) -> Iterator[Conn]:
         """One transaction: committed on success, rolled back on any exception."""
         with psycopg.connect(self.url, row_factory=dict_row,
                              connect_timeout=self.connect_timeout_s) as conn:
             yield conn
 
+    def _write(self, body: Callable[[Conn], T]) -> T:
+        """Run `body` in one transaction, and once more if Postgres aborted it for a deadlock or a
+        serialization failure. A second such failure, or any other error, raises."""
+        for attempt in (1, 2):
+            try:
+                with self._tx() as c:
+                    return body(c)
+            except psycopg.Error as exc:
+                if exc.sqlstate not in RETRY_SQLSTATES or attempt == 2:
+                    raise
+                log.warning("postgres write aborted, retrying once",
+                            extra={"sqlstate": exc.sqlstate, "error": type(exc).__name__})
+        raise AssertionError("unreachable")
+
     def _migrate(self, ddl: Sequence[str]) -> None:
-        with self._tx() as c:
+        def body(c: Conn) -> None:
             c.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK,))
             for stmt in ddl:
                 c.execute(stmt)
+        self._write(body)
 
 
 class PostgresQueue(_Pg):
@@ -143,7 +178,8 @@ class PostgresQueue(_Pg):
         repo = repo.lower()
         now = self._clock()
         key = job_key(repo, pr, head_sha)
-        with self._tx() as c:
+
+        def body(c: Conn) -> tuple[int, bool]:
             # Serialise enqueues for one PR, as SQLite's BEGIN IMMEDIATE does.
             c.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{repo}#{pr}",))
             c.execute("UPDATE jobs SET state='superseded', updated_at=%s "
@@ -169,11 +205,13 @@ class PostgresQueue(_Pg):
             if new is None:
                 raise RuntimeError("INSERT ... RETURNING returned no row")
             return int(new["id"]), True
+        return self._write(body)
 
     def claim(self) -> Job | None:
         """Take the next ready job, or one whose worker died (lease expired)."""
         now = self._clock()
-        with self._tx() as c:
+
+        def body(c: Conn) -> Job | None:
             c.execute("UPDATE jobs SET state='dead', last_error='lease expired on final attempt', "
                       "lease_until=NULL, updated_at=%s WHERE id IN (SELECT id FROM jobs "
                       "WHERE state='running' AND lease_until < %s AND attempts >= max_attempts "
@@ -191,20 +229,23 @@ class PostgresQueue(_Pg):
             if claimed is None:
                 raise RuntimeError(f"locked job {row['id']} vanished during claim")
             return self._job(claimed)
+        return self._write(body)
 
     def complete(self, job: Job) -> None:
         """Mark done. Raises LeaseLost if another worker took the job after our lease ran out."""
-        with self._tx() as c:
+        def body(c: Conn) -> None:
             cur = c.execute("UPDATE jobs SET state='done', lease_until=NULL, updated_at=%s "
                             "WHERE id=%s AND state='running' AND lease_token=%s",
                             (self._clock(), job.id, job.lease_token))
             if cur.rowcount != 1:
                 raise LeaseLost(job.id)
+        self._write(body)
 
     def fail(self, job: Job, error: str, retryable: bool) -> str:
         """Record a failure. Returns the new state: 'queued' (will retry) or 'dead'."""
         now = self._clock()
-        with self._tx() as c:
+
+        def body(c: Conn) -> str:
             row = c.execute("SELECT attempts, max_attempts FROM jobs WHERE id=%s "
                             "AND state='running' AND lease_token=%s FOR UPDATE",
                             (job.id, job.lease_token)).fetchone()
@@ -218,16 +259,19 @@ class PostgresQueue(_Pg):
             c.execute("UPDATE jobs SET state=%s, run_after=%s, lease_until=NULL, last_error=%s, "
                       "updated_at=%s WHERE id=%s", (state, run_after, error[:500], now, job.id))
             return state
+        return self._write(body)
 
     def extend_lease(self, job: Job) -> float:
         """Push the lease out by lease_s. Raises LeaseLost if the job is no longer ours."""
         now = self._clock()
-        with self._tx() as c:
+
+        def body(c: Conn) -> None:
             cur = c.execute("UPDATE jobs SET lease_until=%s, updated_at=%s WHERE id=%s "
                             "AND state='running' AND lease_token=%s",
                             (now + self.lease_s, now, job.id, job.lease_token))
             if cur.rowcount != 1:
                 raise LeaseLost(job.id)
+        self._write(body)
         return now + self.lease_s
 
     def get(self, job_id: int) -> Job | None:
@@ -242,10 +286,12 @@ class PostgresQueue(_Pg):
 
     def requeue(self, job_id: int) -> bool:
         now = self._clock()
-        with self._tx() as c:
+
+        def body(c: Conn) -> bool:
             cur = c.execute("UPDATE jobs SET state='queued', attempts=0, run_after=%s, "
                             "updated_at=%s WHERE id=%s AND state='dead'", (now, now, job_id))
             return cur.rowcount == 1
+        return self._write(body)
 
     def stuck_count(self, older_than_s: float) -> int:
         """Queued jobs waiting longer than `older_than_s`: the backlog alarm reads this."""
@@ -282,11 +328,13 @@ class PostgresStore(_Pg):
         return {r["fingerprint"]: r["state"] for r in rows}
 
     def record_review(self, rec: ReviewRecord, posted: list[Finding],
-                      held: list[tuple[Finding, str]]) -> int:
-        """Write the review and every finding in one transaction."""
+                      held: list[tuple[Finding, str]],
+                      blockers: Sequence[Blocker] = ()) -> int:
+        """Write the review, every finding and the review's blockers in one transaction."""
         now = self._clock()
         repo = rec.repo.lower()
-        with self._tx() as c:
+
+        def body(c: Conn) -> int:
             row = c.execute(
                 "INSERT INTO reviews (repo, pr, head_sha, outcome, tier, model, providers, event, "
                 "posted, post_id, cost_usd, timings, error, created_at) "
@@ -298,17 +346,24 @@ class PostgresStore(_Pg):
                 raise RuntimeError("INSERT ... RETURNING returned no row")
             for f, state, reason in upsert_order(rec, posted, held):
                 self._upsert(c, repo, rec.pr, rec.head_sha, f, state, reason, now)
-            rows = review_finding_rows(rec, posted)
-            if rows:
-                with c.cursor() as cur:
+            with c.cursor() as cur:
+                rows = review_finding_rows(rec, posted)
+                if rows:
                     cur.executemany(
                         "INSERT INTO review_findings (repo, pr, review_id, fingerprint, file, "
                         "line, side, severity, category, evidence_quote, identity) VALUES "
                         "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", rows)
+                brows = blocker_rows(rec, blockers)
+                if brows:
+                    cur.executemany(
+                        "INSERT INTO review_blockers (repo, pr, review_id, fingerprint, file, "
+                        "side, category, evidence_quote, identity) VALUES "
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
             return int(row["id"])
+        return self._write(body)
 
     @staticmethod
-    def _upsert(c: psycopg.Connection[DictRow], repo: str, pr: int, head: str, f: Finding,
+    def _upsert(c: Conn, repo: str, pr: int, head: str, f: Finding,
                 state: str, reason: str | None, now: float) -> None:
         # Same protected states as Store._upsert: feedback and live comments are never overwritten.
         c.execute(
@@ -326,17 +381,45 @@ class PostgresStore(_Pg):
 
     def claim_post(self, repo: str, pr: int, head_sha: str) -> bool:
         """At most one post per head, even if two workers or a retry reach the post step."""
-        with self._tx() as c:
+        def body(c: Conn) -> bool:
             cur = c.execute("INSERT INTO posts (repo, pr, head_sha, created_at) "
                             "VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                             (repo.lower(), pr, head_sha, self._clock()))
             return cur.rowcount == 1
+        return self._write(body)
 
     def release_post(self, repo: str, pr: int, head_sha: str) -> None:
         """Undo claim_post after GitHub rejected the review, so a later run may post it."""
-        with self._tx() as c:
+        def body(c: Conn) -> None:
             c.execute("DELETE FROM posts WHERE repo=%s AND pr=%s AND head_sha=%s",
                       (repo.lower(), pr, head_sha))
+        self._write(body)
+
+    def mark_posted(self, repo: str, pr: int, head_sha: str, post_id: str) -> None:
+        """Record the GitHub review id on the claim the moment the post lands."""
+        def body(c: Conn) -> None:
+            c.execute("INSERT INTO posts (repo, pr, head_sha, created_at, post_id) "
+                      "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (repo, pr, head_sha) DO UPDATE "
+                      "SET post_id=excluded.post_id",
+                      (repo.lower(), pr, head_sha, self._clock(), post_id))
+        self._write(body)
+
+    def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> str | None:
+        """The review id of a post that landed for this head but has no posted review record."""
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT p.post_id FROM posts p WHERE p.repo=%s AND p.pr=%s AND p.head_sha=%s "
+                "AND p.post_id IS NOT NULL AND p.post_id != '' AND NOT EXISTS (SELECT 1 FROM "
+                "reviews r WHERE r.repo=p.repo AND r.pr=p.pr AND r.post_id=p.post_id "
+                "AND r.outcome='posted')", (repo.lower(), pr, head_sha)).fetchone()
+        return None if row is None else str(row["post_id"])
+
+    def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
+        with self._tx() as c:
+            rows = c.execute("SELECT fingerprint, file, side, category, evidence_quote, identity "
+                             "FROM review_blockers WHERE repo=%s AND pr=%s AND review_id=%s "
+                             "ORDER BY file, fingerprint", (repo.lower(), pr, review_id)).fetchall()
+        return [dict(r) for r in rows]
 
     def add_feedback(self, repo: str, pr: int, fingerprint: str, kind: str,
                      detail: str = "") -> bool:
@@ -348,7 +431,8 @@ class PostgresStore(_Pg):
         check_kinds(items)
         now = self._clock()
         repo = repo.lower()
-        with self._tx() as c:
+
+        def body(c: Conn) -> list[bool] | None:
             if event_key:
                 cur = c.execute("INSERT INTO feedback_events (key, created_at) VALUES (%s,%s) "
                                 "ON CONFLICT DO NOTHING", (event_key, now))
@@ -369,6 +453,7 @@ class PostgresStore(_Pg):
                     c.execute("UPDATE findings SET state=%s, updated_at=%s WHERE repo=%s "
                               "AND pr=%s AND fingerprint=%s", (kind, now, repo, pr, fingerprint))
             return done
+        return self._write(body)
 
     def posted_findings(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
         with self._tx() as c:
@@ -395,13 +480,16 @@ class PostgresStore(_Pg):
         if not links:
             return
         now = self._clock()
-        with self._tx() as c, c.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO comment_links (repo, comment_id, pr, fingerprint, review_id, "
-                "created_at) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (repo, comment_id) DO UPDATE "
-                "SET pr=excluded.pr, fingerprint=excluded.fingerprint, "
-                "review_id=excluded.review_id, created_at=excluded.created_at",
-                [(repo.lower(), cid, pr, fp, review_id, now) for cid, fp in links])
+
+        def body(c: Conn) -> None:
+            with c.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO comment_links (repo, comment_id, pr, fingerprint, review_id, "
+                    "created_at) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (repo, comment_id) "
+                    "DO UPDATE SET pr=excluded.pr, fingerprint=excluded.fingerprint, "
+                    "review_id=excluded.review_id, created_at=excluded.created_at",
+                    [(repo.lower(), cid, pr, fp, review_id, now) for cid, fp in links])
+        self._write(body)
 
     def linked_findings(self, repo: str, comment_ids: list[int]) -> dict[int, tuple[int, str]]:
         """comment id -> (PR, fingerprint), for the ids we posted; others are absent."""
@@ -430,10 +518,12 @@ class PostgresStore(_Pg):
                          error: str = "", permanent: bool = False) -> None:
         """ok is stored as 1 (dismissed), 0 (failed, retry later) or -1 (failed, give up)."""
         status = 1 if ok else (-1 if permanent else 0)
-        with self._tx() as c:
+
+        def body(c: Conn) -> None:
             c.execute("INSERT INTO dismissals (repo, pr, review_id, ok, error, created_at) "
                       "VALUES (%s,%s,%s,%s,%s,%s)",
                       (repo.lower(), pr, review_id, status, error[:500], self._clock()))
+        self._write(body)
 
     def dismissals(self, repo: str, pr: int) -> list[dict[str, Any]]:
         with self._tx() as c:
@@ -455,12 +545,13 @@ class PostgresMetrics(_Pg):
 
     def add(self, increments: Sequence[tuple[str, str, float]]) -> None:
         # Sorted so two workers lock the same rows in the same order and cannot deadlock.
-        with self._tx() as c:
+        def body(c: Conn) -> None:
             for name, label, value in sorted(increments):
                 c.execute("INSERT INTO metric_counters (name, label, value) VALUES (%s,%s,%s) "
                           "ON CONFLICT (name, label) DO UPDATE "
                           "SET value = metric_counters.value + excluded.value",
                           (name, label, value))
+        self._write(body)
 
     def counters(self) -> dict[tuple[str, str], float]:
         with self._tx() as c:
