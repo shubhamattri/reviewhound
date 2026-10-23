@@ -1,0 +1,44 @@
+{
+  "title": "17-js-map-callback-returns-nothing",
+  "expected": [
+    {
+      "file": "src/cart.js",
+      "line": 14,
+      "category": "correctness"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/cart.js",
+        "severity": "major",
+        "category": "correctness",
+        "title": "map callback returns undefined",
+        "body": "The arrow function has a block body and no return, so every total is undefined.",
+        "evidence_quote": "o.qty * o.price;",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "lineTotals"
+          }
+        ],
+        "line": 14
+      },
+      {
+        "file": "src/cart.js",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Totals skip Order.tax",
+        "body": "Each order should go through Order.tax before it is summed.",
+        "evidence_quote": "return orders.map((o) => {",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "Order.tax"
+          }
+        ],
+        "line": 13
+      }
+    ]
+  }
+}

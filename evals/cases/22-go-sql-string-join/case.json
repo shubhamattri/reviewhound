@@ -1,0 +1,24 @@
+{
+  "title": "22-go-sql-string-join",
+  "expected": [
+    {
+      "file": "store/users.go",
+      "line": 10,
+      "category": "sql-injection"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "store/users.go",
+        "severity": "major",
+        "category": "correctness",
+        "title": "ByID passes the wrong placeholder",
+        "body": "Old code, not changed by this PR.",
+        "evidence_quote": "return db.Query(\"SELECT * FROM users WHERE id = $1\", id)",
+        "claims": [],
+        "line": 6
+      }
+    ]
+  }
+}

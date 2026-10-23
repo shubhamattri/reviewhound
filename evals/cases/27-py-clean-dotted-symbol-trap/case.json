@@ -1,0 +1,39 @@
+{
+  "title": "27-py-clean-dotted-symbol-trap",
+  "expected": [],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "shop/cart.py",
+        "severity": "major",
+        "category": "correctness",
+        "title": "count trusts quantities Cart never validated",
+        "body": "Cart.validate_qty should run before items are counted.",
+        "evidence_quote": "return sum(q for _, q in self.items)",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "Cart.validate_qty"
+          }
+        ],
+        "line": 13
+      },
+      {
+        "file": "shop/cart.py",
+        "severity": "minor",
+        "category": "performance",
+        "title": "count loops by hand",
+        "body": "Use the built-in sum.",
+        "evidence_quote": "def count(self):",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "Cart.count",
+            "callee": "sum"
+          }
+        ],
+        "line": 12
+      }
+    ]
+  }
+}

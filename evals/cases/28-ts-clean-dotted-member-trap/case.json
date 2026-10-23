@@ -1,0 +1,23 @@
+{
+  "title": "28-ts-clean-dotted-member-trap",
+  "expected": [],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/invoice.ts",
+        "severity": "major",
+        "category": "correctness",
+        "title": "count should go through Invoice.tax",
+        "body": "Every Invoice amount is taxed by its tax method.",
+        "evidence_quote": "return this.lines.length;",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "Invoice.tax"
+          }
+        ],
+        "line": 13
+      }
+    ]
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "title": "16-js-route-without-admin-check",
+  "expected": [
+    {
+      "file": "src/routes.js",
+      "line": 7,
+      "category": "auth"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/routes.js",
+        "severity": "blocker",
+        "category": "auth",
+        "title": "Delete route has no admin check",
+        "body": "The other user routes go through requireAdmin; this one lets anyone delete a user.",
+        "evidence_quote": "app.delete(\"/users/:id\", deleteUser);",
+        "claims": [
+          {
+            "kind": "quote",
+            "file": "src/routes.js",
+            "text": "app.put(\"/users/:id\", requireAdmin, updateUser);"
+          },
+          {
+            "kind": "calls",
+            "caller": "register",
+            "callee": "delete"
+          }
+        ],
+        "line": 7
+      },
+      {
+        "file": "src/routes.js",
+        "severity": "major",
+        "category": "auth",
+        "title": "Update route has no admin check",
+        "body": "updateUser is reachable without requireAdmin.",
+        "evidence_quote": "app.put(\"/users/:id\", updateUser);",
+        "claims": [],
+        "line": 6
+      }
+    ]
+  }
+}

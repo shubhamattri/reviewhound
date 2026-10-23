@@ -1,13 +1,14 @@
 """Eval harness: replay recorded PRs through the full pipeline and score the findings.
 
-A reported finding matches an expected one when it is in the same file within
-`line_tolerance` lines. Each expected finding can be matched once.
+A reported finding matches an expected one when it is in the same file, on the same side
+(RIGHT: head line, LEFT: base line the PR deleted) and within `line_tolerance` lines.
+Each expected finding can be matched once.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -73,21 +74,27 @@ def _read_tree(root: Path) -> dict[str, str]:
             if p.is_file()}
 
 
-def score(expected: list[dict[str, Any]], reported: list[tuple[str, int]],
+def _label(path: str, line: int, side: str) -> str:
+    return f"{path}:{line}" if side == "RIGHT" else f"{path}:{line}:{side}"
+
+
+def score(expected: list[dict[str, Any]], reported: Sequence[tuple[str, int, str]],
           line_tolerance: int = 3) -> tuple[int, list[str], list[str]]:
     """Return (true positives, missed expected, false alarms)."""
     unmatched = list(expected)
     tp = 0
     false_alarms: list[str] = []
-    for path, line in reported:
+    for path, line, side in reported:
         hit = next((e for e in unmatched if e["file"] == path and
+                    e.get("side", "RIGHT") == side and
                     abs(int(e["line"]) - line) <= line_tolerance), None)
         if hit is None:
-            false_alarms.append(f"{path}:{line}")
+            false_alarms.append(_label(path, line, side))
         else:
             unmatched.remove(hit)
             tp += 1
-    return tp, [f"{e['file']}:{e['line']}" for e in unmatched], false_alarms
+    return tp, [_label(e["file"], int(e["line"]), e.get("side", "RIGHT"))
+                for e in unmatched], false_alarms
 
 
 def run_case(case_dir: Path, provider_factory: Callable[[dict[str, Any]], Provider],
@@ -103,9 +110,11 @@ def run_case(case_dir: Path, provider_factory: Callable[[dict[str, Any]], Provid
         result = reviewer.review(pr.repo, 1, dry_run=True)
     except Exception as exc:  # noqa: BLE001 - one broken case must not stop the run
         return CaseResult(case_dir.name, len(spec["expected"]), 0, 0, 0, 0.0,
-                          misses=[f"{e['file']}:{e['line']}" for e in spec["expected"]],
+                          misses=[_label(e["file"], int(e["line"]), e.get("side", "RIGHT"))
+                                  for e in spec["expected"]],
                           error=type(exc).__name__)
-    posted = [(f.file, f.line) for f in (result.decision.post if result.decision else [])]
+    posted = [(f.file, f.line, f.side)
+              for f in (result.decision.post if result.decision else [])]
     tp, misses, false_alarms = score(spec["expected"], posted)
     return CaseResult(case_dir.name, len(spec["expected"]), len(posted), tp,
                       len(result.dropped), result.cost_usd, misses, false_alarms)

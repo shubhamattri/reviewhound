@@ -1,0 +1,60 @@
+{
+  "title": "15-js-unescaped-html",
+  "expected": [
+    {
+      "file": "src/comments.js",
+      "line": 6,
+      "category": "security"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/comments.js",
+        "severity": "blocker",
+        "category": "security",
+        "title": "Comment text is written as raw HTML",
+        "body": "A comment containing a script tag runs in every reader's browser. escapeHtml exists in this file but is not used here.",
+        "evidence_quote": "el.innerHTML = \"<p>\" + comment.text + \"</p>\";",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "renderComment",
+            "callee": "escapeHtml"
+          },
+          {
+            "kind": "symbol_exists",
+            "name": "escapeHtml"
+          }
+        ],
+        "line": 6
+      },
+      {
+        "file": "src/comments.js",
+        "severity": "minor",
+        "category": "correctness",
+        "title": "Comment text is escaped twice",
+        "body": "renderComment escapes text that escapeHtml already escaped.",
+        "evidence_quote": "el.innerHTML = \"<p>\" + comment.text + \"</p>\";",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "renderComment",
+            "callee": "escapeHtml"
+          }
+        ],
+        "line": 6
+      },
+      {
+        "file": "src/comments.js",
+        "severity": "major",
+        "category": "security",
+        "title": "escapeHtml does not escape quotes",
+        "body": "Old helper, not changed by this PR.",
+        "evidence_quote": "return s.replace(/&/g, \"&amp;\")",
+        "claims": [],
+        "line": 2
+      }
+    ]
+  }
+}

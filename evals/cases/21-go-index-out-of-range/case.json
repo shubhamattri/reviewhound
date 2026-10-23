@@ -1,0 +1,45 @@
+{
+  "title": "21-go-index-out-of-range",
+  "expected": [
+    {
+      "file": "stats/sum.go",
+      "line": 9,
+      "category": "correctness"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "stats/sum.go",
+        "severity": "blocker",
+        "category": "correctness",
+        "title": "Loop reads one past the end",
+        "body": "i reaches len(xs), so xs[i] panics with index out of range.",
+        "evidence_quote": "for i := 0; i <= len(xs); i++ {",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "Sum"
+          }
+        ],
+        "line": 9
+      },
+      {
+        "file": "stats/sum.go",
+        "severity": "minor",
+        "category": "style",
+        "title": "Use a range loop",
+        "body": "The rest of the package ranges over slices.",
+        "evidence_quote": "for _, x := range xs {",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "Sum",
+            "callee": "Count"
+          }
+        ],
+        "line": 12
+      }
+    ]
+  }
+}

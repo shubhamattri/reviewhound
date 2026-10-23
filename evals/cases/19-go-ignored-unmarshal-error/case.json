@@ -1,0 +1,49 @@
+{
+  "title": "19-go-ignored-unmarshal-error",
+  "expected": [
+    {
+      "file": "config/load.go",
+      "line": 19,
+      "category": "error-handling"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "config/load.go",
+        "severity": "major",
+        "category": "error-handling",
+        "title": "Unmarshal error is ignored",
+        "body": "Bad config bytes silently give a zero Config with Port 0.",
+        "evidence_quote": "json.Unmarshal(data, &cfg)",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "Load",
+            "callee": "Unmarshal"
+          },
+          {
+            "kind": "symbol_exists",
+            "name": "Config"
+          }
+        ],
+        "line": 19
+      },
+      {
+        "file": "config/load.go",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Load skips Config.Validate",
+        "body": "Every loaded config should go through its Validate method.",
+        "evidence_quote": "return cfg",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "Config.Validate"
+          }
+        ],
+        "line": 20
+      }
+    ]
+  }
+}

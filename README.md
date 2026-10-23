@@ -85,10 +85,12 @@ Unknown keys or bad values fail the review loudly instead of being guessed.
 
 ## Evals
 
-`evals/build_cases.py` writes `evals/cases/*`: 12 small PRs (Python and TypeScript) with seeded
-bugs, two clean PRs, expected findings, and a recorded model answer that includes deliberate
-hallucinations (invented helpers, quotes that do not exist, bugs in unchanged code, false
-"missing guard" claims). Any prompt or checker change must not lower precision on this set.
+`evals/build_cases.py` writes `evals/cases/*`: 32 small PRs (Python, TypeScript, JavaScript, Go
+and one Ruby file) with seeded bugs, six clean PRs, expected findings, and a recorded model
+answer that includes deliberate hallucinations (invented helpers, `Owner.member` names that do
+not exist, quotes that do not exist, bugs in unchanged code, false "missing guard" claims). Two
+cases put the bug on a line the PR deleted, and one has two secrets on identically shaped lines.
+Any prompt or checker change must not lower precision on this set.
 
 ## Contributing and roadmap
 

@@ -1,0 +1,51 @@
+{
+  "title": "23-go-handler-without-admin-check",
+  "expected": [
+    {
+      "file": "api/server.go",
+      "line": 25,
+      "category": "auth"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "api/server.go",
+        "severity": "blocker",
+        "category": "auth",
+        "title": "DeleteUser skips requireAdmin",
+        "body": "GetUser checks the role first; DeleteUser lets any caller delete users.",
+        "evidence_quote": "s.users.Delete(r.URL.Query().Get(\"id\"))",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "Server.DeleteUser",
+            "callee": "requireAdmin"
+          },
+          {
+            "kind": "calls",
+            "caller": "Server.GetUser",
+            "callee": "requireAdmin"
+          }
+        ],
+        "line": 25
+      },
+      {
+        "file": "api/server.go",
+        "severity": "major",
+        "category": "audit",
+        "title": "Deletes are not audited",
+        "body": "Server.RemoveUser writes an audit record; this path does not.",
+        "evidence_quote": "w.WriteHeader(http.StatusNoContent)",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "Server.RemoveUser",
+            "callee": "audit"
+          }
+        ],
+        "line": 26
+      }
+    ]
+  }
+}
