@@ -6,6 +6,8 @@ from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+import tree_sitter_go
+import tree_sitter_javascript
 import tree_sitter_python
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
@@ -15,13 +17,16 @@ from reviewhound.paths import language_of
 _PY = Language(tree_sitter_python.language())
 _TS = Language(tree_sitter_typescript.language_typescript())
 _TSX = Language(tree_sitter_typescript.language_tsx())
+_JS = Language(tree_sitter_javascript.language())
+_GO = Language(tree_sitter_go.language())
 
 _FUNC_TYPES = {
     "function_definition", "function_declaration", "method_definition",
-    "generator_function_declaration",
+    "generator_function_declaration", "method_declaration",
 }
 _CLASS_TYPES = {"class_definition", "class_declaration", "abstract_class_declaration"}
-_TYPE_TYPES = {"interface_declaration", "type_alias_declaration", "enum_declaration"}
+_TYPE_TYPES = {"interface_declaration", "type_alias_declaration", "enum_declaration",
+               "type_spec", "type_alias"}
 _CALL_TYPES = {"call", "call_expression", "new_expression"}
 
 
@@ -51,6 +56,10 @@ def _parser_for(path: str) -> Parser | None:
         return Parser(_PY)
     if lang == "typescript":
         return Parser(_TSX if path.endswith(".tsx") else _TS)
+    if lang == "javascript":
+        return Parser(_JS)
+    if lang == "go":
+        return Parser(_GO)
     return None
 
 
@@ -64,12 +73,24 @@ def _callee_name(call: Node) -> str:
     target = call.child_by_field_name("function") or call.child_by_field_name("constructor")
     if target is None:
         return ""
-    if target.type in ("attribute", "member_expression"):
-        prop = target.child_by_field_name("attribute") or target.child_by_field_name("property")
+    if target.type in ("attribute", "member_expression", "selector_expression"):
+        prop = (target.child_by_field_name("attribute") or target.child_by_field_name("property")
+                or target.child_by_field_name("field"))
         return _text(prop)
     if target.type in ("identifier", "type_identifier"):
         return _text(target)
     return ""
+
+
+def _go_receiver(method: Node) -> str:
+    """`Store` for `func (s *Store)`, `func (s Store)` and `func (s *Store[T])`."""
+    params = method.child_by_field_name("receiver")
+    decl = next((c for c in params.named_children if c.type == "parameter_declaration"), None) \
+        if params is not None else None
+    t = decl.child_by_field_name("type") if decl is not None else None
+    while t is not None and t.type in ("pointer_type", "generic_type"):
+        t = t.named_children[0] if t.type == "pointer_type" else t.child_by_field_name("type")
+    return _text(t) if t is not None and t.type == "type_identifier" else ""
 
 
 def _def_name(node: Node) -> tuple[str, str] | None:
@@ -101,6 +122,8 @@ def index_file(path: str, source: str) -> FileIndex | None:
         child_scope, child_owner = scope, owner
         if found and found[0]:
             name, kind = found
+            if node.type == "method_declaration":
+                scope = [r for r in (_go_receiver(node),) if r]
             qualified = ".".join([*scope, name])
             fi.definitions.append(Definition(name=name, qualified=qualified, kind=kind, file=path,
                                              start_line=node.start_point[0] + 1,
@@ -113,7 +136,8 @@ def index_file(path: str, source: str) -> FileIndex | None:
             callee = _callee_name(node)
             if callee:
                 fi.calls[owner].add(callee)
-        if node.type in ("identifier", "property_identifier", "type_identifier"):
+        if node.type in ("identifier", "property_identifier", "type_identifier",
+                         "field_identifier"):
             fi.identifiers.add(_text(node))
         for child in node.children:
             walk(child, child_scope, child_owner)

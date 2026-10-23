@@ -16,7 +16,7 @@ GitHub webhook ──> webhook.py ──> SQLite job queue (one job per repo + P
    ┌──────────────────────────────────────────────────────────────────────────────┐
    │ fetch PR + diff ─> config from BASE branch (.reviewhound.yml, defaults)        │
    │ risk router ─> tier (skip / light / standard / deep), model, byte budget       │
-   │ tree-sitter index of head (Python, TypeScript) + learned conventions           │
+   │ tree-sitter index of head (Python, TypeScript, JS, Go) + learned conventions   │
    │ context: diff with head line numbers, changed functions, callers, referenced   │
    │          types, recent history, all inside the byte budget                     │
    │ model registry (claude -p, fallback, circuit breaker) ─> JSON findings         │
@@ -63,7 +63,7 @@ leak into a review.
 
 ```yaml
 posting: false            # shadow mode until true
-languages: [python, typescript]
+languages: [python, typescript, javascript, go]
 ignore_paths: ["**/*.lock", "**/dist/**"]
 risk_paths:
   - {pattern: "**/billing/**", tier: deep}
