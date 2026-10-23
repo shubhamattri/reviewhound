@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
+
+from reviewhound.procenv import claude_env
 
 log = logging.getLogger(__name__)
 
@@ -57,9 +58,7 @@ class ClaudeCliProvider:
         self._run = runner
 
     def _env(self) -> dict[str, str]:
-        env = dict(os.environ)
-        env.pop("ANTHROPIC_API_KEY", None)
-        return env
+        return claude_env()
 
     def complete(self, prompt: str, *, model: str, timeout_s: float) -> Completion:
         cmd = [self.binary, "-p", "--output-format", "json", "--model", model,

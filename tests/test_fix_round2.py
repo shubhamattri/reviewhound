@@ -29,7 +29,7 @@ from reviewhound.vcs.github import GitHubError
 from reviewhound.vcs.memory import MemoryVCS
 from reviewhound.worker import is_retryable, run_one
 from tests.conftest import Backend, answer, make_pr, spy
-from tests.test_fix_round1_b import REJECTED, SECOND, scripted_posts
+from tests.test_fix_round1_b import REJECTED, scripted_posts
 from tests.test_github_feedback import CFG, FIXED, FP, push, reviewer_on
 from tests.test_pipeline import BASE, HEAD, REAL
 
@@ -169,6 +169,7 @@ def test_failure_before_the_post_requeues_the_job_and_the_retry_posts(
     done = q.get(job.id)
     assert done is not None and done.state == "done"
     assert len(vcs.posted) == 1
+    assert [r["outcome"] for r in store.reviews(REPO, PR)] == ["posted"]
 
 
 def test_interrupt_during_the_post_keeps_the_claim(backend: Backend,
@@ -719,3 +720,214 @@ def test_webhook_enqueue_rides_out_one_deadlock(backend: Backend,
     body = {"action": "opened", "repository": {"full_name": REPO},
             "pull_request": {"number": PR, "draft": False, "head": {"sha": H1}}}
     assert handle_event(q, "pull_request", body) == (202, "job 1 queued")
+
+
+# --- H1: a set-but-empty owner allowlist refuses to start ---------------------------------
+
+class _Idle:
+    def serve_forever(self) -> None:
+        pass
+
+
+def _serve(monkeypatch: pytest.MonkeyPatch, home: Any, owners: str | None) -> list[Any]:
+    import reviewhound.webhook as wh
+    from reviewhound.cli import main
+    started: list[Any] = []
+
+    def fake_make_server(*a: Any, **kw: Any) -> _Idle:
+        started.append(kw["allowed_owners"])
+        return _Idle()
+    monkeypatch.setattr(wh, "make_server", fake_make_server)
+    monkeypatch.setenv("REVIEWHOUND_WEBHOOK_SECRET", "s")
+    monkeypatch.delenv("REVIEWHOUND_DATABASE_URL", raising=False)
+    if owners is None:
+        monkeypatch.delenv("REVIEWHOUND_ALLOWED_OWNERS", raising=False)
+    else:
+        monkeypatch.setenv("REVIEWHOUND_ALLOWED_OWNERS", owners)
+    assert main(["--home", str(home), "serve"]) == 0
+    return started
+
+
+@pytest.mark.parametrize("owners", [" ", ",", " , ,", "\t,"])
+def test_serve_refuses_an_allowlist_that_names_no_owner(
+        tmp_path: Any, monkeypatch: pytest.MonkeyPatch, owners: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _serve(monkeypatch, tmp_path, owners)
+    assert str(exc.value) == (
+        f"REVIEWHOUND_ALLOWED_OWNERS is set but names no owner ({owners!r}). List owners "
+        "separated by commas, or unset it to accept every owner.")
+
+
+@pytest.mark.parametrize(("owners", "allowed"), [
+    (None, None), ("", None), ("Acme, ,", frozenset({"acme"}))])
+def test_serve_starts_when_the_allowlist_is_unset_empty_or_named(
+        tmp_path: Any, monkeypatch: pytest.MonkeyPatch, owners: str | None,
+        allowed: frozenset[str] | None) -> None:
+    assert _serve(monkeypatch, tmp_path, owners) == [allowed]
+
+
+# --- H2: the webhook body read has a total deadline ---------------------------------------
+
+def test_body_trickled_past_the_deadline_gets_408_and_frees_the_thread(tmp_path: Any) -> None:
+    import socket
+    import time
+
+    from reviewhound.queue import SQLiteQueue
+    from tests.test_fix_round1_b import serving
+    q = SQLiteQueue(tmp_path / "q.db")
+    with serving(queue=q, read_timeout_s=0.5, body_deadline_s=1.0) as port:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(b"POST /webhook HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+        sock.settimeout(0.2)
+        start, got = time.monotonic(), b""
+        while time.monotonic() - start < 5:
+            try:
+                data = sock.recv(4096)
+            except TimeoutError:
+                sock.sendall(b" ")  # one byte per 0.2s: never trips the 0.5s per-read timeout
+                continue
+            if not data:
+                break
+            got += data
+        elapsed = time.monotonic() - start
+        sock.close()
+    assert got.startswith(b"HTTP/1.0 408 ")
+    assert got.endswith(b'{"message": "body not received in time"}')
+    assert 0.9 < elapsed < 2.5
+    assert q.claim() is None
+
+
+def test_default_body_deadline_is_thirty_seconds() -> None:
+    import inspect
+
+    from reviewhound.webhook import BODY_DEADLINE_S, make_server
+    assert BODY_DEADLINE_S == 30.0
+    assert inspect.signature(make_server).parameters["body_deadline_s"].default == 30.0
+
+
+def test_body_sent_in_pieces_within_the_deadline_is_accepted(tmp_path: Any) -> None:
+    import json
+    import socket
+    import time
+
+    from reviewhound.queue import SQLiteQueue
+    from tests.test_fix_round1_b import pr_body, serving
+    from tests.test_webhook import sign
+    q = SQLiteQueue(tmp_path / "q.db")
+    body = json.dumps(pr_body()).encode()
+    with serving(queue=q, read_timeout_s=1.0, body_deadline_s=5.0) as port:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(b"POST /webhook HTTP/1.1\r\nHost: x\r\nX-GitHub-Event: pull_request\r\n"
+                     b"X-Hub-Signature-256: " + sign(body).encode() +
+                     f"\r\nContent-Length: {len(body)}\r\n\r\n".encode())
+        for i in range(0, len(body), 20):
+            sock.sendall(body[i:i + 20])
+            time.sleep(0.02)
+        reply = sock.recv(4096)
+        sock.close()
+    assert reply.startswith(b"HTTP/1.0 202 ")
+    assert reply.endswith(b'{"message": "job 1 queued"}')
+
+
+# --- H3, H4: child process environments ---------------------------------------------------
+
+CLAUDE_OK = {"PATH": "/usr/bin", "HOME": "/home/rh", "USER": "rh", "LOGNAME": "rh",
+             "LANG": "C.UTF-8", "TMPDIR": "/tmp/rh", "SHELL": "/bin/sh",
+             "CLAUDE_CODE_OAUTH_TOKEN": "oauth", "CLAUDE_CONFIG_DIR": "/home/rh/.claude"}
+NETWORK = {"HTTPS_PROXY": "http://p:3128", "HTTP_PROXY": "http://p:3128", "NO_PROXY": "localhost",
+           "https_proxy": "http://p:3128", "http_proxy": "http://p:3128", "no_proxy": "localhost",
+           "SSL_CERT_FILE": "/etc/ca.pem", "REQUESTS_CA_BUNDLE": "/etc/ca.pem"}
+SECRETS = {"GITHUB_TOKEN": "ghp_x", "ANTHROPIC_API_KEY": "sk-x",
+           "REVIEWHOUND_WEBHOOK_SECRET": "w", "REVIEWHOUND_DATABASE_URL": "pg-url-with-password",
+           "REVIEWHOUND_METRICS_TOKEN": "m", "AWS_SECRET_ACCESS_KEY": "a"}
+
+
+def _env(monkeypatch: pytest.MonkeyPatch, values: dict[str, str]) -> None:
+    import os
+    for k in list(os.environ):
+        monkeypatch.delenv(k)
+    for k, v in values.items():
+        monkeypatch.setenv(k, v)
+
+
+def test_claude_child_gets_only_its_login_and_shell_basics(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    import subprocess
+
+    from reviewhound.providers import ClaudeCliProvider
+    _env(monkeypatch, {**CLAUDE_OK, **NETWORK, **SECRETS})
+    sent: list[dict[str, str]] = []
+
+    def run(cmd: list[str], stdin: str, timeout: float,
+            env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        sent.append(env)
+        return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": "{}"}), "")
+    p = ClaudeCliProvider(runner=run)
+    p.complete("P", model="sonnet", timeout_s=5)
+    assert p.healthy() is True
+    assert sent == [CLAUDE_OK, CLAUDE_OK]
+
+
+def test_claude_child_skips_unset_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    from reviewhound.procenv import CLAUDE_KEYS, claude_env
+    _env(monkeypatch, {"PATH": "/bin", "GITHUB_TOKEN": "x"})
+    assert claude_env() == {"PATH": "/bin"}
+    assert CLAUDE_KEYS == ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "SHELL",
+                           "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR")
+
+
+def test_git_and_semgrep_keep_proxy_and_ca_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from reviewhound.procenv import child_env
+    _env(monkeypatch, {**CLAUDE_OK, **NETWORK, **SECRETS})
+    assert child_env(EXTRA="1") == {"PATH": "/usr/bin", "HOME": "/home/rh", "LANG": "C.UTF-8",
+                                    **NETWORK, "EXTRA": "1"}
+
+
+# --- H6: the proof budget counts Docker's own time, not only the test timeout -------------
+
+class _ClockedDocker:
+    """A docker CLI where every call takes its full timeout: the worst case."""
+
+    def __init__(self, clock: Any) -> None:
+        from tests.test_proof import FakeDocker
+        self.clock, self.fake = clock, FakeDocker()
+
+    def __call__(self, cmd: list[str], timeout_s: float) -> Any:
+        self.clock.now += timeout_s
+        return self.fake(cmd, timeout_s)
+
+
+def test_docker_overhead_is_the_sum_of_its_step_timeouts() -> None:
+    from reviewhound.proof import DockerRunner
+    assert DockerRunner(startup_grace_s=30).overhead_s == 15 + 30 + 10 + 15 + 15 + 30
+
+
+def test_worst_case_docker_run_stays_inside_the_budget(clock: Any) -> None:
+    from reviewhound.proof import BudgetedRunner, DockerRunner
+    from tests.test_proof import FILES
+    docker = _ClockedDocker(clock)
+    runner = BudgetedRunner(DockerRunner(command=docker, startup_grace_s=30), total_s=150,
+                            clock=clock)
+    runner.run(FILES, "tests/test_p.py", 60)
+    assert docker.fake.timeouts == [15, 30, 35 + 10, 15, 15, 30]  # the test got 150 - 115 s
+    assert runner.remaining() == 0.0
+    refused = runner.run(FILES, "tests/test_p.py", 60)
+    assert refused.error == "proof time budget of 150s for this review is used up"
+    assert len(docker.fake.calls) == 6
+
+
+def test_budget_smaller_than_docker_overhead_refuses_before_any_docker_call(clock: Any) -> None:
+    from reviewhound.proof import BudgetedRunner, DockerRunner
+    from tests.test_proof import FILES
+    docker = _ClockedDocker(clock)
+    runner = BudgetedRunner(DockerRunner(command=docker, startup_grace_s=30), total_s=115.5,
+                            clock=clock)
+    assert runner.exhausted() is True
+    assert runner.run(FILES, "tests/test_p.py", 60).error == (
+        "proof time budget of 115.5s for this review is used up")
+    assert docker.fake.calls == []
+    ok = BudgetedRunner(DockerRunner(command=docker, startup_grace_s=30), total_s=116.5,
+                        clock=clock)
+    ok.run(FILES, "tests/test_p.py", 60)
+    assert docker.fake.timeouts[2] == 1.5 + 10

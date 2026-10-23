@@ -194,10 +194,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     secret = os.environ.get("REVIEWHOUND_WEBHOOK_SECRET", "")
     if not secret:
         raise SystemExit("Set REVIEWHOUND_WEBHOOK_SECRET to the GitHub App webhook secret.")
+    owners_env = os.environ.get(ALLOWED_OWNERS_ENV, "")
+    if owners_env and allowed_owners_from(owners_env, []) is None:
+        # A set but empty allowlist is a mistake; read as "unset" it would accept every owner.
+        raise SystemExit(f"{ALLOWED_OWNERS_ENV} is set but names no owner ({owners_env!r}). "
+                         "List owners separated by commas, or unset it to accept every owner.")
     home = Path(args.home)
     queue = open_queue(home, args.database_url)
     metrics = open_metrics(home, args.database_url)
-    owners = allowed_owners_from(os.environ.get(ALLOWED_OWNERS_ENV, ""), args.allowed_owner)
+    owners = allowed_owners_from(owners_env, args.allowed_owner)
     server = make_server(queue, secret, args.host, args.port,
                          store=open_store(home, args.database_url),
                          app_id=os.environ.get("REVIEWHOUND_APP_ID") or None,

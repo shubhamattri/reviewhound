@@ -333,6 +333,7 @@ class DockerRunner:
     """
 
     name = "docker"
+    INFO_S, EXEC_SLACK_S, READ_S, RM_S = 15.0, 10.0, 15.0, 30.0
 
     def __init__(self, image: str = DEFAULT_IMAGE, docker: str = "docker",
                  command: CommandRunner = _run_command, startup_grace_s: float = 30.0) -> None:
@@ -341,9 +342,15 @@ class DockerRunner:
         self._cmd = command
         self.startup_grace_s = startup_grace_s
 
+    @property
+    def overhead_s(self) -> float:
+        """The most one run can take on top of the test timeout: info, start, exec slack, the two
+        read-backs and the rm."""
+        return self.INFO_S + self.startup_grace_s + self.EXEC_SLACK_S + 2 * self.READ_S + self.RM_S
+
     def _unavailable(self) -> str:
         try:
-            res = self._cmd([self.docker, "info", "--format", "{{.ServerVersion}}"], 15)
+            res = self._cmd([self.docker, "info", "--format", "{{.ServerVersion}}"], self.INFO_S)
         except OSError:
             return "docker unavailable: the docker CLI is not installed"
         except subprocess.TimeoutExpired:
@@ -390,7 +397,7 @@ class DockerRunner:
                                  + (res.stderr or "").strip()[-300:])
             try:
                 res = self._cmd([self.docker, "exec", name, "sh", "-c", _DOCKER_SCRIPT, "sh",
-                                 test_path], timeout_s + 10)
+                                 test_path], timeout_s + self.EXEC_SLACK_S)
             except subprocess.TimeoutExpired:
                 return RunResult(None, None, timed_out=True)
             except OSError as exc:
@@ -408,7 +415,7 @@ class DockerRunner:
         """At most `limit` bytes of a file inside the container, with how the read went."""
         try:
             res = self._cmd([self.docker, "exec", name, "sh", "-c", _READ_SCRIPT, "sh", path,
-                             str(limit), mode], 15)
+                             str(limit), mode], self.READ_S)
         except (OSError, subprocess.TimeoutExpired) as exc:
             log.warning("could not read proof output", extra={"container": name, "path": path,
                                                               "error": type(exc).__name__})
@@ -421,7 +428,7 @@ class DockerRunner:
 
     def _remove(self, name: str) -> None:
         try:
-            res = self._cmd([self.docker, "rm", "-f", name], 30)
+            res = self._cmd([self.docker, "rm", "-f", name], self.RM_S)
         except (OSError, subprocess.TimeoutExpired) as exc:
             log.warning("could not remove proof container",
                         extra={"container": name, "error": type(exc).__name__})
@@ -455,8 +462,12 @@ class BudgetedRunner:
     def remaining(self) -> float:
         return max(0.0, self.total_s - self._spent)
 
+    def _test_s(self) -> float:
+        """Time the next test may take so the whole run, runner overhead included, fits."""
+        return self.remaining() - float(getattr(self.inner, "overhead_s", 0.0))
+
     def exhausted(self) -> bool:
-        return self.remaining() < 1.0
+        return self._test_s() < 1.0
 
     def refusal(self) -> str:
         return f"proof time budget of {self.total_s:g}s for this review is used up"
@@ -466,7 +477,7 @@ class BudgetedRunner:
             return RunResult(None, None, error=self.refusal())
         start = self._clock()
         try:
-            return self.inner.run(files, test_path, min(timeout_s, self.remaining()))
+            return self.inner.run(files, test_path, min(timeout_s, self._test_s()))
         finally:
             self._spent += self._clock() - start
 

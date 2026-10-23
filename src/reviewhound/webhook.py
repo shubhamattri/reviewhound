@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import os
+import time
 from collections.abc import Callable, Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -19,6 +20,7 @@ log = logging.getLogger(__name__)
 PR_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 MAX_BODY = 5 * 1024 * 1024
 READ_TIMEOUT_S = 10.0
+BODY_DEADLINE_S = 30.0
 METRICS_TOKEN_ENV = "REVIEWHOUND_METRICS_TOKEN"
 ALLOWED_OWNERS_ENV = "REVIEWHOUND_ALLOWED_OWNERS"
 
@@ -86,7 +88,8 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int,
                 metrics: Callable[[], str] | None = None,
                 metrics_token: str | None = None,
                 allowed_owners: frozenset[str] | None = None,
-                read_timeout_s: float = READ_TIMEOUT_S) -> ThreadingHTTPServer:
+                read_timeout_s: float = READ_TIMEOUT_S,
+                body_deadline_s: float = BODY_DEADLINE_S) -> ThreadingHTTPServer:
     """`metrics_token` None reads REVIEWHOUND_METRICS_TOKEN; empty leaves /metrics open."""
     if not secret:
         raise ValueError("webhook secret is required")
@@ -146,7 +149,13 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int,
             if length <= 0 or length > MAX_BODY:
                 self._reply(413 if length > MAX_BODY else 400, "bad body length")
                 return
-            body = self.rfile.read(length)
+            body = self._read_body(length)
+            if body is None:
+                log.warning("webhook body not received within the deadline",
+                            extra={"deadline_s": body_deadline_s, "length": length})
+                self.close_connection = True
+                self._reply(408, "body not received in time")
+                return
             if not verify_signature(secret, body, self.headers.get("X-Hub-Signature-256")):
                 self._reply(401, "bad signature")
                 return
@@ -160,6 +169,29 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int,
                                            store, app_id, hashlib.sha256(body).hexdigest(),
                                            allowed_owners)
             self._reply(status, message)
+
+        def _read_body(self, length: int) -> bytes | None:
+            """`length` bytes, or None once `body_deadline_s` has passed, however the client
+            paces its bytes. A stall longer than the per-read timeout still raises TimeoutError."""
+            deadline = time.monotonic() + body_deadline_s
+            chunks: list[bytes] = []
+            got = 0
+            while got < length:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.connection.settimeout(min(read_timeout_s, left))
+                try:
+                    chunk = self.rfile.read1(min(65_536, length - got))
+                except TimeoutError:
+                    if time.monotonic() >= deadline:
+                        return None
+                    raise
+                if not chunk:
+                    break  # the client hung up: a short body fails the signature check
+                chunks.append(chunk)
+                got += len(chunk)
+            return b"".join(chunks)
 
         def log_message(self, format: str, *args: Any) -> None:
             log.debug("http " + format, *args)
