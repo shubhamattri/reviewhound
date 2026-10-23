@@ -1,5 +1,7 @@
 # Reviewhound
 
+[![ci](https://github.com/shubhamattri/reviewhound/actions/workflows/ci.yml/badge.svg)](https://github.com/shubhamattri/reviewhound/actions/workflows/ci.yml)
+
 A pull-request reviewer that developers can trust. The model proposes findings; code checks
 every one of them before anything is posted. It measures its own precision on a replay set.
 
@@ -38,7 +40,7 @@ it is reviewed.
 
 ```bash
 uv sync
-uv run pytest -q                      # 89 tests, no network
+uv run pytest -q                      # no network needed
 uv run reviewhound eval               # replay recorded answers: precision / recall
 uv run reviewhound eval --no-checker  # same, with the claim checker switched off
 uv run reviewhound eval --live        # ask the real model (uses `claude -p`, your subscription)
@@ -87,6 +89,10 @@ Unknown keys or bad values fail the review loudly instead of being guessed.
 bugs, two clean PRs, expected findings, and a recorded model answer that includes deliberate
 hallucinations (invented helpers, quotes that do not exist, bugs in unchanged code, false
 "missing guard" claims). Any prompt or checker change must not lower precision on this set.
+
+## Contributing and roadmap
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md). Licensed under Apache-2.0.
 
 ## Not in milestone 1
 
