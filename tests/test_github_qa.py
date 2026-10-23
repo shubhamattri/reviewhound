@@ -168,3 +168,18 @@ def test_qa_result_passes_only_when_every_check_passes() -> None:
     assert r.passed is True
     r.checks.append(github_qa.Check("c", False))
     assert r.passed is False
+
+
+@pytest.mark.parametrize("content, user", [
+    ('{"cookies": [{"name": "logged_in", "value": "yes"}, {"name": "dotcom_user", "value": "me"}]}',
+     "me"),
+    ('{"cookies": [{"name": "logged_in", "value": "no"}, {"name": "dotcom_user", "value": "me"}]}',
+     ""),
+    ('{"cookies": [{"name": "logged_in", "value": "yes"}]}', ""),
+    ("not json", ""),
+])
+def test_saved_login_must_be_signed_in(tmp_path: Path, content: str, user: str) -> None:
+    f = tmp_path / "state.json"
+    f.write_text(content)
+    assert github_qa.saved_login_user(f) == user
+    assert github_qa.saved_login_user(tmp_path / "missing.json") == ""

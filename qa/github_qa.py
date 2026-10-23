@@ -23,9 +23,17 @@ import httpx
 
 QA_HOME = Path.home() / ".reviewhound" / "qa"
 SUMMARY_PREFIX = "Reviewhound ("
-LOGIN_HELP = ("No saved GitHub login for Playwright. Run once, log in, then close the window:\n"
-              f"  uv run playwright open --save-storage={QA_HOME}/github-state.json "
-              "https://github.com/login")
+LOGIN_HELP = ("No saved GitHub login for Playwright. Run this once and log in:\n"
+              "  uv run python -m qa.login")
+
+
+def saved_login_user(state_file: Path) -> str:
+    """The GitHub user in a saved browser login, or "" when it is missing or signed out."""
+    try:
+        cookies = {c["name"]: c["value"] for c in json.loads(state_file.read_text())["cookies"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return ""
+    return cookies.get("dotcom_user", "") if cookies.get("logged_in") == "yes" else ""
 
 
 @dataclass
@@ -269,7 +277,7 @@ def main() -> int:
     ap.add_argument("--keep-pr", action="store_true", help="leave the QA PR open")
     args = ap.parse_args()
 
-    if not (QA_HOME / "github-state.json").exists():
+    if not saved_login_user(QA_HOME / "github-state.json"):
         sys.exit(LOGIN_HELP)
     out = QA_HOME / "runs" / f"{args.milestone}-{time.strftime('%Y%m%d-%H%M%S')}"
     out.mkdir(parents=True)
