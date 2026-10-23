@@ -295,7 +295,8 @@ class Reviewer:
         done = self._finish(result, t, posted,
                             [(f, r) for f, r in decision.held if r != "duplicate"], stored)
         if done.outcome == "post-uncertain":
-            log.warning("post outcome uncertain; comments not linked, verdicts not dismissed",
+            # Findings stay `stored`: the retry asks GitHub first and adopts or posts.
+            log.warning("post outcome uncertain; the job retries and checks GitHub first",
                         extra={"pr": number, "head": pr.head_sha})
         if done.outcome in ("posted", "recovered") and self.store is not None:
             after_post(self.vcs, self.store, done, cfg.policy)
@@ -530,7 +531,7 @@ class Reviewer:
                          event=result.posted_event or (result.review.event if result.review
                                                        else ""),
                          # An uncertain post may have landed: never risk posting it twice.
-                         posted=result.outcome in ("posted", "post-uncertain", "recovered"),
+                         posted=result.outcome in ("posted", "recovered"),
                          post_id=result.post_id, cost_usd=result.cost_usd,
                          timings=t.timings, error=result.error),
             posted, held, result.blockers, stored)

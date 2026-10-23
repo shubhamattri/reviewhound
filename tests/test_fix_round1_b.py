@@ -470,7 +470,7 @@ def test_retry_that_times_out_is_uncertain_and_keeps_the_claim(
     result = reviewer.review("acme/shop", 7, dry_run=False)
     assert (result.outcome, result.error) == ("post-uncertain", "TimeoutError")
     assert [(r["outcome"], r["posted"]) for r in store.reviews("acme/shop", 7)] == [
-        ("post-uncertain", 1)]
+        ("post-uncertain", 0)]
     assert store.claim_post("acme/shop", 7, "h1") is False
 
 
@@ -500,7 +500,7 @@ def test_uncertain_post_skips_linking_and_says_so(backend: Backend,
     caplog.set_level(logging.WARNING, logger="reviewhound.pipeline")
     assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "post-uncertain"
     assert [(r.msg, r.pr, r.head) for r in caplog.records] == [  # type: ignore[attr-defined]
-        ("post outcome uncertain; comments not linked, verdicts not dismissed", 7, "h1")]
+        ("post outcome uncertain; the job retries and checks GitHub first", 7, "h1")]
     assert store.linked_findings("acme/shop", [1001]) == {}
 
 

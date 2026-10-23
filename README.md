@@ -147,7 +147,7 @@ TypeScript proofs are not built yet (next: a vitest or jest runner behind the sa
 
 ## Evals
 
-`evals/build_cases.py` writes `evals/cases/*`: 34 small PRs (Python, TypeScript, JavaScript, Go
+`evals/build_cases.py` writes `evals/cases/*`: 36 small PRs (Python, TypeScript, JavaScript, Go
 and one Ruby file) with seeded bugs, six clean PRs, expected findings, and a recorded model
 answer that includes deliberate hallucinations (invented helpers, `Owner.member` names that do
 not exist, quotes that do not exist, bugs in unchanged code, false "missing guard" claims). Two
@@ -164,9 +164,12 @@ proof verdict differs from `expected_proofs`.
   cases. That is a regression test for the checker, **not** the tool's accuracy: the recorded
   answers were written with the seeded bugs in mind.
 - **Live eval** (`reviewhound eval --live`): asks the real model on the same cases, so it
-  measures model plus checker. This is the number to quote.
+  measures model plus checker. It is closer to real use, but read it with care: the cases were
+  written by the same people who tuned the checker, there are only 30 planted bugs, and results
+  vary between runs. It is a smoke test, not an independent benchmark.
 
-  Live eval on 2026-10-24 (real model through `claude -p`, checker on, 36 cases): precision 1.00, recall 0.97 (29 of 30 planted bugs; the miss was a JavaScript loop that skips its first row, which the model did not report), about $0.018 per PR. Two proof cases were skipped because no Docker sandbox was available. Live results vary from run to run; runs during development scored recall between 0.86 and 1.00 as the checker changed.
+  Live eval on 2026-10-24 at commit ee526ac (real model through `claude -p`, checker on, 36
+  cases; raw output in `docs/evals/live-2026-10-24-ee526ac.txt`): precision 1.00, recall 0.97 (29 of 30 planted bugs; the miss was a JavaScript loop that skips its first row, which the model did not report), about $0.018 per PR. Two proof cases were skipped because no Docker sandbox was available. Live results vary from run to run; runs during development scored recall between 0.86 and 1.00 as the checker changed.
 
 ### Alternative fair anchors
 
@@ -256,13 +259,16 @@ timestamps) for a real second resolve, so this needs a manual redelivery to happ
 
 Known gaps that remain after fix round 4, in plain words:
 
-- **An uncertain post is not chased.** A POST that times out or gets a 5xx is recorded as
-  `post-uncertain`, its findings as posted, and the job ends. If it did not land, that head has
-  no review until the next push.
+- **An uncertain post is retried slowly.** A POST that times out or gets a 5xx is recorded as
+  `post-uncertain` with its findings `stored`, not posted, and the job goes back to the queue.
+  The retry asks GitHub first and adopts the review if it landed, or posts it if it did not. While
+  the first claim is still fresh the retry waits, so this can take up to one queue lease (30
+  minutes by default), and a run that keeps failing ends in the dead-job list.
 - **The GitHub check trusts what GitHub lists.** If GitHub accepted a review but does not list
   it yet, a run that took over a stale claim could post a second one.
-- **Unknown account.** When the token cannot say which account it is (`GET /user` failed), any
-  author's review of this head whose body starts with "Reviewhound (" counts as ours.
+- **Unknown account.** When the token cannot say which account it is (`GET /user` failed), no
+  existing review is adopted, because anyone can start a review with "Reviewhound (". A crash
+  right after a POST can then lead to a duplicate review on that head, never a silenced one.
 - **A stalled worker.** If a worker freezes for longer than one queue lease and then wakes right
   before its POST, another run may already have taken over its claim; both could post.
 - **A busy claim uses up attempts.** Each `claim-busy` retry counts as an attempt; with a very
@@ -296,6 +302,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md). Licensed un
 - Feedback from GitHub events and App installation tokens: done in milestone 3, see
   "Install as a GitHub App".
 - Comments on deleted lines: done in milestone 5 (posted on the LEFT side).
-- A post that times out is recorded as `post-uncertain` and not retried, so it may be missing
-  or present on GitHub; nothing posts it twice automatically. A later run for that head checks
-  GitHub first and adopts the review if it is there.
+- A post that times out is recorded as `post-uncertain` and retried; see "Open risks".

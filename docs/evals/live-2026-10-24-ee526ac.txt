@@ -1,0 +1,39 @@
+case                                   exp rep  tp drop  notes
+01-py-missing-auth-guard                 1   1   1    0  
+02-py-off-by-one                         1   1   1    0  
+03-py-sql-string-join                    1   1   1    0  
+04-py-none-dereference                   1   1   1    0  
+05-py-committed-secret                   1   1   1    0  
+06-py-personal-data-in-logs              1   1   1    0  
+07-py-swallowed-payment-error            1   1   1    0  
+08-ts-missing-await                      1   1   1    0  
+09-ts-assignment-in-condition            1   1   1    0  
+10-ts-loop-bound                         1   1   1    0  
+11-ts-clean-change-hallucinations        0   0   0    0  
+12-py-clean-refactor                     0   0   0    0  
+13-js-unawaited-insert                   1   1   1    0  
+14-js-loop-skips-first-row               1   0   0    0  miss src/report.js:7
+15-js-unescaped-html                     1   1   1    0  
+16-js-route-without-admin-check          1   1   1    0  
+17-js-map-callback-returns-nothing       1   1   1    0  
+18-js-two-secrets-same-shape             2   2   2    0  
+19-go-ignored-unmarshal-error            1   1   1    0  
+20-go-lock-held-on-early-return          1   1   1    0  
+21-go-index-out-of-range                 1   1   1    0  
+22-go-sql-string-join                    1   1   1    0  
+23-go-handler-without-admin-check        1   1   1    0  
+24-go-response-body-not-closed           1   1   1    0  
+25-js-clean-rename-hallucinations        0   0   0    0  
+26-go-clean-helper-hallucinations        0   0   0    0  
+27-py-clean-dotted-symbol-trap           0   0   0    0  
+28-ts-clean-dotted-member-trap           0   0   0    0  
+29-py-removed-role-check                 1   1   1    0  
+30-py-quote-spans-blank-line             1   1   1    0  
+31-rb-finding-in-unindexed-language      1   1   1    0  
+32-go-removed-deferred-unlock            1   1   1    0  
+33-py-proof-proven-discount              1   1   1    0  proof pricing.py:3 skipped (no sandbox)
+34-py-proof-not-reproduced               0   0   0    0  proof clamp.py:3 skipped (no sandbox)
+35-py-removed-role-check-quoted-around   1   1   1    0  
+36-go-removed-unlock-quoted-around       1   1   1    0  
+
+cases: 36  precision: 1.00  recall: 0.97  dropped by claim checker: 0  cost per PR: $0.0182

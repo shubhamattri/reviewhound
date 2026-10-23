@@ -47,3 +47,20 @@ def test_worker_retries_model_outage_and_kills_config_errors(tmp_path: Path) -> 
     run_one(q, Reviewer(bad, ProviderRegistry([FakeProvider([])]), [], None))
     dead = q.get(job.id)
     assert dead is not None and dead.state == "dead"
+
+
+def test_uncertain_post_sends_the_job_back_instead_of_finishing_it(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    q = SQLiteQueue(tmp_path / "q.db")
+    q.enqueue("acme/shop", 7, "h1")
+    uncertain = SimpleNamespace(outcome="post-uncertain", error="TimeoutError", timings={},
+                                cost_usd=0.0, retry_after_s=None)
+
+    class Stub:
+        def review(self, *a: object, **kw: object) -> object:
+            return uncertain
+    job = run_one(q, Stub())  # type: ignore[arg-type]
+    assert job is not None
+    after = q.get(job.id)
+    assert after is not None and after.state == "queued"
+    assert after.last_error == "post-uncertain: TimeoutError"

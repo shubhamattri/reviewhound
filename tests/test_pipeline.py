@@ -130,7 +130,7 @@ def test_post_failure_is_recorded_as_uncertain(tmp_path: Path) -> None:
     result = reviewer.review("acme/shop", 7, dry_run=False)
     assert (result.outcome, result.error) == ("post-uncertain", "TimeoutError")
     assert [(r["outcome"], r["posted"]) for r in store.reviews("acme/shop", 7)] == [
-        ("post-uncertain", 1)]
+        ("post-uncertain", 0)]
 
 
 def test_language_turned_off_in_config_gives_unknown_claims_not_dropped_findings() -> None:
@@ -180,7 +180,7 @@ def test_second_worker_on_same_head_does_not_post_again(tmp_path: Path) -> None:
     assert vcs.posted == []
 
 
-def test_uncertain_post_is_remembered_as_posted_so_it_is_never_doubled(tmp_path: Path) -> None:
+def test_uncertain_post_that_never_landed_is_raised_again_not_suppressed(tmp_path: Path) -> None:
     vcs, reviewer, store = setup([answer(REAL), answer(REAL)], posting=True, tmp_path=tmp_path)
     real_post = vcs.post_review
 
@@ -188,12 +188,12 @@ def test_uncertain_post_is_remembered_as_posted_so_it_is_never_doubled(tmp_path:
         raise TimeoutError("socket")
     vcs.post_review = boom  # type: ignore[method-assign]
     assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "post-uncertain"
-    assert [f["state"] for f in store.findings("acme/shop", 7)] == ["posted"]
+    assert [f["state"] for f in store.findings("acme/shop", 7)] == ["stored"]
     vcs.post_review = real_post  # type: ignore[method-assign]
     vcs.pr = make_pr(head="h2")
     vcs.head_sha_now = "h2"
     reviewer.review("acme/shop", 7, dry_run=False)
-    assert [len(p.comments) for p in vcs.posted] == [0]
+    assert [len(p.comments) for p in vcs.posted] == [1]
 
 
 def test_github_refusal_is_rejected_not_uncertain_and_frees_the_head(tmp_path: Path) -> None:

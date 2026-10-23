@@ -73,6 +73,9 @@ def _fail(queue: WorkerQueue, job: Job, error: str, retryable: bool, kind: str,
         log.error("job failed", extra={"job": job.id, "error": kind, "new_state": state})
 
 
+POST_UNCERTAIN_RETRY_S = 60.0
+
+
 def run_one(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
             metrics: MetricsLog | None = None,
             max_job_seconds: float = DEFAULT_MAX_JOB_SECONDS) -> Job | None:
@@ -100,6 +103,12 @@ def run_one(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
         # Another run may still post this head: look again once its claim can be taken over.
         _fail(queue, job, f"claim-busy: {result.error}", True, "ClaimBusy",
               delay_s=result.retry_after_s)
+        _record(metrics, review_increments(result.outcome, result.timings, result.cost_usd), job)
+        return job
+    if result.outcome == "post-uncertain":
+        # It may or may not have landed: never call it done. The retry checks GitHub first.
+        _fail(queue, job, f"post-uncertain: {result.error}", True, "PostUncertain",
+              delay_s=POST_UNCERTAIN_RETRY_S)
         _record(metrics, review_increments(result.outcome, result.timings, result.cost_usd), job)
         return job
     if result.outcome == "post-rejected":
