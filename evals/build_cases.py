@@ -1078,6 +1078,46 @@ export function percent(ratio: number): string {
         "expected_proofs": [{"file": "clamp.py", "anchor": "return max(low",
                              "proof": "not_proven"}],
     },
+    # Cases 29 and 32 again, with the answers a live model gave: it quoted the code that
+    # survived around the deleted guard instead of the deleted line.
+    {
+        "name": "35-py-removed-role-check-quoted-around",
+        "base": {"app/orders.py": PY_ORDERS_BASE, "app/auth.py": AUTH_LIB},
+        "head": {"app/orders.py": PY_ORDERS_BASE.replace(
+            '    require_role(request, "support")\n', ""), "app/auth.py": AUTH_LIB},
+        "expected": [{"file": "app/orders.py", "anchor": "orders.cancel(order_id)",
+                      "category": "auth"}],
+        "recorded": [
+            {"file": "app/orders.py", "anchor": "orders.cancel(order_id)", "severity": "blocker",
+             "category": "auth", "title": "Role check removed from cancel_order",
+             "body": "Any signed-in user can now cancel any order.",
+             "evidence_quote": '    orders.cancel(order_id)\n    return {"ok": True}',
+             "claims": [{"kind": "not_calls", "caller": "cancel_order",
+                         "callee": "require_role"}]},
+            {"file": "app/orders.py", "anchor": "from app.auth import", "severity": "minor",
+             "category": "maintainability", "title": "require_role is imported but unused",
+             "body": "Drop the import.", "evidence_quote": "from app.auth import require_role",
+             "claims": []},
+        ],
+    },
+    {
+        "name": "36-go-removed-unlock-quoted-around",
+        "base": {"cache/cache.go": GO_CACHE_BASE},
+        "head": {"cache/cache.go": GO_CACHE_BASE.replace("\tdefer c.mu.Unlock()\n", "")},
+        "expected": [{"file": "cache/cache.go", "anchor": "c.mu.Lock()",
+                      "category": "concurrency"}],
+        "recorded": [
+            {"file": "cache/cache.go", "anchor": "c.mu.Lock()", "severity": "blocker",
+             "category": "concurrency", "title": "Set no longer releases the mutex",
+             "body": "With the deferred Unlock gone, the second Set deadlocks.",
+             "evidence_quote": "c.mu.Lock()\n\tc.data[k] = v\n}",
+             "claims": [{"kind": "not_calls", "caller": "Cache.Set", "callee": "Unlock"}]},
+            {"file": "cache/cache.go", "anchor": "type Cache struct", "severity": "major",
+             "category": "concurrency", "title": "Cache has no constructor",
+             "body": "A zero Cache has a nil map.", "evidence_quote": "type Cache struct {",
+             "claims": []},
+        ],
+    },
 ]
 
 

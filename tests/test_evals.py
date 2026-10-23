@@ -24,14 +24,14 @@ def test_score_requires_the_same_side() -> None:
 
 def test_recorded_eval_set_scores_and_checker_earns_its_keep() -> None:
     with_checker = run_eval(CASES)
-    assert len(with_checker.cases) == 34
-    assert sum(c.expected for c in with_checker.cases) == 28
+    assert len(with_checker.cases) == 36
+    assert sum(c.expected for c in with_checker.cases) == 30
     assert (round(with_checker.precision, 2), round(with_checker.recall, 2)) == (1.0, 1.0)
-    assert sum(c.dropped_by_checker for c in with_checker.cases) == 32
+    assert sum(c.dropped_by_checker for c in with_checker.cases) == 34
     assert [c.error for c in with_checker.cases if c.error] == []
     baseline = run_eval(CASES, verify=False)
     assert (sum(c.reported for c in baseline.cases),
-            sum(c.true_positives for c in baseline.cases)) == (54, 26)
+            sum(c.true_positives for c in baseline.cases)) == (58, 28)
     assert round(baseline.precision, 2) == 0.48
 
 
@@ -49,10 +49,12 @@ def test_eval_set_covers_each_language_and_trap_kind() -> None:
     names = sorted(p.name for p in CASES.iterdir() if (p / "case.json").exists())
     seeded = {lang: [n for n in names if f"-{lang}-" in n and "clean" not in n]
               for lang in ("js", "go")}
-    assert (len(seeded["js"]), len(seeded["go"])) == (6, 7)
+    assert (len(seeded["js"]), len(seeded["go"])) == (6, 8)
     assert len([n for n in names if "clean" in n]) == 6
     assert {"18-js-two-secrets-same-shape", "29-py-removed-role-check",
-            "32-go-removed-deferred-unlock", "27-py-clean-dotted-symbol-trap"} <= set(names)
+            "32-go-removed-deferred-unlock", "27-py-clean-dotted-symbol-trap",
+            "35-py-removed-role-check-quoted-around",
+            "36-go-removed-unlock-quoted-around"} <= set(names)
 
 
 def test_proof_eval_cases_prove_the_real_bug_and_hold_the_unreproduced_blocker() -> None:

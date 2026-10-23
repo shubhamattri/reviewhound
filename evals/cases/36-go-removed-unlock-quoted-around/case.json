@@ -1,0 +1,40 @@
+{
+  "title": "36-go-removed-unlock-quoted-around",
+  "expected": [
+    {
+      "file": "cache/cache.go",
+      "line": 11,
+      "category": "concurrency"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "cache/cache.go",
+        "severity": "blocker",
+        "category": "concurrency",
+        "title": "Set no longer releases the mutex",
+        "body": "With the deferred Unlock gone, the second Set deadlocks.",
+        "evidence_quote": "c.mu.Lock()\n\tc.data[k] = v\n}",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "Cache.Set",
+            "callee": "Unlock"
+          }
+        ],
+        "line": 11
+      },
+      {
+        "file": "cache/cache.go",
+        "severity": "major",
+        "category": "concurrency",
+        "title": "Cache has no constructor",
+        "body": "A zero Cache has a nil map.",
+        "evidence_quote": "type Cache struct {",
+        "claims": [],
+        "line": 5
+      }
+    ]
+  }
+}

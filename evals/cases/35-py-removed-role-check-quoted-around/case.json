@@ -1,0 +1,40 @@
+{
+  "title": "35-py-removed-role-check-quoted-around",
+  "expected": [
+    {
+      "file": "app/orders.py",
+      "line": 5,
+      "category": "auth"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "app/orders.py",
+        "severity": "blocker",
+        "category": "auth",
+        "title": "Role check removed from cancel_order",
+        "body": "Any signed-in user can now cancel any order.",
+        "evidence_quote": "    orders.cancel(order_id)\n    return {\"ok\": True}",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "cancel_order",
+            "callee": "require_role"
+          }
+        ],
+        "line": 5
+      },
+      {
+        "file": "app/orders.py",
+        "severity": "minor",
+        "category": "maintainability",
+        "title": "require_role is imported but unused",
+        "body": "Drop the import.",
+        "evidence_quote": "from app.auth import require_role",
+        "claims": [],
+        "line": 1
+      }
+    ]
+  }
+}

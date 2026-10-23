@@ -17,6 +17,7 @@ class Hunk:
     old_start: int = 0
     deleted: list[int] = field(default_factory=list)  # base-side line numbers
     deleted_text: dict[int, str] = field(default_factory=dict)
+    deleted_at: list[int] = field(default_factory=list)  # head line after each run deleting code
 
 
 @dataclass
@@ -99,6 +100,11 @@ def parse_patch(path: str, patch: str, status: str = "modified",
             continue
         if hunk is None or raw.startswith("\\"):
             continue
+        if raw.startswith("-") and raw[1:].strip():
+            # "+N,0" names the line before an empty head range, so the deletion follows it.
+            at = new_line if hunk.new_count else hunk.new_start + 1
+            if not hunk.deleted_at or hunk.deleted_at[-1] != at:
+                hunk.deleted_at.append(at)
         if raw.startswith("+"):
             hunk.added.append(new_line)
             new_line += 1

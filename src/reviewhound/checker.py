@@ -109,6 +109,32 @@ class ClaimChecker:
             return None, f"base version of {f.file} does not match the diff"
         return None, "evidence quote is only in code this PR did not change"
 
+    def _locate_beside_deletion(self, f: Finding, fd: FileDiff,
+                                quote_spans: list[tuple[int, int]], src: str) -> int | None:
+        """A context line of a quote that sits right next to lines this PR deleted, or None.
+
+        Every quoted line must be context in a hunk that deletes, and only blank lines, at
+        most `snap_distance` of them, may separate the quote from the deleted run.
+        """
+        lines = src.splitlines()
+        best: tuple[int, int, int] | None = None
+        for h in fd.hunks:
+            context = set(h.context)
+            for gap in h.deleted_at:  # the deleted run sat just before head line `gap`
+                for start, end in quote_spans:
+                    if not all(n in context for n in range(start, end + 1)):
+                        continue
+                    between = range(end + 1, gap) if end < gap else range(gap, start)
+                    if len(between) > self.snap_distance or \
+                            any(lines[n - 1].strip() for n in between):
+                        continue
+                    for n in range(start, end + 1):
+                        if lines[n - 1].strip():
+                            away = gap - 1 - n if n < gap else n - gap
+                            key = (away, abs(n - f.line), n)
+                            best = key if best is None or key < best else best
+        return None if best is None else best[2]
+
     def _uncovered(self, claim: Claim, path: str) -> ClaimResult:
         return ClaimResult(claim, "unknown", f"{path} is not in a language the index covers")
 
@@ -217,6 +243,7 @@ class ClaimChecker:
         line: int | None = None
         how = ""
         has_evidence = bool(quote_spans)
+        beside_deletion = False
         if quote_spans or not f.evidence_quote:
             line, how = self._locate(f, quote_spans, src)
         if line is None and f.evidence_quote:
@@ -227,9 +254,15 @@ class ClaimChecker:
                 f.side = "LEFT"
             elif not quote_spans:
                 how = left_how
+            else:
+                # A removed guard is often quoted by the code that survived around it.
+                beside = self._locate_beside_deletion(f, fd, quote_spans, src)
+                if beside is not None:
+                    line, beside_deletion = beside, True
+                    how = f"anchored on context line {beside}, next to lines this PR deleted"
         if line is None:
             return f, how
-        if line != f.line or f.side == "LEFT":
+        if line != f.line or f.side == "LEFT" or beside_deletion:
             f.notes.append(how)
             f.line = line
 

@@ -69,3 +69,12 @@ rename to b.py
     assert d.changed_paths == ["new.py", "b.py"]
     assert d.added_line_count() == 3
     assert d.removed_line_count() == 2
+
+
+def test_parse_patch_records_the_head_line_after_each_deleted_run() -> None:
+    patch = "@@ -4,6 +4,4 @@\n a\n-b\n-c\n d\n+D\n-e\n f\n@@ -20 +18,0 @@\n-z\n"
+    fd = parse_patch("f.py", patch)
+    assert [h.deleted_at for h in fd.hunks] == [[5, 7], [19]]
+    assert [h.deleted_at for h in parse_patch("f.py", PATCH).hunks] == [[2], []]
+    blank_runs = "@@ -1,6 +1,4 @@\n a\n-\n b\n-   \n-c\n d\n"
+    assert parse_patch("f.py", blank_runs).hunks[0].deleted_at == [3]

@@ -1,3 +1,5 @@
+import difflib
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -334,3 +336,104 @@ def test_trivial_quote_counts_as_no_evidence() -> None:
     assert reason is None
     assert f.verified is False
     assert f.severity is Severity.MINOR
+
+
+# Live answers (eval cases 29 and 32): the model quoted the code around a deleted guard.
+EVAL_CASES = Path(__file__).parent.parent / "evals" / "cases"
+BESIDE = "anchored on context line {}, next to lines this PR deleted"
+ONLY_UNCHANGED = "evidence quote is only in code this PR did not change"
+
+
+def case_checker(name: str, path: str, with_base: bool = True) -> ClaimChecker:
+    base = {path: (EVAL_CASES / name / "base" / path).read_text()}
+    head = {path: (EVAL_CASES / name / "head" / path).read_text()}
+    return ClaimChecker(diff_file_maps(base, head), CodeIndex.build(head),
+                        base_reader=base.get if with_base else None)
+
+
+def test_live_answer_quoting_code_after_a_removed_role_check_is_kept_beside_it() -> None:
+    c = case_checker("29-py-removed-role-check", "app/orders.py")
+    f, reason = c.check(mf(file="app/orders.py", line=5, severity="blocker",
+                           evidence_quote='    orders.cancel(order_id)\n    return {"ok": True}'),
+                        "m")
+    assert (reason, f.side, f.line, f.verified) == (None, "RIGHT", 5, True)
+    assert f.notes == [BESIDE.format(5)]
+
+
+def test_live_answer_quoting_code_around_a_removed_unlock_is_kept_beside_it() -> None:
+    c = case_checker("32-go-removed-deferred-unlock", "cache/cache.go")
+    f, reason = c.check(mf(file="cache/cache.go", line=11, severity="blocker",
+                           evidence_quote="c.mu.Lock()\n\tc.data[k] = v\n}"), "m")
+    assert (reason, f.side, f.line, f.verified) == (None, "RIGHT", 11, True)
+    assert f.notes == [BESIDE.format(11)]
+
+
+def test_quote_beside_a_deletion_anchors_on_the_line_nearest_the_gap() -> None:
+    c = case_checker("32-go-removed-deferred-unlock", "cache/cache.go")
+    f, reason = c.check(mf(file="cache/cache.go", line=13, evidence_quote="c.data[k] = v\n}"),
+                        "m")
+    assert (reason, f.side, f.line) == (None, "RIGHT", 12)
+    assert f.notes == [BESIDE.format(12)]
+
+
+def test_beside_a_deletion_needs_no_base_reader() -> None:
+    c = case_checker("29-py-removed-role-check", "app/orders.py", with_base=False)
+    f, reason = c.check(mf(file="app/orders.py", line=4, evidence_quote="orders.cancel(order_id)"),
+                        "m")
+    assert (reason, f.side, f.line) == (None, "RIGHT", 5)
+
+
+def wide_checker(base: str, head: str, context: int) -> ClaimChecker:
+    body = difflib.unified_diff(base.splitlines(), head.splitlines(), fromfile="a/w.py",
+                                tofile="b/w.py", lineterm="", n=context)
+    diff = parse_unified_diff("\n".join(["diff --git a/w.py b/w.py", *body]) + "\n")
+    return ClaimChecker(diff, CodeIndex.build({"w.py": head}), base_reader={"w.py": base}.get)
+
+
+SPREAD = "".join(f"value_{i} = {i}\n" for i in range(1, 15))
+
+
+def test_quote_of_unchanged_code_ten_lines_from_the_deletion_is_dropped() -> None:
+    c = wide_checker(SPREAD, SPREAD.replace("value_3 = 3\n", ""), context=3)
+    _, reason = c.check(mf(file="w.py", line=12, evidence_quote="value_13 = 13"), "m")
+    assert reason == ONLY_UNCHANGED
+
+
+@pytest.mark.parametrize("blanks, reason", [(3, None), (4, ONLY_UNCHANGED),
+                                            (10, ONLY_UNCHANGED)])
+def test_only_blank_lines_within_snap_distance_may_separate_quote_and_deletion(
+        blanks: int, reason: str | None) -> None:
+    base = "first = 1\nguard_call()\n" + "\n" * blanks + "after_blank = 2\n"
+    c = wide_checker(base, base.replace("guard_call()\n", ""), context=15)
+    f, got = c.check(mf(file="w.py", line=2, evidence_quote="after_blank = 2"), "m")
+    assert got == reason
+    if reason is None:
+        assert (f.side, f.line, f.notes) == ("RIGHT", 2 + blanks, [BESIDE.format(2 + blanks)])
+
+
+def test_code_between_the_quote_and_the_deletion_drops_it() -> None:
+    _, reason = del_checker().check(mf(file="h.py", line=3, evidence_quote="db.delete(uid)"), "m")
+    assert reason == ONLY_UNCHANGED
+
+
+def test_quote_next_to_an_addition_only_hunk_is_dropped() -> None:
+    base = "first = 1\nsecond = 2\nthird = 3\n"
+    c = wide_checker(base, "first = 1\nsecond = 2\nadded = 9\nthird = 3\n", context=3)
+    _, reason = c.check(mf(file="w.py", line=2, evidence_quote="second = 2"), "m")
+    assert reason == ONLY_UNCHANGED
+
+
+def test_quote_running_past_the_hunk_context_is_dropped() -> None:
+    c = wide_checker(SPREAD, SPREAD.replace("value_3 = 3\n", ""), context=3)
+    in_hunk = "value_4 = 4\nvalue_5 = 5\nvalue_6 = 6"
+    _, reason = c.check(mf(file="w.py", line=3, evidence_quote=in_hunk), "m")
+    assert reason is None
+    _, reason = c.check(mf(file="w.py", line=3, evidence_quote=in_hunk + "\nvalue_7 = 7"), "m")
+    assert reason == ONLY_UNCHANGED
+
+
+def test_hallucinated_quote_beside_a_deletion_is_dropped() -> None:
+    c = case_checker("29-py-removed-role-check", "app/orders.py")
+    _, reason = c.check(mf(file="app/orders.py", line=5,
+                           evidence_quote="orders.cancel(order_id, force=True)"), "m")
+    assert reason == "evidence quote does not exist at head or on deleted lines"
