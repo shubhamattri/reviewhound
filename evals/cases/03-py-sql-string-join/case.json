@@ -1,0 +1,13 @@
+{
+  "title": "03-py-sql-string-join",
+  "expected": [
+    {
+      "file": "repo/orders.py",
+      "line": 6,
+      "category": "sql-injection"
+    }
+  ],
+  "recorded_answer": {
+    "findings": []
+  }
+}

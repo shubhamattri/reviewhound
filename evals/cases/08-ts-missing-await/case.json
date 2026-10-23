@@ -1,0 +1,49 @@
+{
+  "title": "08-ts-missing-await",
+  "expected": [
+    {
+      "file": "src/orders.ts",
+      "line": 5,
+      "category": "async"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/orders.ts",
+        "severity": "major",
+        "category": "async",
+        "title": "saveOrder is not awaited",
+        "body": "The rejection escapes the try/catch, so failures still return saved.",
+        "evidence_quote": "saveOrder(order);",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "placeOrder",
+            "callee": "saveOrder"
+          },
+          {
+            "kind": "symbol_exists",
+            "name": "saveOrder"
+          }
+        ],
+        "line": 5
+      },
+      {
+        "file": "src/orders.ts",
+        "severity": "major",
+        "category": "async",
+        "title": "placeOrder never validates the order",
+        "body": "placeOrder should call validateOrder before saving.",
+        "evidence_quote": "saveOrder(order);",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "validateOrder"
+          }
+        ],
+        "line": 5
+      }
+    ]
+  }
+}

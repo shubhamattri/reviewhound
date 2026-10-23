@@ -1,0 +1,29 @@
+{
+  "title": "10-ts-loop-bound",
+  "expected": [
+    {
+      "file": "src/sum.ts",
+      "line": 3,
+      "category": "correctness"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/sum.ts",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Loop reads past the end of the array",
+        "body": "i <= xs.length adds undefined on the last pass, so total becomes NaN.",
+        "evidence_quote": "for (let i = 0; i <= xs.length; i++) {",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "sum"
+          }
+        ],
+        "line": 3
+      }
+    ]
+  }
+}

@@ -1,0 +1,121 @@
+"""Eval harness: replay recorded PRs through the full pipeline and score the findings.
+
+A reported finding matches an expected one when it is in the same file within
+`line_tolerance` lines. Each expected finding can be matched once.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from reviewhound.pipeline import Reviewer
+from reviewhound.providers import FakeProvider, Provider, ProviderRegistry
+from reviewhound.scanners import BuiltinScanner
+from reviewhound.vcs.base import PullRequest
+from reviewhound.vcs.memory import MemoryVCS
+
+
+@dataclass
+class CaseResult:
+    name: str
+    expected: int
+    reported: int
+    true_positives: int
+    dropped_by_checker: int
+    cost_usd: float
+    misses: list[str] = field(default_factory=list)
+    false_alarms: list[str] = field(default_factory=list)
+    error: str = ""
+
+
+@dataclass
+class EvalReport:
+    cases: list[CaseResult]
+
+    @property
+    def precision(self) -> float:
+        reported = sum(c.reported for c in self.cases)
+        return 1.0 if reported == 0 else sum(c.true_positives for c in self.cases) / reported
+
+    @property
+    def recall(self) -> float:
+        expected = sum(c.expected for c in self.cases)
+        return 1.0 if expected == 0 else sum(c.true_positives for c in self.cases) / expected
+
+    @property
+    def cost_per_pr(self) -> float:
+        return sum(c.cost_usd for c in self.cases) / max(1, len(self.cases))
+
+    def render(self) -> str:
+        rows = [f"{'case':<38} {'exp':>3} {'rep':>3} {'tp':>3} {'drop':>4}  notes"]
+        for c in self.cases:
+            notes = "; ".join([*(f"miss {m}" for m in c.misses),
+                               *(f"false alarm {f}" for f in c.false_alarms),
+                               *([f"error {c.error}"] if c.error else [])])
+            rows.append(f"{c.name:<38} {c.expected:>3} {c.reported:>3} {c.true_positives:>3} "
+                        f"{c.dropped_by_checker:>4}  {notes}")
+        dropped = sum(c.dropped_by_checker for c in self.cases)
+        rows.append("")
+        rows.append(f"cases: {len(self.cases)}  precision: {self.precision:.2f}  "
+                    f"recall: {self.recall:.2f}  dropped by claim checker: {dropped}  "
+                    f"cost per PR: ${self.cost_per_pr:.4f}")
+        return "\n".join(rows)
+
+
+def _read_tree(root: Path) -> dict[str, str]:
+    if not root.exists():
+        return {}
+    return {p.relative_to(root).as_posix(): p.read_text() for p in sorted(root.rglob("*"))
+            if p.is_file()}
+
+
+def score(expected: list[dict[str, Any]], reported: list[tuple[str, int]],
+          line_tolerance: int = 3) -> tuple[int, list[str], list[str]]:
+    """Return (true positives, missed expected, false alarms)."""
+    unmatched = list(expected)
+    tp = 0
+    false_alarms: list[str] = []
+    for path, line in reported:
+        hit = next((e for e in unmatched if e["file"] == path and
+                    abs(int(e["line"]) - line) <= line_tolerance), None)
+        if hit is None:
+            false_alarms.append(f"{path}:{line}")
+        else:
+            unmatched.remove(hit)
+            tp += 1
+    return tp, [f"{e['file']}:{e['line']}" for e in unmatched], false_alarms
+
+
+def run_case(case_dir: Path, provider_factory: Callable[[dict[str, Any]], Provider],
+             verify: bool = True) -> CaseResult:
+    spec = json.loads((case_dir / "case.json").read_text())
+    base, head = _read_tree(case_dir / "base"), _read_tree(case_dir / "head")
+    pr = PullRequest(repo=f"eval/{case_dir.name}", number=1, title=spec.get("title", ""),
+                     body=spec.get("body", ""), base_sha="base", head_sha="head")
+    vcs = MemoryVCS(pr, base, head)
+    registry = ProviderRegistry([provider_factory(spec)])
+    reviewer = Reviewer(vcs, registry, [BuiltinScanner()], store=None, verify=verify)
+    try:
+        result = reviewer.review(pr.repo, 1, dry_run=True)
+    except Exception as exc:  # noqa: BLE001 - one broken case must not stop the run
+        return CaseResult(case_dir.name, len(spec["expected"]), 0, 0, 0, 0.0,
+                          misses=[f"{e['file']}:{e['line']}" for e in spec["expected"]],
+                          error=type(exc).__name__)
+    posted = [(f.file, f.line) for f in (result.decision.post if result.decision else [])]
+    tp, misses, false_alarms = score(spec["expected"], posted)
+    return CaseResult(case_dir.name, len(spec["expected"]), len(posted), tp,
+                      len(result.dropped), result.cost_usd, misses, false_alarms)
+
+
+def recorded_provider(spec: dict[str, Any]) -> Provider:
+    return FakeProvider([json.dumps(spec["recorded_answer"])])
+
+
+def run_eval(cases_root: Path, provider_factory: Callable[[dict[str, Any]], Provider]
+             = recorded_provider, verify: bool = True) -> EvalReport:
+    cases = sorted(p for p in cases_root.iterdir() if (p / "case.json").exists())
+    return EvalReport([run_case(c, provider_factory, verify) for c in cases])

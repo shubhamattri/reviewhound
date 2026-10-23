@@ -1,0 +1,43 @@
+{
+  "title": "11-ts-clean-change-hallucinations",
+  "expected": [],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/format.ts",
+        "severity": "major",
+        "category": "correctness",
+        "title": "percent should call clampRatio",
+        "body": "Other formatters clamp first.",
+        "evidence_quote": "return clampRatio(ratio);",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "clampRatio"
+          }
+        ],
+        "line": 5
+      },
+      {
+        "file": "src/format.ts",
+        "severity": "minor",
+        "category": "correctness",
+        "title": "money rounds incorrectly",
+        "body": "toFixed rounds half-even.",
+        "evidence_quote": "return (cents / 100).toFixed(2);",
+        "claims": [],
+        "line": 2
+      },
+      {
+        "file": "src/missing.ts",
+        "line": 3,
+        "severity": "major",
+        "category": "correctness",
+        "title": "Bug in a file the PR never touched",
+        "body": "...",
+        "evidence_quote": "x",
+        "claims": []
+      }
+    ]
+  }
+}

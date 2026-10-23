@@ -1,0 +1,51 @@
+{
+  "title": "01-py-missing-auth-guard",
+  "expected": [
+    {
+      "file": "app/admin.py",
+      "line": 17,
+      "category": "auth"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "app/admin.py",
+        "severity": "blocker",
+        "category": "auth",
+        "title": "delete_user has no role check",
+        "body": "Every other handler calls require_role first; this one deletes any user.",
+        "evidence_quote": "users.delete(user_id)",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "delete_user",
+            "callee": "require_role"
+          },
+          {
+            "kind": "calls",
+            "caller": "get_user",
+            "callee": "require_role"
+          }
+        ],
+        "line": 17
+      },
+      {
+        "file": "app/admin.py",
+        "severity": "major",
+        "category": "auth",
+        "title": "update_user skips the role check",
+        "body": "update_user writes without authorisation.",
+        "evidence_quote": "users.update(user_id, data)",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "update_user",
+            "callee": "require_role"
+          }
+        ],
+        "line": 17
+      }
+    ]
+  }
+}

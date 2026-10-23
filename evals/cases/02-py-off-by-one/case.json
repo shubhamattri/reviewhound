@@ -1,0 +1,44 @@
+{
+  "title": "02-py-off-by-one",
+  "expected": [
+    {
+      "file": "stats.py",
+      "line": 3,
+      "category": "correctness"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "stats.py",
+        "severity": "major",
+        "category": "correctness",
+        "title": "First element is skipped",
+        "body": "range starts at 1, so xs[0] is never added.",
+        "evidence_quote": "for i in range(1, len(xs)):",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "total"
+          }
+        ],
+        "line": 3
+      },
+      {
+        "file": "stats.py",
+        "severity": "major",
+        "category": "correctness",
+        "title": "total() should use safe_sum",
+        "body": "Use the safe_sum helper instead of a manual loop.",
+        "evidence_quote": "result += xs[i]",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "safe_sum"
+          }
+        ],
+        "line": 4
+      }
+    ]
+  }
+}

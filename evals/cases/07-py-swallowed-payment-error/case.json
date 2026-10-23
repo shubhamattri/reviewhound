@@ -1,0 +1,30 @@
+{
+  "title": "07-py-swallowed-payment-error",
+  "expected": [
+    {
+      "file": "billing/charge.py",
+      "line": 4,
+      "category": "error-handling"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "billing/charge.py",
+        "severity": "blocker",
+        "category": "error-handling",
+        "title": "Failed charges are reported as paid",
+        "body": "The exception is swallowed and the function still returns paid.",
+        "evidence_quote": "except Exception:\n        pass",
+        "claims": [
+          {
+            "kind": "quote",
+            "file": "billing/charge.py",
+            "text": "return {\"status\": \"paid\"}"
+          }
+        ],
+        "line": 4
+      }
+    ]
+  }
+}

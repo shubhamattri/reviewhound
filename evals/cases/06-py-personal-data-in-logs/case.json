@@ -1,0 +1,13 @@
+{
+  "title": "06-py-personal-data-in-logs",
+  "expected": [
+    {
+      "file": "signup.py",
+      "line": 7,
+      "category": "personal-data-in-logs"
+    }
+  ],
+  "recorded_answer": {
+    "findings": []
+  }
+}

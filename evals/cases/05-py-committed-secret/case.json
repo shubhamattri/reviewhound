@@ -1,0 +1,13 @@
+{
+  "title": "05-py-committed-secret",
+  "expected": [
+    {
+      "file": "settings.py",
+      "line": 4,
+      "category": "secret"
+    }
+  ],
+  "recorded_answer": {
+    "findings": []
+  }
+}

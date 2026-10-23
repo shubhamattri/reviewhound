@@ -1,0 +1,34 @@
+{
+  "title": "09-ts-assignment-in-condition",
+  "expected": [
+    {
+      "file": "src/invoice.ts",
+      "line": 2,
+      "category": "correctness"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/invoice.ts",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Assignment instead of comparison",
+        "body": "This sets status to paid and is always true. Use ===.",
+        "evidence_quote": "if (inv.status === \"paid\") {",
+        "claims": [],
+        "line": 2
+      },
+      {
+        "file": "src/invoice.ts",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Assignment instead of comparison",
+        "body": "This sets status to paid and is always true, so every invoice shows Paid.",
+        "evidence_quote": "if (inv.status = \"paid\") {",
+        "claims": [],
+        "line": 2
+      }
+    ]
+  }
+}

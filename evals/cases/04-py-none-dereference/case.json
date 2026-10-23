@@ -1,0 +1,45 @@
+{
+  "title": "04-py-none-dereference",
+  "expected": [
+    {
+      "file": "svc/profile.py",
+      "line": 7,
+      "category": "correctness"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "svc/profile.py",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Crashes when the user does not exist",
+        "body": "find_user returns store.get(...), which is None for a missing id.",
+        "evidence_quote": "return user[\"first\"] + \" \" + user[\"last\"]",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "display_name",
+            "callee": "find_user"
+          },
+          {
+            "kind": "quote",
+            "file": "svc/profile.py",
+            "text": "return store.get(user_id)"
+          }
+        ],
+        "line": 7
+      },
+      {
+        "file": "svc/profile.py",
+        "severity": "minor",
+        "category": "correctness",
+        "title": "find_user does not validate user_id",
+        "body": "Old function, not changed here.",
+        "evidence_quote": "def find_user(store, user_id):",
+        "claims": [],
+        "line": 1
+      }
+    ]
+  }
+}
