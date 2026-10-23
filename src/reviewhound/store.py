@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS review_findings (
 CREATE TABLE IF NOT EXISTS review_blockers (
     repo TEXT NOT NULL, pr INTEGER NOT NULL, review_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
     file TEXT NOT NULL, side TEXT NOT NULL, category TEXT NOT NULL,
-    evidence_quote TEXT NOT NULL, identity TEXT NOT NULL,
+    evidence_quote TEXT NOT NULL, identity TEXT NOT NULL, deleted_text TEXT,
     PRIMARY KEY (repo, pr, review_id, fingerprint)
 );
 """
@@ -108,25 +108,29 @@ class Blocker:
     category: str
     evidence_quote: str
     identity: str
+    deleted_text: str = ""  # a removed-guard blocker is gone once this text is back
 
     @classmethod
     def of(cls, f: Finding) -> Blocker:
-        return cls(f.fingerprint, f.file, f.side, f.category, f.evidence_quote, f.identity)
+        return cls(f.fingerprint, f.file, f.side, f.category, f.evidence_quote, f.identity,
+                   f.deleted_text)
 
 
 def blocker_rows(rec: ReviewRecord, blockers: Sequence[Blocker]) -> list[tuple[Any, ...]]:
     if rec.outcome != "posted" or not rec.post_id:
         return []
     return [(rec.repo.lower(), rec.pr, rec.post_id, b.fingerprint, b.file, b.side, b.category,
-             b.evidence_quote, b.identity) for b in blockers]
+             b.evidence_quote, b.identity, b.deleted_text) for b in blockers]
 
 
-def upsert_order(rec: ReviewRecord, posted: list[Finding], held: list[tuple[Finding, str]]
-                 ) -> list[tuple[Finding, str, str | None]]:
+def upsert_order(rec: ReviewRecord, posted: list[Finding], held: list[tuple[Finding, str]],
+                 stored: Sequence[Finding] = ()) -> list[tuple[Finding, str, str | None]]:
     """(finding, state, held reason) sorted by fingerprint, so concurrent writers lock rows in
-    one order and cannot deadlock. The sort is stable: posted stays ahead of held on a tie."""
+    one order and cannot deadlock. The sort is stable: posted stays ahead of held on a tie.
+    `stored`: findings a landed review was meant to carry but GitHub does not show."""
     new_state = "posted" if rec.posted else "stored"
-    rows = [(f, new_state, None) for f in posted] + [(f, "held", r) for f, r in held]
+    rows = [(f, new_state, None) for f in posted] + [(f, "stored", None) for f in stored] + \
+        [(f, "held", r) for f, r in held]
     return sorted(rows, key=lambda row: row[0].fingerprint)
 
 
@@ -151,9 +155,13 @@ class ReviewStore(Protocol):
 
     def record_review(self, rec: ReviewRecord, posted: list[Finding],
                       held: list[tuple[Finding, str]],
-                      blockers: Sequence[Blocker] = ()) -> int: ...
+                      blockers: Sequence[Blocker] = (), stored: Sequence[Finding] = ()) -> int: ...
 
     def claim_post(self, repo: str, pr: int, head_sha: str) -> bool: ...
+
+    def post_claim(self, repo: str, pr: int, head_sha: str) -> tuple[str, float] | None: ...
+
+    def take_stale_claim(self, repo: str, pr: int, head_sha: str, older_than_s: float) -> bool: ...
 
     def release_post(self, repo: str, pr: int, head_sha: str) -> None: ...
 
@@ -214,6 +222,9 @@ class Store:
                 c.execute("ALTER TABLE posts ADD COLUMN post_id TEXT")
             if "event" not in cols:
                 c.execute("ALTER TABLE posts ADD COLUMN event TEXT")
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(review_blockers)")}
+            if "deleted_text" not in cols:
+                c.execute("ALTER TABLE review_blockers ADD COLUMN deleted_text TEXT")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -239,7 +250,7 @@ class Store:
 
     def record_review(self, rec: ReviewRecord, posted: list[Finding],
                       held: list[tuple[Finding, str]],
-                      blockers: Sequence[Blocker] = ()) -> int:
+                      blockers: Sequence[Blocker] = (), stored: Sequence[Finding] = ()) -> int:
         """Write the review, every finding and the review's blockers in one transaction."""
         now = self._clock()
         repo = rec.repo.lower()
@@ -251,14 +262,14 @@ class Store:
                 (repo, rec.pr, rec.head_sha, rec.outcome, rec.tier, rec.model,
                  json.dumps(list(rec.providers)), rec.event, int(rec.posted), rec.post_id,
                  rec.cost_usd, json.dumps(rec.timings or {}), rec.error, now))
-            for f, state, reason in upsert_order(rec, posted, held):
+            for f, state, reason in upsert_order(rec, posted, held, stored):
                 self._upsert(c, repo, rec.pr, rec.head_sha, f, state, reason, now)
             c.executemany("INSERT OR IGNORE INTO review_findings (repo, pr, review_id, fingerprint, "
                           "file, line, side, severity, category, evidence_quote, identity) "
                           "VALUES (?,?,?,?,?,?,?,?,?,?,?)", review_finding_rows(rec, posted))
             c.executemany("INSERT OR IGNORE INTO review_blockers (repo, pr, review_id, fingerprint, "
-                          "file, side, category, evidence_quote, identity) "
-                          "VALUES (?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
+                          "file, side, category, evidence_quote, identity, deleted_text) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
             return int(cur.lastrowid or 0)
 
     @staticmethod
@@ -286,6 +297,24 @@ class Store:
                             "VALUES (?,?,?,?)", (repo.lower(), pr, head_sha, self._clock()))
             return cur.rowcount == 1
 
+    def post_claim(self, repo: str, pr: int, head_sha: str) -> tuple[str, float] | None:
+        """(post id or "", age in seconds) of this head's claim, or None when nobody holds it."""
+        with self._tx() as c:
+            row = c.execute("SELECT post_id, created_at FROM posts WHERE repo=? AND pr=? "
+                            "AND head_sha=?", (repo.lower(), pr, head_sha)).fetchone()
+        if row is None:
+            return None
+        return str(row["post_id"] or ""), self._clock() - float(row["created_at"])
+
+    def take_stale_claim(self, repo: str, pr: int, head_sha: str, older_than_s: float) -> bool:
+        """Take over a claim with no post id older than `older_than_s`; one taker wins."""
+        now = self._clock()
+        with self._tx() as c:
+            cur = c.execute("UPDATE posts SET created_at=? WHERE repo=? AND pr=? AND head_sha=? "
+                            "AND (post_id IS NULL OR post_id='') AND created_at < ?",
+                            (now, repo.lower(), pr, head_sha, now - older_than_s))
+            return cur.rowcount == 1
+
     def release_post(self, repo: str, pr: int, head_sha: str) -> None:
         """Undo claim_post after GitHub rejected the review, so a later run may post it."""
         with self._tx() as c:
@@ -302,8 +331,8 @@ class Store:
                       "SET post_id=excluded.post_id, event=excluded.event",
                       (repo.lower(), pr, head_sha, self._clock(), post_id, event))
             c.executemany("INSERT OR IGNORE INTO review_blockers (repo, pr, review_id, fingerprint, "
-                          "file, side, category, evidence_quote, identity) "
-                          "VALUES (?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
+                          "file, side, category, evidence_quote, identity, deleted_text) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?)", blocker_rows(rec, blockers))
 
     def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> tuple[str, str] | None:
         """(review id, event) of a post that landed for this head with no posted review record."""
@@ -317,7 +346,8 @@ class Store:
 
     def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
         with self._tx() as c:
-            rows = c.execute("SELECT fingerprint, file, side, category, evidence_quote, identity "
+            rows = c.execute("SELECT fingerprint, file, side, category, evidence_quote, identity, "
+                             "COALESCE(deleted_text, '') AS deleted_text "
                              "FROM review_blockers WHERE repo=? AND pr=? AND review_id=? "
                              "ORDER BY file, fingerprint", (repo.lower(), pr, review_id)).fetchall()
         return [dict(r) for r in rows]

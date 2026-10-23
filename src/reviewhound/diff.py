@@ -18,6 +18,7 @@ class Hunk:
     deleted: list[int] = field(default_factory=list)  # base-side line numbers
     deleted_text: dict[int, str] = field(default_factory=dict)
     deleted_at: list[int] = field(default_factory=list)  # head line after each run deleting code
+    runs: list[tuple[int, list[int]]] = field(default_factory=list)  # (head line after, base lines)
 
 
 @dataclass
@@ -45,6 +46,15 @@ class FileDiff:
     def commentable_lines(self) -> set[int]:
         """Head-side lines GitHub accepts a review comment on: added plus context in hunks."""
         return {n for h in self.hunks for n in (*h.added, *h.context)}
+
+    def run_text(self, at: int | None = None, base_line: int | None = None) -> str:
+        """Text of the deleted run(s) sitting just before head line `at`, or holding `base_line`."""
+        out: list[str] = []
+        for h in self.hunks:
+            for gap, lines in h.runs:
+                if gap == at or base_line in lines:
+                    out.extend(h.deleted_text[n] for n in lines)
+        return "\n".join(out)
 
     def nearest_added(self, line: int, max_distance: int) -> int | None:
         best: int | None = None
@@ -89,6 +99,7 @@ def parse_patch(path: str, patch: str, status: str = "modified",
     fd = FileDiff(path=path, old_path=old_path, status=status, patch=patch)
     hunk: Hunk | None = None
     new_line = old_line = 0
+    prev_deleted = last_deleted = False
     for raw in patch.splitlines():
         m = _HUNK_RE.match(raw)
         if m:
@@ -97,9 +108,11 @@ def parse_patch(path: str, patch: str, status: str = "modified",
             hunk = Hunk(new_start=new_start, new_count=new_count, old_start=int(m.group(1)))
             fd.hunks.append(hunk)
             new_line, old_line = new_start, hunk.old_start
+            last_deleted = False
             continue
         if hunk is None or raw.startswith("\\"):
             continue
+        prev_deleted, last_deleted = last_deleted, raw.startswith("-")
         if raw.startswith("-") and raw[1:].strip():
             # "+N,0" names the line before an empty head range, so the deletion follows it.
             at = new_line if hunk.new_count else hunk.new_start + 1
@@ -109,6 +122,11 @@ def parse_patch(path: str, patch: str, status: str = "modified",
             hunk.added.append(new_line)
             new_line += 1
         elif raw.startswith("-"):
+            at = new_line if hunk.new_count else hunk.new_start + 1
+            if prev_deleted and hunk.runs and hunk.runs[-1][0] == at:
+                hunk.runs[-1][1].append(old_line)
+            else:
+                hunk.runs.append((at, [old_line]))
             hunk.deleted.append(old_line)
             hunk.deleted_text[old_line] = raw[1:]
             old_line += 1

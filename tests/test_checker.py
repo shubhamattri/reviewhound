@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from reviewhound.checker import ClaimChecker, find_quote
+from reviewhound.checker import UNCONFIRMED_BESIDE, ClaimChecker, find_quote
 from reviewhound.config import Severity
 from reviewhound.diff import parse_unified_diff
 from reviewhound.findings import Claim, ModelFinding
@@ -354,8 +354,9 @@ def case_checker(name: str, path: str, with_base: bool = True) -> ClaimChecker:
 def test_live_answer_quoting_code_after_a_removed_role_check_is_kept_beside_it() -> None:
     c = case_checker("29-py-removed-role-check", "app/orders.py")
     f, reason = c.check(mf(file="app/orders.py", line=5, severity="blocker",
-                           evidence_quote='    orders.cancel(order_id)\n    return {"ok": True}'),
-                        "m")
+                           evidence_quote='    orders.cancel(order_id)\n    return {"ok": True}',
+                           claims=[{"kind": "not_calls", "caller": "cancel_order",
+                                    "callee": "require_role"}]), "m")
     assert (reason, f.side, f.line, f.verified) == (None, "RIGHT", 5, True)
     assert f.notes == [BESIDE.format(5)]
 
@@ -363,7 +364,9 @@ def test_live_answer_quoting_code_after_a_removed_role_check_is_kept_beside_it()
 def test_live_answer_quoting_code_around_a_removed_unlock_is_kept_beside_it() -> None:
     c = case_checker("32-go-removed-deferred-unlock", "cache/cache.go")
     f, reason = c.check(mf(file="cache/cache.go", line=11, severity="blocker",
-                           evidence_quote="c.mu.Lock()\n\tc.data[k] = v\n}"), "m")
+                           evidence_quote="c.mu.Lock()\n\tc.data[k] = v\n}",
+                           claims=[{"kind": "not_calls", "caller": "Cache.Set",
+                                    "callee": "Unlock"}]), "m")
     assert (reason, f.side, f.line, f.verified) == (None, "RIGHT", 11, True)
     assert f.notes == [BESIDE.format(11)]
 
@@ -373,7 +376,7 @@ def test_quote_beside_a_deletion_anchors_on_the_line_nearest_the_gap() -> None:
     f, reason = c.check(mf(file="cache/cache.go", line=13, evidence_quote="c.data[k] = v\n}"),
                         "m")
     assert (reason, f.side, f.line) == (None, "RIGHT", 12)
-    assert f.notes == [BESIDE.format(12)]
+    assert f.notes == [BESIDE.format(12), UNCONFIRMED_BESIDE]
 
 
 def test_beside_a_deletion_needs_no_base_reader() -> None:
@@ -408,7 +411,8 @@ def test_only_blank_lines_within_snap_distance_may_separate_quote_and_deletion(
     f, got = c.check(mf(file="w.py", line=2, evidence_quote="after_blank = 2"), "m")
     assert got == reason
     if reason is None:
-        assert (f.side, f.line, f.notes) == ("RIGHT", 2 + blanks, [BESIDE.format(2 + blanks)])
+        assert (f.side, f.line, f.notes) == ("RIGHT", 2 + blanks,
+                                             [BESIDE.format(2 + blanks), UNCONFIRMED_BESIDE])
 
 
 def test_code_between_the_quote_and_the_deletion_drops_it() -> None:

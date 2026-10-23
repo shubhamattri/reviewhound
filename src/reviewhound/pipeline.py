@@ -19,14 +19,23 @@ from reviewhound.index.conventions import learn_conventions
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.paths import language_of, matches_any
 from reviewhound.policy import PolicyDecision, apply_policy
-from reviewhound.poster import build_review, own_pr_review, render_dry_run
+from reviewhound.poster import SUMMARY_PREFIX, build_review, own_pr_review, render_dry_run
 from reviewhound.prompt import build_prompt
 from reviewhound.proof import DockerRunner, Prover, SandboxRunner, run_proof_stage, select_runner
 from reviewhound.providers import ProviderError, ProviderRegistry
+from reviewhound.queue import DEFAULT_LEASE_S
 from reviewhound.router import Route, route
 from reviewhound.scanners import Scanner
 from reviewhound.store import Blocker, ReviewRecord, ReviewStore
-from reviewhound.vcs.base import VCS, PullRequest, ReviewPayload, Snapshot
+from reviewhound.vcs.base import (
+    VCS,
+    PostedComment,
+    PostedReview,
+    PullRequest,
+    ReviewPayload,
+    ReviewThreads,
+    Snapshot,
+)
 from reviewhound.vcs.github import GitHubError
 
 log = logging.getLogger(__name__)
@@ -36,6 +45,9 @@ RETRY_IN_BODY = (400, 422)  # GitHub could not place an inline comment
 
 
 RECOVERED = "recovered: an earlier attempt posted this review but did not record it"
+ADOPTED = "adopted: a review of this head by this account was already on GitHub; not posted again"
+CLAIM_BUSY = "another run holds the post claim for this head and nothing of it is on GitHub yet"
+EVENTS = {"COMMENTED": "COMMENT", "CHANGES_REQUESTED": "REQUEST_CHANGES", "APPROVED": "APPROVE"}
 
 
 class RecordAfterPostError(RuntimeError):
@@ -66,6 +78,10 @@ class ReviewResult:
     blockers: list[Blocker] = field(default_factory=list)  # as decided before any proof
     recovered_id: str = ""  # an earlier attempt's post of this head, recorded by this run
     recovered_event: str = ""  # the verdict that post really carried
+    posted_event: str = ""  # the verdict of a landed review this run did not post itself
+    read_back: list[PostedComment] | None = None  # that review's comments, as GitHub has them
+    retry_after_s: float = 0.0  # claim-busy: when the other run's claim goes stale
+    dry_run: bool = False  # a dry run writes nothing, whatever its outcome
 
 
 @dataclass
@@ -142,9 +158,8 @@ def comments_in_body(review: ReviewPayload, limit: int = MAX_BODY_CHARS) -> Revi
 
 
 def _refused(exc: Exception) -> bool:
-    """GitHub answered 4xx (not 429): nothing landed, so this head may be posted again."""
-    return (isinstance(exc, GitHubError) and exc.status is not None
-            and 400 <= exc.status < 500 and exc.status != 429)
+    """GitHub answered 4xx (429 included): nothing landed, so this head may be posted again."""
+    return isinstance(exc, GitHubError) and exc.status is not None and 400 <= exc.status < 500
 
 
 def blocking_snapshot(decision: PolicyDecision, policy: PolicyConfig) -> list[Blocker]:
@@ -157,8 +172,10 @@ def blocking_snapshot(decision: PolicyDecision, policy: PolicyConfig) -> list[Bl
 class Reviewer:
     def __init__(self, vcs: VCS, registry: ProviderRegistry, scanners: list[Scanner],
                  store: ReviewStore | None, verify: bool = True,
-                 proof_runners: Mapping[str, SandboxRunner] | None = None) -> None:
+                 proof_runners: Mapping[str, SandboxRunner] | None = None,
+                 stale_claim_s: float = DEFAULT_LEASE_S) -> None:
         self.verify = verify  # False only for the eval baseline that measures the checker
+        self.stale_claim_s = stale_claim_s  # a claim with no post id this old was abandoned
         # Only runners the operator hands in can run; a repo's config cannot add one.
         self.proof_runners = proof_runners if proof_runners is not None else \
             {"docker": DockerRunner()}
@@ -190,8 +207,10 @@ class Reviewer:
         t = _Timer()
         with t.stage("fetch"):
             pr = self.vcs.get_pull(repo, number)
-        result = ReviewResult(pr=pr, outcome="")
-        result.recovered_id, result.recovered_event = self._record_landed(repo, number, expected_head or pr.head_sha)
+        result = ReviewResult(pr=pr, outcome="", dry_run=dry_run)
+        if not dry_run:
+            result.recovered_id, result.recovered_event = self._record_landed(
+                repo, number, expected_head or pr.head_sha)
         if pr.state != "open":
             result.outcome = "skipped"
             result.error = f"PR is {pr.state}"
@@ -246,7 +265,7 @@ class Reviewer:
             for s in self.scanners:
                 scanned.extend(s.scan(diff, head, cfg))
             result.reviewers.extend(f"scanner:{s.name}" for s in self.scanners)
-        known = self.store.known_state(repo, number) if self.store else {}
+        known = self.store.known_state(repo, number) if self.store and not dry_run else {}
         decision = apply_policy(outcome.kept + scanned, cfg.policy, known)
         result.decision = decision
         result.blockers = blocking_snapshot(decision, cfg.policy)
@@ -265,11 +284,16 @@ class Reviewer:
             elif should_post is not None and not should_post():
                 result.outcome = "lease-lost"  # checked again right before each POST
             elif self.store is not None and not self.store.claim_post(repo, number, pr.head_sha):
-                self._already_posted(pr, result)
+                self._claim_taken(pr, result, should_post)
             else:
                 self._post(pr, result, should_post)
-        done = self._finish(result, t, decision.post,
-                            [(f, r) for f, r in decision.held if r != "duplicate"])
+        posted, stored = decision.post, []
+        if result.read_back is not None:  # a review this run did not post: trust only GitHub
+            on = {(c.path, c.side, c.line) for c in result.read_back}
+            posted = [f for f in decision.post if (f.file, f.side, f.line) in on]
+            stored = [f for f in decision.post if (f.file, f.side, f.line) not in on]
+        done = self._finish(result, t, posted,
+                            [(f, r) for f, r in decision.held if r != "duplicate"], stored)
         if done.outcome == "post-uncertain":
             log.warning("post outcome uncertain; comments not linked, verdicts not dismissed",
                         extra={"pr": number, "head": pr.head_sha})
@@ -297,13 +321,68 @@ class Reviewer:
                                        f"{type(exc).__name__}") from exc
         return post_id, event
 
-    def _already_posted(self, pr: PullRequest, result: ReviewResult) -> None:
-        """Another run holds this head. If it was this run that recorded that post, finish its
-        follow-ups (findings, comment links, dismissal) as outcome `recovered`."""
-        if not result.recovered_id:
+    def _claim_taken(self, pr: PullRequest, result: ReviewResult,
+                     should_post: Callable[[], bool] | None) -> None:
+        """Another run holds this head's claim. Recover or adopt a review that landed, take over
+        an abandoned claim, or come back once it is stale. Never post twice."""
+        assert self.store is not None
+        if result.recovered_id:  # this run recorded that post at job start
+            result.outcome, result.post_id, result.error = "recovered", result.recovered_id, \
+                RECOVERED
+            result.posted_event = result.recovered_event
+            self._read_back(pr, result)
+            return
+        held = self.store.post_claim(pr.repo, pr.number, pr.head_sha)
+        if held is not None and held[0]:
             result.outcome = "already-posted"
             return
-        result.outcome, result.post_id, result.error = "recovered", result.recovered_id, RECOVERED
+        age = held[1] if held is not None else self.stale_claim_s
+        if age > self.stale_claim_s and self.store.take_stale_claim(
+                pr.repo, pr.number, pr.head_sha, self.stale_claim_s):
+            log.warning("taking over an abandoned post claim", extra={
+                "pr": pr.number, "head": pr.head_sha, "age_s": round(age, 1)})
+            self._post(pr, result, should_post)  # the remote check runs before its POST
+            return
+        landed = self._landed_review(pr)
+        if landed is not None:
+            self._adopt(pr, result, landed)
+            return
+        result.outcome, result.error = "claim-busy", CLAIM_BUSY
+        result.retry_after_s = max(0.0, self.stale_claim_s - age)
+
+    def _landed_review(self, pr: PullRequest) -> PostedReview | None:
+        """This account's review of exactly this head, if one is on GitHub (the source of truth
+        for "did it land"). An account the token cannot name matches any author."""
+        viewer = self.vcs.viewer_login()
+        for r in self.vcs.list_reviews(pr.repo, pr.number):
+            if r.commit_id == pr.head_sha and r.body.startswith(SUMMARY_PREFIX) and \
+                    (not viewer or r.author == viewer):
+                return r
+        return None
+
+    def _adopt(self, pr: PullRequest, result: ReviewResult, landed: PostedReview) -> None:
+        """Record a landed review instead of posting again: its id on the claim, then a posted
+        record whose findings are only those GitHub shows."""
+        event = EVENTS.get(landed.state, landed.state)
+        log.warning("review already on GitHub; adopting it", extra={
+            "pr": pr.number, "head": pr.head_sha, "post_id": landed.id})
+        self._mark_posted(pr, landed.id, event, result.blockers)
+        result.outcome, result.post_id, result.error = "posted", landed.id, ADOPTED
+        result.posted_event = event
+        self._read_back(pr, result)
+
+    def _read_back(self, pr: PullRequest, result: ReviewResult) -> None:
+        """The landed review's comments. On failure none: its findings stay `stored`, unlinked."""
+        result.read_back = []
+        if not isinstance(self.vcs, ReviewThreads):
+            log.warning("VCS cannot read back comments; findings stored", extra={"pr": pr.number})
+            return
+        try:
+            result.read_back = self.vcs.review_comments(pr.repo, pr.number, result.post_id)
+        except Exception as exc:  # noqa: BLE001 - nothing is marked posted without proof
+            log.error("could not read back the landed review; findings stored, not linked",
+                      extra={"pr": pr.number, "post_id": result.post_id,
+                             "error": type(exc).__name__})
 
     def _post(self, pr: PullRequest, result: ReviewResult,
               should_post: Callable[[], bool] | None) -> None:
@@ -315,11 +394,16 @@ class Reviewer:
             if not claim.keep and self.store is not None:
                 self.store.release_post(pr.repo, pr.number, pr.head_sha)
 
-    def _blocked(self, pr: PullRequest, should_post: Callable[[], bool] | None) -> str:
-        """Checked right before every POST: a moved head or a lost lease posts nothing. The lease
-        is read last, after the head lookup's network time."""
+    def _blocked(self, pr: PullRequest, result: ReviewResult,
+                 should_post: Callable[[], bool] | None) -> str:
+        """Checked right before every POST: a moved head, a review already on GitHub (adopted)
+        or a lost lease posts nothing. The lease is read last, after the network calls."""
         if self.vcs.current_head(pr.repo, pr.number) != pr.head_sha:
             return "head-moved"
+        landed = self._landed_review(pr)
+        if landed is not None:
+            self._adopt(pr, result, landed)
+            return "adopted"
         if should_post is not None and not should_post():
             return "lease-lost"
         return ""
@@ -335,7 +419,10 @@ class Reviewer:
         payload = result.review
         status: int | None = None
         for attempt in (1, 2):
-            blocked = self._blocked(pr, should_post)
+            blocked = self._blocked(pr, result, should_post)
+            if blocked == "adopted":
+                claim.keep = True  # it landed: never free the head again
+                return
             if blocked:
                 result.outcome, result.error = blocked, ""
                 return
@@ -390,15 +477,16 @@ class Reviewer:
             result.cost_usd += prover.cost_usd
 
     def _finish(self, result: ReviewResult, t: _Timer, posted: list[Finding],
-                held: list[tuple[Finding, str]]) -> ReviewResult:
+                held: list[tuple[Finding, str]], stored: list[Finding] | None = None
+                ) -> ReviewResult:
         result.timings = t.timings
         log.info("review finished", extra={"repo": result.pr.repo, "pr": result.pr.number,
                                            "head": result.pr.head_sha, "outcome": result.outcome,
                                            "timings": t.timings, "cost_usd": result.cost_usd})
-        if self.store is None or result.outcome == "dry-run":
+        if self.store is None or result.dry_run:
             return result
         try:
-            self._record(result, t, posted, held)
+            self._record(result, t, posted, held, stored or [])
         except Exception as exc:
             if result.outcome == "posted":
                 raise RecordAfterPostError(f"review {result.post_id} posted but not recorded: "
@@ -407,7 +495,7 @@ class Reviewer:
         return result
 
     def _record(self, result: ReviewResult, t: _Timer, posted: list[Finding],
-                held: list[tuple[Finding, str]]) -> None:
+                held: list[tuple[Finding, str]], stored: list[Finding]) -> None:
         assert self.store is not None
         rt = result.route
         self.store.record_review(
@@ -415,10 +503,10 @@ class Reviewer:
                          head_sha=result.pr.head_sha, outcome=result.outcome,
                          tier=rt.tier if rt else "", model=rt.model if rt else "",
                          providers=tuple(result.reviewers),
-                         event=result.recovered_event if result.outcome == "recovered" else
-                         result.review.event if result.review else "",
+                         event=result.posted_event or (result.review.event if result.review
+                                                       else ""),
                          # An uncertain post may have landed: never risk posting it twice.
                          posted=result.outcome in ("posted", "post-uncertain", "recovered"),
                          post_id=result.post_id, cost_usd=result.cost_usd,
                          timings=t.timings, error=result.error),
-            posted, held, result.blockers)
+            posted, held, result.blockers, stored)

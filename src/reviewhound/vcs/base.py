@@ -41,6 +41,17 @@ class PostedComment:
     side: str = "RIGHT"
 
 
+@dataclass(frozen=True)
+class PostedReview:
+    """A review as GitHub lists it on the pull request."""
+
+    id: str
+    author: str
+    commit_id: str
+    body: str
+    state: str  # COMMENTED | CHANGES_REQUESTED | APPROVED | DISMISSED | PENDING
+
+
 @dataclass
 class ReviewPayload:
     head_sha: str
@@ -126,6 +137,8 @@ class VCS(Protocol):
     def current_head(self, repo: str, number: int) -> str: ...
 
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str: ...
+
+    def list_reviews(self, repo: str, number: int) -> list[PostedReview]: ...
 
     def viewer_login(self) -> str: ...
 

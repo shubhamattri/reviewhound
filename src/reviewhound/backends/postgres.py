@@ -18,7 +18,7 @@ import psycopg
 from psycopg.rows import DictRow, dict_row
 
 from reviewhound.findings import Finding
-from reviewhound.queue import Job, LeaseLost, job_key
+from reviewhound.queue import DEFAULT_LEASE_S, Job, LeaseLost, job_key
 from reviewhound.store import (
     Blocker,
     ReviewRecord,
@@ -111,6 +111,7 @@ STORE_DDL: list[str] = [
         fingerprint TEXT NOT NULL, file TEXT NOT NULL, side TEXT NOT NULL,
         category TEXT NOT NULL, evidence_quote TEXT NOT NULL, identity TEXT NOT NULL,
         PRIMARY KEY (repo, pr, review_id, fingerprint))""",
+    "ALTER TABLE review_blockers ADD COLUMN IF NOT EXISTS deleted_text TEXT",
 ]
 
 METRICS_DDL: list[str] = [
@@ -157,7 +158,7 @@ class _Pg:
 
 
 class PostgresQueue(_Pg):
-    def __init__(self, url: str, max_attempts: int = 4, lease_s: float = 1800,
+    def __init__(self, url: str, max_attempts: int = 4, lease_s: float = DEFAULT_LEASE_S,
                  backoff_base_s: float = 30, clock: Callable[[], float] = time.time) -> None:
         super().__init__(url)
         self.max_attempts = max_attempts
@@ -242,8 +243,8 @@ class PostgresQueue(_Pg):
                 raise LeaseLost(job.id)
         self._write(body)
 
-    def fail(self, job: Job, error: str, retryable: bool) -> str:
-        """Record a failure. Returns the new state: 'queued' (will retry) or 'dead'."""
+    def fail(self, job: Job, error: str, retryable: bool, delay_s: float = 0.0) -> str:
+        """Same contract as SQLiteQueue.fail."""
         now = self._clock()
 
         def body(c: Conn) -> str:
@@ -254,7 +255,7 @@ class PostgresQueue(_Pg):
                 raise LeaseLost(job.id)
             if retryable and row["attempts"] < row["max_attempts"]:
                 state = "queued"
-                run_after = now + self.backoff_base_s * (2 ** (row["attempts"] - 1))
+                run_after = now + max(delay_s, self.backoff_base_s * (2 ** (row["attempts"] - 1)))
             else:
                 state, run_after = "dead", now
             c.execute("UPDATE jobs SET state=%s, run_after=%s, lease_until=NULL, last_error=%s, "
@@ -330,7 +331,7 @@ class PostgresStore(_Pg):
 
     def record_review(self, rec: ReviewRecord, posted: list[Finding],
                       held: list[tuple[Finding, str]],
-                      blockers: Sequence[Blocker] = ()) -> int:
+                      blockers: Sequence[Blocker] = (), stored: Sequence[Finding] = ()) -> int:
         """Write the review, every finding and the review's blockers in one transaction."""
         now = self._clock()
         repo = rec.repo.lower()
@@ -345,7 +346,7 @@ class PostgresStore(_Pg):
                  rec.cost_usd, json.dumps(rec.timings or {}), rec.error, now)).fetchone()
             if row is None:
                 raise RuntimeError("INSERT ... RETURNING returned no row")
-            for f, state, reason in upsert_order(rec, posted, held):
+            for f, state, reason in upsert_order(rec, posted, held, stored):
                 self._upsert(c, repo, rec.pr, rec.head_sha, f, state, reason, now)
             with c.cursor() as cur:
                 rows = review_finding_rows(rec, posted)
@@ -358,8 +359,8 @@ class PostgresStore(_Pg):
                 if brows:
                     cur.executemany(
                         "INSERT INTO review_blockers (repo, pr, review_id, fingerprint, file, "
-                        "side, category, evidence_quote, identity) VALUES "
-                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
+                        "side, category, evidence_quote, identity, deleted_text) VALUES "
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
             return int(row["id"])
         return self._write(body)
 
@@ -389,6 +390,27 @@ class PostgresStore(_Pg):
             return cur.rowcount == 1
         return self._write(body)
 
+    def post_claim(self, repo: str, pr: int, head_sha: str) -> tuple[str, float] | None:
+        """(post id or "", age in seconds) of this head's claim, or None when nobody holds it."""
+        with self._tx() as c:
+            row = c.execute("SELECT post_id, created_at FROM posts WHERE repo=%s AND pr=%s "
+                            "AND head_sha=%s", (repo.lower(), pr, head_sha)).fetchone()
+        if row is None:
+            return None
+        return str(row["post_id"] or ""), self._clock() - float(row["created_at"])
+
+    def take_stale_claim(self, repo: str, pr: int, head_sha: str, older_than_s: float) -> bool:
+        """Take over a claim with no post id older than `older_than_s`; one taker wins."""
+        now = self._clock()
+
+        def body(c: Conn) -> bool:
+            cur = c.execute("UPDATE posts SET created_at=%s WHERE repo=%s AND pr=%s "
+                            "AND head_sha=%s AND (post_id IS NULL OR post_id='') "
+                            "AND created_at < %s",
+                            (now, repo.lower(), pr, head_sha, now - older_than_s))
+            return cur.rowcount == 1
+        return self._write(body)
+
     def release_post(self, repo: str, pr: int, head_sha: str) -> None:
         """Undo claim_post after GitHub rejected the review, so a later run may post it."""
         def body(c: Conn) -> None:
@@ -411,8 +433,8 @@ class PostgresStore(_Pg):
                 with c.cursor() as cur:
                     cur.executemany(
                         "INSERT INTO review_blockers (repo, pr, review_id, fingerprint, file, "
-                        "side, category, evidence_quote, identity) VALUES "
-                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
+                        "side, category, evidence_quote, identity, deleted_text) VALUES "
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", brows)
         self._write(body)
 
     def unrecorded_post(self, repo: str, pr: int, head_sha: str) -> tuple[str, str] | None:
@@ -428,7 +450,8 @@ class PostgresStore(_Pg):
 
     def review_blockers(self, repo: str, pr: int, review_id: str) -> list[dict[str, Any]]:
         with self._tx() as c:
-            rows = c.execute("SELECT fingerprint, file, side, category, evidence_quote, identity "
+            rows = c.execute("SELECT fingerprint, file, side, category, evidence_quote, identity, "
+                             "COALESCE(deleted_text, '') AS deleted_text "
                              "FROM review_blockers WHERE repo=%s AND pr=%s AND review_id=%s "
                              "ORDER BY file, fingerprint", (repo.lower(), pr, review_id)).fetchall()
         return [dict(r) for r in rows]

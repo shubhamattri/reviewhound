@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import sqlite3
 from collections.abc import Callable, Iterator
@@ -166,7 +167,8 @@ def test_failure_before_the_post_requeues_the_job_and_the_retry_posts(
     vcs.pr = make_pr(head=H1, author="alice")
     q = backend.queue(backoff_base_s=0)
     q.enqueue(REPO, PR, H1)
-    logins = iter([GitHubError("token lookup failed"), "reviewhound-bot"])
+    logins = itertools.chain([GitHubError("token lookup failed")],
+                             itertools.repeat("reviewhound-bot"))
 
     def viewer() -> str:
         nxt = next(logins)
@@ -340,10 +342,12 @@ def test_head_moved_and_already_posted_complete_the_job(
     vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
     if outcome == "head-moved":
         vcs.head_sha_now = "h2"
-    else:
-        store.claim_post(REPO, PR, H1)
+    else:  # another run posted and recorded this head
+        store.mark_posted(REPO, PR, H1, "r0", "COMMENT")
+        store.record_review(ReviewRecord(repo=REPO, pr=PR, head_sha=H1, outcome="posted",
+                                         posted=True, post_id="r0"), [], [])
     assert _worker_run(backend, reviewer) == ("done", None)
-    assert [r["outcome"] for r in store.reviews(REPO, PR)] == [outcome]
+    assert [r["outcome"] for r in store.reviews(REPO, PR)][-1] == outcome
 
 
 def test_lease_lost_still_fails_retryable(backend: Backend,
@@ -531,13 +535,6 @@ def test_mark_failure_is_logged_and_the_review_still_records(
         ("posted", "memory-review-1")]
 
 
-def test_claim_without_a_post_id_stays_already_posted(backend: Backend) -> None:
-    vcs, reviewer, store = reviewer_on(backend, [answer(REAL)])
-    store.claim_post(REPO, PR, H1)  # an uncertain post: no id was ever recorded
-    result = reviewer.review(REPO, PR, dry_run=False)
-    assert (result.outcome, result.post_id, vcs.posted) == ("already-posted", "", [])
-
-
 def test_recorded_post_is_not_recovered_twice(backend: Backend) -> None:
     vcs, reviewer, store = reviewer_on(backend, [answer(REAL), answer(REAL)])
     reviewer.review(REPO, PR, dry_run=False)
@@ -636,7 +633,7 @@ def test_blocker_changed_by_a_proof_is_still_dismissed_once_gone(
     assert (first.outcome, first.review.event) == ("posted", "REQUEST_CHANGES")  # type: ignore
     assert store.review_blockers(REPO, PR, "memory-review-1") == [{
         "fingerprint": FP, "file": "app/admin.py", "side": "RIGHT", "category": "auth",
-        "evidence_quote": "db.delete(uid)", "identity": ""}]
+        "evidence_quote": "db.delete(uid)", "identity": "", "deleted_text": ""}]
     push(vcs, "h2", FIXED)
     _proof_on(vcs)
     assert reviewer.review(REPO, PR, dry_run=False).outcome == "posted"
@@ -675,7 +672,7 @@ def test_blockers_are_written_only_for_a_posted_review_with_an_id(backend: Backe
     assert store.review_blockers(REPO, PR, "") == []
     assert store.review_blockers("ACME/shop", PR, "r1") == [{
         "fingerprint": "fp1", "file": "a.py", "side": "RIGHT", "category": "auth",
-        "evidence_quote": "do_it(x)", "identity": ""}]
+        "evidence_quote": "do_it(x)", "identity": "", "deleted_text": ""}]
     assert store.review_blockers(REPO, 8, "r1") == []
 
 

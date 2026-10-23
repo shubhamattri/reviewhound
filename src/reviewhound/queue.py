@@ -55,7 +55,7 @@ class JobQueue(Protocol):
 
     def complete(self, job: Job) -> None: ...
 
-    def fail(self, job: Job, error: str, retryable: bool) -> str: ...
+    def fail(self, job: Job, error: str, retryable: bool, delay_s: float = 0.0) -> str: ...
 
     def dead_jobs(self) -> list[Job]: ...
 
@@ -86,8 +86,11 @@ def job_key(repo: str, pr: int, head_sha: str) -> str:
     return f"{repo.lower()}#{pr}@{head_sha}"
 
 
+DEFAULT_LEASE_S = 1800.0
+
+
 class SQLiteQueue:
-    def __init__(self, path: Path | str, max_attempts: int = 4, lease_s: float = 1800,
+    def __init__(self, path: Path | str, max_attempts: int = 4, lease_s: float = DEFAULT_LEASE_S,
                  backoff_base_s: float = 30, clock: Callable[[], float] = time.time) -> None:
         self.path = str(path)
         self.max_attempts = max_attempts
@@ -189,8 +192,9 @@ class SQLiteQueue:
             if cur.rowcount != 1:
                 raise LeaseLost(job.id)
 
-    def fail(self, job: Job, error: str, retryable: bool) -> str:
-        """Record a failure. Returns the new state: 'queued' (will retry) or 'dead'."""
+    def fail(self, job: Job, error: str, retryable: bool, delay_s: float = 0.0) -> str:
+        """Record a failure. Returns the new state: 'queued' (will retry) or 'dead'.
+        A retry waits the backoff, or `delay_s` when that is longer."""
         now = self._clock()
         job_id = job.id
         with self._tx() as c:
@@ -201,7 +205,7 @@ class SQLiteQueue:
                 raise LeaseLost(job_id)
             if retryable and row["attempts"] < row["max_attempts"]:
                 state = "queued"
-                run_after = now + self.backoff_base_s * (2 ** (row["attempts"] - 1))
+                run_after = now + max(delay_s, self.backoff_base_s * (2 ** (row["attempts"] - 1)))
             else:
                 state, run_after = "dead", now
             c.execute("UPDATE jobs SET state=?, run_after=?, lease_until=NULL, last_error=?, "

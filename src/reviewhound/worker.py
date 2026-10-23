@@ -24,7 +24,8 @@ from reviewhound.vcs.github import GitHubError
 log = logging.getLogger(__name__)
 
 
-POST_RETRYABLE_HTTP = (401, 403, 408)  # an expired token or a timeout can pass on a later try
+# An expired token, a timeout or a rate limit can pass on a later try.
+POST_RETRYABLE_HTTP = (401, 403, 408, 429)
 
 
 def is_retryable(exc: BaseException) -> bool:
@@ -62,9 +63,10 @@ LEASE_LOST_ERROR = ("LeaseLost: review ran past --max-job-seconds or lost its le
                     "nothing was posted")
 
 
-def _fail(queue: WorkerQueue, job: Job, error: str, retryable: bool, kind: str) -> None:
+def _fail(queue: WorkerQueue, job: Job, error: str, retryable: bool, kind: str,
+          delay_s: float = 0.0) -> None:
     try:
-        state = queue.fail(job, error, retryable=retryable)
+        state = queue.fail(job, error, retryable=retryable, delay_s=delay_s)
     except LeaseLost:
         log.warning("lease lost before recording failure", extra={"job": job.id})
     else:
@@ -92,6 +94,12 @@ def run_one(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
     if result.outcome == "lease-lost":
         # Nothing was posted: hand the job back (or to dead after max attempts), never done.
         _fail(queue, job, LEASE_LOST_ERROR, True, "LeaseLost")
+        _record(metrics, review_increments(result.outcome, result.timings, result.cost_usd), job)
+        return job
+    if result.outcome == "claim-busy":
+        # Another run may still post this head: look again once its claim can be taken over.
+        _fail(queue, job, f"claim-busy: {result.error}", True, "ClaimBusy",
+              delay_s=result.retry_after_s)
         _record(metrics, review_increments(result.outcome, result.timings, result.cost_usd), job)
         return job
     if result.outcome == "post-rejected":

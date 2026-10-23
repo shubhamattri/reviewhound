@@ -20,7 +20,14 @@ import httpx
 
 from reviewhound.diff import Diff, parse_patch
 from reviewhound.procenv import child_env
-from reviewhound.vcs.base import DirSnapshot, PostedComment, PullRequest, ReviewPayload, Snapshot
+from reviewhound.vcs.base import (
+    DirSnapshot,
+    PostedComment,
+    PostedReview,
+    PullRequest,
+    ReviewPayload,
+    Snapshot,
+)
 
 log = logging.getLogger(__name__)
 API = "https://api.github.com"
@@ -72,8 +79,9 @@ class GitHubError(RuntimeError):
 class GitHubVCS:
     def __init__(self, token: str | Callable[[], str], cache_dir: Path,
                  client: httpx.Client | None = None, max_attempts: int = 4,
-                 history_depth: int = 50) -> None:
-        """`token` is a static token, or a provider called per request (App installation tokens)."""
+                 history_depth: int = 50, login: Callable[[], str] | None = None) -> None:
+        """`token` is a static token, or a provider called per request (App installation tokens).
+        `login` names the account the token posts as when `GET /user` cannot (an App's bot)."""
         if not token:
             raise GitHubError("GitHub token is empty; set GITHUB_TOKEN")
         self._token_source = token
@@ -81,6 +89,7 @@ class GitHubVCS:
         self.max_attempts = max_attempts
         self.history_depth = history_depth
         self._viewer: str | None = None
+        self._login = login
         self._http = client or httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
         self._headers = {"Accept": "application/vnd.github+json",
                          "X-GitHub-Api-Version": "2022-11-28"}
@@ -206,7 +215,9 @@ class GitHubVCS:
         return Counter(ln for ln in res.stdout.splitlines() if ln.strip())
 
     def viewer_login(self) -> str:
-        """Login the token acts as, or "" when it cannot say (app installation tokens)."""
+        """Login the token acts as, or "" when it cannot say. A `login` source's errors raise."""
+        if self._login is not None:
+            return self._login()
         if self._viewer is None:
             try:
                 self._viewer = str(self._request("GET", "/user").json().get("login") or "")
@@ -221,6 +232,21 @@ class GitHubVCS:
         d = self._request("POST", f"/repos/{pr.repo}/pulls/{pr.number}/reviews",
                           json=payload).json()
         return str(d.get("id", ""))
+
+    def list_reviews(self, repo: str, number: int) -> list[PostedReview]:
+        out: list[PostedReview] = []
+        page = 1
+        while True:
+            items = self._request("GET", f"/repos/{repo}/pulls/{number}/reviews",
+                                  params={"per_page": 100, "page": page}).json()
+            out += [PostedReview(id=str(r.get("id", "")),
+                                 author=str((r.get("user") or {}).get("login") or ""),
+                                 commit_id=str(r.get("commit_id") or ""),
+                                 body=str(r.get("body") or ""), state=str(r.get("state") or ""))
+                    for r in items]
+            if len(items) < 100:
+                return out
+            page += 1
 
     def review_comments(self, repo: str, number: int, review_id: str) -> list[PostedComment]:
         # The per-review endpoint omits `line`; the PR-wide list has it, so filter that by review.

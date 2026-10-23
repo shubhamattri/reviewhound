@@ -412,7 +412,8 @@ def test_left_and_right_comments_on_the_same_line_number_link_to_their_own_findi
         ReviewComment(path="app/admin.py", line=6, body="r", side="RIGHT"),
         ReviewComment(path="app/admin.py", line=6, body="l", side="LEFT")]))
     result: Any = SimpleNamespace(pr=make_pr(head="h1"), post_id="memory-review-1",
-                                  decision=SimpleNamespace(post=[left, right], held=[]))
+                                  decision=SimpleNamespace(post=[left, right], held=[]),
+                                  read_back=None)
     store = backend.store()
     link_comments(vcs, store, result, PolicyConfig())
     assert store.linked_findings("acme/shop", [1001, 1002]) == {

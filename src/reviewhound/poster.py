@@ -11,6 +11,8 @@ from reviewhound.policy import PolicyDecision
 from reviewhound.proof import UNREPRODUCED
 from reviewhound.vcs.base import ReviewComment, ReviewPayload
 
+SUMMARY_PREFIX = "Reviewhound ("  # every review body starts with it; finds our own landed review
+
 
 def _comment_body(f: Finding) -> str:
     tag = f.severity.name.lower()
@@ -45,7 +47,7 @@ def build_review(head_sha: str, decision: PolicyDecision, diff: Diff, tier: str,
         else:
             body_only.append(f)
     ran = ", ".join(reviewers) if reviewers else "none"
-    lines = [f"Reviewhound ({tier} review). Reviewers that ran: {ran}."]
+    lines = [f"{SUMMARY_PREFIX}{tier} review). Reviewers that ran: {ran}."]
     if not decision.post:
         lines.append("No verified issues found.")
     else:

@@ -18,6 +18,8 @@ from reviewhound.index.treesitter import CodeIndex
 
 log = logging.getLogger(__name__)
 MIN_EVIDENCE_CHARS = 8  # a quote like "x" or "}" matches anywhere and proves nothing
+UNCONFIRMED_BESIDE = ("unverified: kept only because it sits next to lines this PR deleted, "
+                      "and no claim about it was checked true")
 
 
 def is_meaningful(quote: str) -> bool:
@@ -109,15 +111,15 @@ class ClaimChecker:
             return None, f"base version of {f.file} does not match the diff"
         return None, "evidence quote is only in code this PR did not change"
 
-    def _locate_beside_deletion(self, f: Finding, fd: FileDiff,
-                                quote_spans: list[tuple[int, int]], src: str) -> int | None:
-        """A context line of a quote that sits right next to lines this PR deleted, or None.
+    def _locate_beside_deletion(self, f: Finding, fd: FileDiff, quote_spans: list[tuple[int, int]],
+                                src: str) -> tuple[int, int] | None:
+        """(context line, deletion point) for a quote right next to lines this PR deleted, or None.
 
         Every quoted line must be context in a hunk that deletes, and only blank lines, at
         most `snap_distance` of them, may separate the quote from the deleted run.
         """
         lines = src.splitlines()
-        best: tuple[int, int, int] | None = None
+        best: tuple[int, int, int, int] | None = None
         for h in fd.hunks:
             context = set(h.context)
             for gap in h.deleted_at:  # the deleted run sat just before head line `gap`
@@ -131,9 +133,9 @@ class ClaimChecker:
                     for n in range(start, end + 1):
                         if lines[n - 1].strip():
                             away = gap - 1 - n if n < gap else n - gap
-                            key = (away, abs(n - f.line), n)
+                            key = (away, abs(n - f.line), n, gap)
                             best = key if best is None or key < best else best
-        return None if best is None else best[2]
+        return None if best is None else (best[2], best[3])
 
     def _uncovered(self, claim: Claim, path: str) -> ClaimResult:
         return ClaimResult(claim, "unknown", f"{path} is not in a language the index covers")
@@ -252,14 +254,16 @@ class ClaimChecker:
             if left is not None:
                 line, how, has_evidence = left, left_how, True
                 f.side = "LEFT"
+                f.deleted_text = fd.run_text(base_line=left)
             elif not quote_spans:
                 how = left_how
             else:
                 # A removed guard is often quoted by the code that survived around it.
                 beside = self._locate_beside_deletion(f, fd, quote_spans, src)
                 if beside is not None:
-                    line, beside_deletion = beside, True
-                    how = f"anchored on context line {beside}, next to lines this PR deleted"
+                    (line, gap), beside_deletion = beside, True
+                    f.deleted_text = fd.run_text(at=gap)
+                    how = f"anchored on context line {line}, next to lines this PR deleted"
         if line is None:
             return f, how
         if line != f.line or f.side == "LEFT" or beside_deletion:
@@ -268,16 +272,31 @@ class ClaimChecker:
 
         for claim in mf.claims:
             r = self.check_claim(claim, f.file)
+            if beside_deletion and r.verdict == "false":
+                r = self._deleted_quote(claim, f) or r
             f.claim_results.append(r)
             if r.verdict == "false":
                 return f, f"false claim: {r.reason}"
 
         all_true = all(r.verdict == "true" for r in f.claim_results)
         f.verified = has_evidence and all_true
+        if beside_deletion and not any(r.verdict == "true" for r in f.claim_results):
+            # Context next to a deletion proves only where the finding sits, not what it says.
+            f.verified = False
+            f.notes.append(UNCONFIRMED_BESIDE)
         if not has_evidence:
             f.severity = Severity(max(Severity.NIT, f.severity - 1))
             f.notes.append("no evidence quote: severity lowered one step")
         return f, None
+
+    @staticmethod
+    def _deleted_quote(claim: Claim, f: Finding) -> ClaimResult | None:
+        """A quote claim of the code this PR deleted next to the finding holds on the base side."""
+        if claim.kind != "quote" or (claim.file or f.file) != f.file or not claim.text:
+            return None
+        if not is_meaningful(claim.text) or not find_quote(f.deleted_text, claim.text):
+            return None
+        return ClaimResult(claim, "true", "quote found on the lines this PR deleted")
 
     def check_all(self, findings: list[ModelFinding], source: str) -> CheckOutcome:
         out = CheckOutcome()

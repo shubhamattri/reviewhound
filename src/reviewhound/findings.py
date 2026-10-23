@@ -101,6 +101,7 @@ class Finding:
     side: Literal["LEFT", "RIGHT"] = "RIGHT"  # LEFT: `line` is a base line this PR deleted
     proof: Literal["proven", "not_proven", "inconclusive"] | None = None
     proof_test: str = ""  # the generated test code, when the model produced one
+    deleted_text: str = ""  # LEFT or beside a deletion: the deleted run, gone once restored
 
     @property
     def fingerprint(self) -> str:

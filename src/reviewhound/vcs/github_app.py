@@ -53,6 +53,7 @@ class GitHubApp:
         self._sleep = sleep
         self.max_attempts = max_attempts
         self._cache: dict[int, tuple[str, float]] = {}
+        self._login: str | None = None
         self._lock = threading.Lock()
 
     def __repr__(self) -> str:
@@ -87,6 +88,19 @@ class GitHubApp:
             token, expires_at = self._exchange(installation_id)
             self._cache[installation_id] = (token, expires_at)
             return token
+
+    def bot_login(self) -> str:
+        """The login the App's reviews carry: "<slug>[bot]", looked up once with the App JWT."""
+        with self._lock:
+            if self._login is None:
+                try:
+                    slug = self._call("GET", "/app").json()["slug"]
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise GitHubError("GET /app: malformed app response") from exc
+                if not isinstance(slug, str) or not slug:
+                    raise GitHubError("GET /app: malformed app response")
+                self._login = f"{slug}[bot]"
+            return self._login
 
     def token_provider(self, installation_id: int) -> Callable[[], str]:
         return lambda: self.installation_token(installation_id)

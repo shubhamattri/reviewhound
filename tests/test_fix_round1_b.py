@@ -474,8 +474,7 @@ def test_retry_that_times_out_is_uncertain_and_keeps_the_claim(
     assert store.claim_post("acme/shop", 7, "h1") is False
 
 
-@pytest.mark.parametrize("first", [GitHubError("HTTP 502", 502), GitHubError("HTTP 429", 429),
-                                   TimeoutError("socket")])
+@pytest.mark.parametrize("first", [GitHubError("HTTP 502", 502), TimeoutError("socket")])
 def test_only_a_refusal_is_retried(backend: Backend, monkeypatch: pytest.MonkeyPatch,
                                    first: Exception) -> None:
     vcs, reviewer, _store = reviewer_on(backend, [answer(REAL)])

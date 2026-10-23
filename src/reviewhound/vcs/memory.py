@@ -6,7 +6,16 @@ import difflib
 from collections import Counter
 
 from reviewhound.diff import Diff, parse_unified_diff
-from reviewhound.vcs.base import DictSnapshot, PostedComment, PullRequest, ReviewPayload, Snapshot
+from reviewhound.vcs.base import (
+    DictSnapshot,
+    PostedComment,
+    PostedReview,
+    PullRequest,
+    ReviewPayload,
+    Snapshot,
+)
+
+STATES = {"COMMENT": "COMMENTED", "REQUEST_CHANGES": "CHANGES_REQUESTED", "APPROVE": "APPROVED"}
 
 
 def diff_file_maps(base: dict[str, str], head: dict[str, str]) -> Diff:
@@ -64,6 +73,11 @@ class MemoryVCS:
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str:
         self.posted.append(review)
         return f"memory-review-{len(self.posted)}"
+
+    def list_reviews(self, repo: str, number: int) -> list[PostedReview]:
+        return [PostedReview(id=f"memory-review-{i}", author=self.viewer, commit_id=r.head_sha,
+                             body=r.body, state=STATES[r.event])
+                for i, r in enumerate(self.posted, start=1)]
 
     def review_comments(self, repo: str, number: int, review_id: str) -> list[PostedComment]:
         if self.comments_error is not None:

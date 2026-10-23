@@ -176,7 +176,7 @@ def test_second_worker_on_same_head_does_not_post_again(tmp_path: Path) -> None:
     vcs, reviewer, store = setup([answer(REAL), answer(REAL)], posting=True, tmp_path=tmp_path)
     assert store.claim_post("acme/shop", 7, "h1") is True  # another worker got there first
     result = reviewer.review("acme/shop", 7, dry_run=False)
-    assert result.outcome == "already-posted"
+    assert (result.outcome, round(result.retry_after_s)) == ("claim-busy", 1800)
     assert vcs.posted == []
 
 

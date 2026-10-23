@@ -26,7 +26,7 @@ from reviewhound.proof import (
     SandboxRunner,
 )
 from reviewhound.providers import ClaudeCliProvider, FakeProvider, Provider, ProviderRegistry
-from reviewhound.queue import Job
+from reviewhound.queue import DEFAULT_LEASE_S, Job
 from reviewhound.scanners import BuiltinScanner, Scanner, SemgrepScanner
 
 if TYPE_CHECKING:
@@ -72,7 +72,8 @@ def _registry(args: argparse.Namespace) -> ProviderRegistry:
     return ProviderRegistry(providers)
 
 
-def _worker_reviewer_factory(args: argparse.Namespace) -> Callable[[Job], Reviewer]:
+def _worker_reviewer_factory(args: argparse.Namespace,
+                             stale_claim_s: float = DEFAULT_LEASE_S) -> Callable[[Job], Reviewer]:
     """One reviewer per job: proof runners and their time budget are per repo and per review."""
     from reviewhound.vcs.github import GitHubVCS
 
@@ -85,7 +86,7 @@ def _worker_reviewer_factory(args: argparse.Namespace) -> Callable[[Job], Review
 
     def build(job: Job) -> Reviewer:
         return Reviewer(vcs, registry, scanners, store,
-                        proof_runners=_proof_runners(args, job.repo))
+                        proof_runners=_proof_runners(args, job.repo), stale_claim_s=stale_claim_s)
     return build
 
 
@@ -136,7 +137,8 @@ def _github_app() -> GitHubApp | None:
         raise SystemExit(str(exc)) from exc
 
 
-def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp) -> Callable[[Job], Reviewer]:
+def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp,
+                          stale_claim_s: float = DEFAULT_LEASE_S) -> Callable[[Job], Reviewer]:
     """One reviewer per job, authenticated as that job's installation."""
     import httpx
 
@@ -152,9 +154,10 @@ def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp) -> Callable[
 
     def build(job: Job) -> Reviewer:
         # With an App every job uses an installation token, looked up by repo when missing.
-        vcs = GitHubVCS(token_for_job(app, job, lambda: ""), home / "checkouts", client=client)
+        vcs = GitHubVCS(token_for_job(app, job, lambda: ""), home / "checkouts", client=client,
+                        login=app.bot_login)
         return Reviewer(vcs, registry, scanners, store,
-                        proof_runners=_proof_runners(args, job.repo))
+                        proof_runners=_proof_runners(args, job.repo), stale_claim_s=stale_claim_s)
     return build
 
 
@@ -226,7 +229,9 @@ def cmd_worker(args: argparse.Namespace) -> int:
     queue = open_queue(Path(args.home), args.database_url)
     metrics = open_metrics(Path(args.home), args.database_url)
     app = _github_app()
-    reviewer = _worker_reviewer_factory(args) if app is None else _app_reviewer_factory(args, app)
+    # A post claim with no id older than one lease was left by a run that is gone.
+    reviewer = _worker_reviewer_factory(args, queue.lease_s) if app is None else \
+        _app_reviewer_factory(args, app, queue.lease_s)
     if args.once:
         job = run_one(queue, reviewer, metrics, args.max_job_seconds)
         print("no job" if job is None else f"ran job {job.id}")

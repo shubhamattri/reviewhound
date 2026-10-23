@@ -124,7 +124,9 @@ def link_comments(vcs: ReviewThreads, store: ReviewStore, result: ReviewResult,
     by_line: dict[tuple[str, str, int], str] = {(f.file, f.side, f.line): f.fingerprint
                                                for f in posted}
     links: list[tuple[int, str]] = []
-    for c in vcs.review_comments(pr.repo, pr.number, result.post_id):
+    comments = result.read_back if result.read_back is not None else \
+        vcs.review_comments(pr.repo, pr.number, result.post_id)
+    for c in comments:
         fingerprint = by_line.get((c.path, c.side, c.line))
         if fingerprint is None:
             log.warning("posted comment matches no finding", extra={
@@ -149,9 +151,13 @@ def open_reason(row: Mapping[str, Any], head: Snapshot, changed: list[str],
                 sources: Mapping[str, str]) -> str | None:
     """Why an old blocker may still be in the code at `head`; None only when it is positively gone.
 
-    Gone means its quote (or, for a secret, the secret's identity) is absent from its own file and
-    from every other file in the head index (`sources`) and every changed file."""
+    A removed-guard blocker (it carries the deleted text) is gone once that text is back in its
+    file. Any other is gone when its quote (or, for a secret, the secret's identity) is absent
+    from its own file, every other file in the head index (`sources`) and every changed file."""
     path, quote = str(row["file"]), str(row["evidence_quote"])
+    deleted = str(row.get("deleted_text") or "")
+    if deleted:
+        return _still_deleted(path, deleted, head)
     if row["side"] == "LEFT":
         return "a deleted-line finding cannot be shown gone"
     secret = row["category"] == "secret" and bool(row["identity"])
@@ -173,6 +179,19 @@ def open_reason(row: Mapping[str, Any], head: Snapshot, changed: list[str],
         if text is not None and present(text):
             return f"{what} is now in {other}"
     return None
+
+
+def _still_deleted(path: str, deleted: str, head: Snapshot) -> str | None:
+    if not is_meaningful(deleted):
+        return "the deleted code is too short to look for"
+    src = head.read(path)
+    if src is None:
+        skip = head.skip_reason(path)
+        return f"{path} could not be read at head ({skip})" if skip else \
+            f"{path} is not in the head"
+    if find_quote(src, deleted):
+        return None
+    return f"the code this PR deleted is still missing from {path}"
 
 
 def dismiss_stale_verdicts(vcs: ThreadedVCS, store: ReviewStore, result: ReviewResult,
