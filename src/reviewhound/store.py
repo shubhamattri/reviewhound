@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS findings (
     created_at REAL NOT NULL, updated_at REAL NOT NULL,
     UNIQUE (repo, pr, fingerprint)
 );
+CREATE TABLE IF NOT EXISTS posts (
+    repo TEXT NOT NULL, pr INTEGER NOT NULL, head_sha TEXT NOT NULL, created_at REAL NOT NULL,
+    PRIMARY KEY (repo, pr, head_sha)
+);
 CREATE TABLE IF NOT EXISTS feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     repo TEXT NOT NULL, pr INTEGER NOT NULL, fingerprint TEXT NOT NULL,
@@ -119,19 +123,27 @@ class Store:
     @staticmethod
     def _upsert(c: sqlite3.Connection, repo: str, pr: int, head: str, f: Finding, state: str,
                 reason: str | None, now: float) -> None:
-        # Feedback states (declined, resolved, fixed) are never overwritten by a re-review.
+        # A re-review never overwrites developer feedback or the fact that a comment is live.
+        # 'fixed' is not kept: a fixed finding that comes back is posted again, once.
         c.execute(
             "INSERT INTO findings (repo, pr, fingerprint, first_head, last_head, file, line, "
             "severity, category, title, body, source, verified, state, held_reason, created_at, "
             "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT (repo, pr, fingerprint) DO UPDATE SET last_head=excluded.last_head, "
             "line=excluded.line, updated_at=excluded.updated_at, "
-            "state=CASE WHEN findings.state IN ('declined','resolved','fixed','posted') "
+            "state=CASE WHEN findings.state IN ('declined','resolved','posted','reopened') "
             "THEN findings.state ELSE excluded.state END, "
-            "held_reason=CASE WHEN findings.state IN ('declined','resolved','fixed','posted') "
+            "held_reason=CASE WHEN findings.state IN ('declined','resolved','posted','reopened') "
             "THEN findings.held_reason ELSE excluded.held_reason END",
             (repo, pr, f.fingerprint, head, head, f.file, f.line, int(f.severity), f.category,
              f.title, f.body, f.source, int(f.verified), state, reason, now, now))
+
+    def claim_post(self, repo: str, pr: int, head_sha: str) -> bool:
+        """At most one post per head, even if two workers or a retry reach the post step."""
+        with self._tx() as c:
+            cur = c.execute("INSERT OR IGNORE INTO posts (repo, pr, head_sha, created_at) "
+                            "VALUES (?,?,?,?)", (repo.lower(), pr, head_sha, self._clock()))
+            return cur.rowcount == 1
 
     def add_feedback(self, repo: str, pr: int, fingerprint: str, kind: str,
                      detail: str = "") -> bool:

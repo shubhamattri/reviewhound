@@ -55,3 +55,34 @@ def test_feedback_rejects_unknown_kind_and_unknown_finding(tmp_path: Path) -> No
     with pytest.raises(ValueError):
         s.add_feedback("a/b", 1, "f", "liked")
     assert s.add_feedback("a/b", 1, "nope", "resolved") is False
+
+
+@pytest.mark.parametrize("state", ["resolved", "posted", "reopened", "declined"])
+def test_feedback_and_posted_states_survive_a_held_re_review(tmp_path: Path, state: str) -> None:
+    s = Store(tmp_path / "s.db")
+    f = fnd("x")
+    s.record_review(ReviewRecord(repo="a/b", pr=1, head_sha="h1", outcome="posted", posted=True),
+                    [f], [])
+    if state != "posted":
+        s.add_feedback("a/b", 1, f.fingerprint, state)
+    s.record_review(ReviewRecord(repo="a/b", pr=1, head_sha="h2", outcome="posted", posted=True),
+                    [], [(f, "already posted on an earlier head")])
+    assert s.known_state("a/b", 1) == {f.fingerprint: state}
+
+
+def test_fixed_finding_that_comes_back_is_posted_once_then_remembered(tmp_path: Path) -> None:
+    s = Store(tmp_path / "s.db")
+    f = fnd("x")
+    s.record_review(ReviewRecord(repo="a/b", pr=1, head_sha="h1", outcome="posted", posted=True),
+                    [f], [])
+    s.add_feedback("a/b", 1, f.fingerprint, "fixed")
+    s.record_review(ReviewRecord(repo="a/b", pr=1, head_sha="h2", outcome="posted", posted=True),
+                    [f], [])
+    assert s.known_state("a/b", 1) == {f.fingerprint: "posted"}
+
+
+def test_only_one_post_per_head(tmp_path: Path) -> None:
+    s = Store(tmp_path / "s.db")
+    assert s.claim_post("A/b", 1, "h1") is True
+    assert s.claim_post("a/b", 1, "h1") is False
+    assert s.claim_post("a/b", 1, "h2") is True

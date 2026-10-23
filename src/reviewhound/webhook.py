@@ -20,7 +20,7 @@ def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
     if not secret or not header or not header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header)
+    return hmac.compare_digest(expected.encode(), header.encode("utf-8", "replace"))
 
 
 def handle_event(queue: JobQueue, event: str, payload: dict[str, Any]) -> tuple[int, str]:
@@ -70,7 +70,10 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int) -> Threading
             if self.path != "/webhook":
                 self._reply(404, "not found")
                 return
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
             if length <= 0 or length > MAX_BODY:
                 self._reply(413 if length > MAX_BODY else 400, "bad body length")
                 return

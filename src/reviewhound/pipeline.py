@@ -170,6 +170,8 @@ class Reviewer:
                 result.outcome = "shadow"
             elif self.vcs.current_head(repo, number) != pr.head_sha:
                 result.outcome = "head-moved"
+            elif self.store is not None and not self.store.claim_post(repo, number, pr.head_sha):
+                result.outcome = "already-posted"
             else:
                 try:
                     post_id = self.vcs.post_review(pr, result.review)
@@ -196,7 +198,8 @@ class Reviewer:
                              tier=rt.tier if rt else "", model=rt.model if rt else "",
                              providers=tuple(result.reviewers),
                              event=result.review.event if result.review else "",
-                             posted=result.outcome == "posted",
+                             # An uncertain post may have landed: never risk posting it twice.
+                             posted=result.outcome in ("posted", "post-uncertain"),
                              post_id=result.post_id, cost_usd=result.cost_usd,
                              timings=t.timings, error=result.error),
                 posted, held)

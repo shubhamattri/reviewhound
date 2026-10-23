@@ -34,20 +34,27 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"""(?i)\b\w*(?:api[_-]?key|secret|passwd|password|token)\w*["']?\s*[:=]\s*"""
         r"""["'](?P<value>[^"'\s]{12,})["']""")),
 ]
-_SQL_VERB = r"(?:SELECT|INSERT|UPDATE|DELETE)\b"
-_SQL_BUILD = [
-    # f-string or template literal with an interpolation inside the SQL text
-    re.compile(rf"""(?i)\bf"[^"]*{_SQL_VERB}[^"]*\{{"""),
-    re.compile(rf"""(?i)\bf'[^']*{_SQL_VERB}[^']*\{{"""),
-    re.compile(rf"""(?i)`[^`]*{_SQL_VERB}[^`]*\$\{{"""),
-    # SQL literal joined with +, % or .format()
-    re.compile(rf"""(?i)"[^"]*{_SQL_VERB}[^"]*"\s*(?:\+|%|\.format\()"""),
-    re.compile(rf"""(?i)'[^']*{_SQL_VERB}[^']*'\s*(?:\+|%|\.format\()"""),
-]
+# A string is SQL only when it has the shape of a statement, not just a verb in a sentence.
+_SQL_SHAPE = re.compile(
+    r"(?i)\b(?:SELECT\b.+\bFROM|INSERT\s+INTO|UPDATE\b.+\bSET|DELETE\s+FROM)\b")
+_INTERPOLATED = [re.compile(r'\bf"([^"]*)"'), re.compile(r"""\bf'([^']*)'"""),
+                 re.compile(r"`([^`]*\$\{[^`]*)`")]
+_JOINED = [re.compile(r""""([^"]*)"\s*(?:\+|%|\.format\()"""),
+           re.compile(r"""'([^']*)'\s*(?:\+|%|\.format\()""")]
+
+
+def builds_sql(text: str) -> bool:
+    for pat in _INTERPOLATED:
+        for m in pat.finditer(text):
+            if "{" in m.group(1) and _SQL_SHAPE.search(m.group(1)):
+                return True
+    return any(_SQL_SHAPE.search(m.group(1)) for pat in _JOINED for m in pat.finditer(text))
+
+
 _LOG_CALL = re.compile(
     r"\b(?:logger|logging|log|console)\.(?:debug|info|warn|warning|error|exception|log)\s*\((.*)")
 _PLACEHOLDER = re.compile(
-    r"(?i)(example|dummy|placeholder|changeme|xxx+|<[^>]+>|\$\{|^https?://|/|\.)")
+    r"(?i)(example|dummy|placeholder|changeme|your[_-]|xxx+|<[^>]+>|\$\{|^https?://|^\.{0,2}/)")
 
 
 class BuiltinScanner:
@@ -87,7 +94,7 @@ class BuiltinScanner:
                          "environment or a secret store and rotate it.",
                     evidence_quote=redacted, source="scanner:builtin", verified=True))
                 break
-        if any(p.search(text) for p in _SQL_BUILD):
+        if builds_sql(text):
             found.append(Finding(
                 file=path, line=n, severity=Severity.MAJOR, category="sql-injection",
                 title="SQL built by string joining",

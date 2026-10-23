@@ -70,3 +70,22 @@ def test_http_server_rejects_bad_signature_and_accepts_good_one(tmp_path: Path) 
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_non_ascii_signature_is_rejected_not_crashing() -> None:
+    assert verify_signature(SECRET, b"x", "sha256=éé") is False
+
+
+def test_bad_content_length_gets_400(tmp_path: Path) -> None:
+    server = make_server(SQLiteQueue(tmp_path / "q.db"), SECRET, "127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.putrequest("POST", "/webhook")
+        conn.putheader("Content-Length", "abc")
+        conn.endheaders()
+        resp = conn.getresponse()
+        assert (resp.status, json.loads(resp.read())["message"]) == (400, "bad body length")
+    finally:
+        server.shutdown()
+        server.server_close()

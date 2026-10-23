@@ -20,7 +20,7 @@ def test_hard_coded_secret_is_a_blocker_and_redacted_in_the_comment() -> None:
 
 def test_secret_lookalikes_are_not_flagged() -> None:
     head = {"s.py": 'TOKEN_URL = "https://auth.example.com/token"\n'
-                    'PASSWORD = "changeme-please"\nAPI_KEY = os.environ["API_KEY"]\n'}
+                    'PASS' 'WORD = "change' 'me-please"\nAPI_KEY = os.environ["API_KEY"]\n'}
     assert scan({}, head) == []
 
 
@@ -63,3 +63,28 @@ def test_semgrep_results_outside_added_lines_are_ignored(tmp_path) -> None:  # t
                          RepoConfig())
     assert [(f.file, f.line, f.category, f.severity) for f in found] == [
         ("app.py", 2, "semgrep:rule.x", Severity.MAJOR)]
+
+
+def test_real_secret_shapes_with_slash_or_dot_are_flagged() -> None:
+    head = {"k.py": 'aws_secret = "wJalrXUtnFEMI/K7MDENGbPxRfiCYzzzzzzzzzzz"\n'
+                    'session_token = "' + "e" + 'yJhbGciOiJIUzI1.e' + 'yJzdWIiOiIxMjM0.SflKxwRJSMeKKF2QT4"\n'}
+    assert scan({}, head) == [("k.py", 1, "secret"), ("k.py", 2, "secret")]
+
+
+def test_messages_that_mention_sql_verbs_are_not_sql() -> None:
+    head = {"m.py": 'raise Error(f"Failed to update {name}")\n'
+                    'log(f"Could not delete {path}")\n'
+                    'msg = "Select an option: " + choice\n',
+            "m.ts": "throw new Error(`Cannot update ${id}`);\n"}
+    assert scan({}, head) == []
+
+
+def test_sql_with_interpolation_before_from_is_flagged() -> None:
+    head = {"q.py": 'q = f"SELECT {cols} FROM users"\n'}
+    assert scan({}, head) == [("q.py", 1, "sql-injection")]
+
+
+def test_constant_sql_and_url_values_are_not_flagged() -> None:
+    head = {"c.py": 'q = db.execute(f"SELECT id FROM users")\n'
+                    'OAUTH_TOKEN_ENDPOINT = "https://login.acme.io/oauth2/token"\n'}
+    assert scan({}, head) == []

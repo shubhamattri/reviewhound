@@ -22,7 +22,7 @@ def test_without_blocker_the_review_is_a_comment() -> None:
     assert apply_policy([fnd(4, Severity.MAJOR)], PolicyConfig()).event == "COMMENT"
 
 
-def test_known_findings_are_never_repeated() -> None:
+def test_posted_and_declined_are_held_but_a_fixed_finding_that_returns_is_posted() -> None:
     posted, declined, fixed = fnd(1, Severity.MAJOR), fnd(2, Severity.MAJOR), fnd(3, Severity.MAJOR)
     known = {posted.fingerprint: "posted", declined.fingerprint: "declined",
              fixed.fingerprint: "fixed"}

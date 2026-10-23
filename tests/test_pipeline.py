@@ -74,6 +74,8 @@ def test_posting_on_posts_once_and_never_repeats_on_next_head(tmp_path: Path) ->
     first = reviewer.review("acme/shop", 7, dry_run=False)
     assert first.outcome == "posted"
     assert [len(p.comments) for p in vcs.posted] == [1]
+    vcs.pr = make_pr(head="h2")
+    vcs.head_sha_now = "h2"
     second = reviewer.review("acme/shop", 7, dry_run=False)
     assert second.outcome == "posted"
     assert [len(p.comments) for p in vcs.posted] == [1, 0]
@@ -128,10 +130,34 @@ def test_post_failure_is_recorded_as_uncertain(tmp_path: Path) -> None:
     result = reviewer.review("acme/shop", 7, dry_run=False)
     assert (result.outcome, result.error) == ("post-uncertain", "TimeoutError")
     assert [(r["outcome"], r["posted"]) for r in store.reviews("acme/shop", 7)] == [
-        ("post-uncertain", 0)]
+        ("post-uncertain", 1)]
 
 
 def test_closed_pr_is_skipped_without_model_call(tmp_path: Path) -> None:
     vcs = MemoryVCS(make_pr(head="h1", state="closed"), BASE, HEAD)
     reviewer = Reviewer(vcs, ProviderRegistry([FakeProvider([])]), [], None)
     assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "skipped"
+
+
+def test_second_worker_on_same_head_does_not_post_again(tmp_path: Path) -> None:
+    vcs, reviewer, store = setup([answer(REAL), answer(REAL)], posting=True, tmp_path=tmp_path)
+    assert store.claim_post("acme/shop", 7, "h1") is True  # another worker got there first
+    result = reviewer.review("acme/shop", 7, dry_run=False)
+    assert result.outcome == "already-posted"
+    assert vcs.posted == []
+
+
+def test_uncertain_post_is_remembered_as_posted_so_it_is_never_doubled(tmp_path: Path) -> None:
+    vcs, reviewer, store = setup([answer(REAL), answer(REAL)], posting=True, tmp_path=tmp_path)
+    real_post = vcs.post_review
+
+    def boom(pr, review):  # type: ignore[no-untyped-def]
+        raise TimeoutError("socket")
+    vcs.post_review = boom  # type: ignore[method-assign]
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "post-uncertain"
+    assert [f["state"] for f in store.findings("acme/shop", 7)] == ["posted"]
+    vcs.post_review = real_post  # type: ignore[method-assign]
+    vcs.pr = make_pr(head="h2")
+    vcs.head_sha_now = "h2"
+    reviewer.review("acme/shop", 7, dry_run=False)
+    assert [len(p.comments) for p in vcs.posted] == [0]
