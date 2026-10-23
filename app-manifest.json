@@ -1,0 +1,20 @@
+{
+  "name": "Reviewhound",
+  "url": "https://github.com/your-org/reviewhound",
+  "description": "Pull-request reviewer: the model proposes findings and code verifies them.",
+  "public": false,
+  "hook_attributes": {
+    "url": "https://reviewhound.example.com/webhook",
+    "active": true
+  },
+  "default_permissions": {
+    "pull_requests": "write",
+    "contents": "read",
+    "metadata": "read"
+  },
+  "default_events": [
+    "pull_request",
+    "pull_request_review_thread",
+    "pull_request_review_comment"
+  ]
+}

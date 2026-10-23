@@ -90,6 +90,52 @@ bugs, two clean PRs, expected findings, and a recorded model answer that include
 hallucinations (invented helpers, quotes that do not exist, bugs in unchanged code, false
 "missing guard" claims). Any prompt or checker change must not lower precision on this set.
 
+## Install as a GitHub App
+
+Running as an App means each repo is reviewed with a short-lived installation token instead
+of one person's token, and developers' reactions on GitHub flow back as feedback.
+
+1. Create the App. Either fill in the form at *Settings > Developer settings > GitHub Apps*,
+   or start from [`app-manifest.json`](app-manifest.json) (set your webhook URL first).
+   - Permissions: **Pull requests: read and write**, **Contents: read**, **Metadata: read**.
+   - Subscribe to events: **`pull_request`**, **`pull_request_review_thread`**,
+     **`pull_request_review_comment`**.
+   - Webhook URL: `https://<your host>/webhook`, with a webhook secret.
+2. Generate a private key for the App and save the `.pem` file where the worker can read it.
+3. Install the App on the repos to review.
+4. Run both processes with these environment variables:
+
+| Variable | Used by | What it is |
+|---|---|---|
+| `REVIEWHOUND_WEBHOOK_SECRET` | `serve` | The App's webhook secret. Required. |
+| `REVIEWHOUND_APP_ID` | `serve`, `worker` | The App id. `serve` uses it to ignore the App's own replies. |
+| `REVIEWHOUND_APP_PRIVATE_KEY_PATH` | `worker` | Path to the App's private key (`.pem`). |
+| `GITHUB_TOKEN` | `worker`, optional | Fallback for jobs with no installation id (manual `enqueue`). |
+
+```bash
+REVIEWHOUND_WEBHOOK_SECRET=... REVIEWHOUND_APP_ID=123456 uv run reviewhound serve --port 8787
+REVIEWHOUND_APP_ID=123456 REVIEWHOUND_APP_PRIVATE_KEY_PATH=~/reviewhound.pem uv run reviewhound worker
+```
+
+Set both App variables or neither; half a configuration stops the worker at start. Without
+them everything works as before with `GITHUB_TOKEN` or `gh`. The key and tokens are never
+logged. Tokens are cached per installation and renewed 5 minutes before they expire.
+
+What the App does with the events:
+
+- `pull_request`: queues a review for the new head, remembering the installation.
+- After a review posts, the worker reads back the comment ids GitHub assigned and links each
+  one to its finding.
+- `pull_request_review_thread`: resolving a thread records the finding as `resolved` (it is
+  not posted again); unresolving records `reopened`.
+- `pull_request_review_comment`: a reply to one of our comments is recorded as `reply`
+  feedback (first 500 characters). Replies made by the App itself are ignored.
+- When a new head's review has no open blocking finding, our earlier "changes requested"
+  reviews on that PR are dismissed. A failed dismissal is logged, recorded, and retried after
+  the next posted review; it never fails the review.
+
+The webhook only writes to the local database; it never calls GitHub.
+
 ## Contributing and roadmap
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md). Licensed under Apache-2.0.
@@ -97,8 +143,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md). Licensed un
 ## Not in milestone 1
 
 - Proof by generated failing test in a sandbox (milestone 2).
-- Feedback from GitHub events (thread resolved, replies); today `reviewhound feedback` records it.
-- GitHub App installation tokens; today a user token (`GITHUB_TOKEN` or `gh`) is used.
+- Feedback from GitHub events and App installation tokens: done in milestone 3, see
+  "Install as a GitHub App".
 - Comments on deleted lines; findings must sit on lines the PR added.
 - A post that times out is recorded as `post-uncertain` and not retried, so it may be missing
   or present on GitHub; nothing posts it twice automatically.
