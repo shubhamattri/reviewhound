@@ -83,7 +83,7 @@ budget:
 proof:                    # runs PR code: read "Proof by failing test" first
   enabled: false
   min_severity: blocker
-  runner: docker          # docker | local (local also needs --allow-local-proof)
+  runner: docker          # docker | local (local also needs --allow-local-proof-repo)
   timeout_s: 60
   max_findings: 3
   downgrade_unproven: false
@@ -101,28 +101,42 @@ result is read from pytest's `--junitxml` report, never from its console text:
 - **proven**: every test failed with `AssertionError`, or with the exception the model said the
   bug raises. Import, syntax, collection and fixture errors never count.
 - **not_proven**: the test passed. With `downgrade_unproven: true` a not-proven blocker becomes
-  major (and is held if that is below `min_severity_to_post`).
+  major (and is held if that is below `min_severity_to_post`), but the review's verdict stays
+  what it was before proofs (see the threat model below).
 - **inconclusive**: anything else, including a timeout, a malformed model answer, Docker not
   running, or a runner crash. Severity is never changed.
 
-A proven finding's comment says so and carries the test in a collapsed `<details>` block. A
-proof problem never fails the review.
+A proven finding's comment says "Reproduced by a generated test" and carries the test in a
+collapsed `<details>` block. A held, downgraded blocker is still named in the review body. A
+proof problem never fails the review, and all proofs in one review share a time budget
+(`--max-proof-seconds`, default 300).
+
+**Threat model.** The generated test runs in the same sandbox as the PR's own code, and that
+code (a `conftest.py`, a `sitecustomize.py`, an import side effect) can rewrite the report or
+make any assertion pass or fail. A proof result is therefore evidence for a human, never a
+security decision: it never dismisses a review, never turns REQUEST_CHANGES into COMMENT and
+never removes a finding from the verdict. "Reproduced" means the test failed as claimed on
+this head, not that the bug is certain.
 
 **This executes code from the pull request.** It is off by default and the repo must turn it on
 in `.reviewhound.yml` on its base branch.
 
-- `runner: docker` (default) runs `docker run --rm --network none --read-only --memory 512m
-  --cpus 1 --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges` with a tmpfs
-  `/tmp`, the tree mounted read-only and copied to a writable dir inside the container. The
-  stock `python:3.12-slim` image has no pytest; pass `--proof-image` with an image that does.
-  When the Docker daemon is not reachable the proof is inconclusive ("docker unavailable").
+- `runner: docker` (default) starts a container from `reviewhound-proof:latest` (build it from
+  `Dockerfile.proof`; it is never pulled) as user 65534 with `--network none --read-only
+  --memory 512m --cpus 1 --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges`,
+  the tree mounted read-only and copied into a tmpfs `/tmp`, and the report in a size-limited
+  tmpfs `/out` that is read back through `docker exec` and never touches a host path. The
+  worker needs the Docker CLI and socket; see docs/deploy.md. When the Docker daemon is not
+  reachable the proof is inconclusive ("docker unavailable").
 - `runner: local` is a plain subprocess with an allowlisted environment (no tokens, `HOME` in
   the temp dir), CPU, file-size and (on Linux) address-space limits, and its process group
-  killed on timeout. It is **not a sandbox**. A repo's config cannot enable it alone: the
-  operator must also start Reviewhound with `--allow-local-proof`. Use it only for repos whose
-  every PR author you would let run code on the machine.
-- With `downgrade_unproven: true`, PR code can influence a finding's severity (a test that
-  passes downgrades it). Keep it off for repos with untrusted authors.
+  killed on timeout. It is **not a sandbox**. A repo's config cannot enable it: the operator
+  names each repo that may use it with `--allow-local-proof-repo owner/name`; every other repo
+  gets "proof runner 'local' is not enabled on this server". List only repos whose every PR
+  author you would let run code on the machine.
+- With `downgrade_unproven: true`, PR code can influence a finding's label and whether its
+  comment is posted (a test that passes downgrades it), though never the verdict. Keep it off
+  for repos with untrusted authors.
 
 TypeScript proofs are not built yet (next: a vitest or jest runner behind the same interface).
 
