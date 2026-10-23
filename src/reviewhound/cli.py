@@ -8,15 +8,20 @@ import logging
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from reviewhound.config import ConfigError
 from reviewhound.evals import run_eval
 from reviewhound.pipeline import Reviewer
 from reviewhound.providers import ClaudeCliProvider, FakeProvider, Provider, ProviderRegistry
-from reviewhound.queue import SQLiteQueue
-from reviewhound.scanners import BuiltinScanner, SemgrepScanner
+from reviewhound.queue import Job, SQLiteQueue
+from reviewhound.scanners import BuiltinScanner, Scanner, SemgrepScanner
 from reviewhound.store import Store
+
+if TYPE_CHECKING:
+    from reviewhound.vcs.github_app import GitHubApp
 
 DEFAULT_HOME = Path(os.environ.get("REVIEWHOUND_HOME", Path.home() / ".reviewhound"))
 
@@ -67,6 +72,41 @@ def _reviewer(args: argparse.Namespace, with_store: bool) -> Reviewer:
     return Reviewer(vcs, _registry(args), [BuiltinScanner(), SemgrepScanner()], store)
 
 
+def _github_app() -> GitHubApp | None:
+    from reviewhound.vcs.github_app import GitHubApp, GitHubAppConfigError
+
+    try:
+        return GitHubApp.from_env()
+    except GitHubAppConfigError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp) -> Callable[[Job], Reviewer]:
+    """One reviewer per job, authenticated as that job's installation."""
+    import httpx
+
+    from reviewhound.vcs.github import API, GitHubVCS
+    from reviewhound.vcs.github_app import token_for_job
+
+    home = Path(args.home)
+    home.mkdir(parents=True, exist_ok=True)
+    store = Store(home / "reviewhound.db")
+    registry = _registry(args)
+    scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner()]
+    client = httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
+
+    def static_token() -> str:
+        token = os.environ.get("GITHUB_TOKEN", "")
+        if not token:
+            raise ConfigError("job has no installation id and GITHUB_TOKEN is not set")
+        return token
+
+    def build(job: Job) -> Reviewer:
+        vcs = GitHubVCS(token_for_job(app, job, static_token), home / "checkouts", client=client)
+        return Reviewer(vcs, registry, scanners, store)
+    return build
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     reviewer = _reviewer(args, with_store=not args.dry_run)
     result = reviewer.review(args.repo, args.pr, dry_run=args.dry_run)
@@ -104,7 +144,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if not secret:
         raise SystemExit("Set REVIEWHOUND_WEBHOOK_SECRET to the GitHub App webhook secret.")
     Path(args.home).mkdir(parents=True, exist_ok=True)
-    server = make_server(SQLiteQueue(Path(args.home) / "queue.db"), secret, args.host, args.port)
+    server = make_server(SQLiteQueue(Path(args.home) / "queue.db"), secret, args.host, args.port,
+                         store=Store(Path(args.home) / "reviewhound.db"),
+                         app_id=os.environ.get("REVIEWHOUND_APP_ID") or None)
     print(f"listening on {args.host}:{args.port}")
     server.serve_forever()
     return 0
@@ -114,7 +156,9 @@ def cmd_worker(args: argparse.Namespace) -> int:
     from reviewhound.worker import run_forever, run_one
 
     queue = SQLiteQueue(Path(args.home) / "queue.db")
-    reviewer = _reviewer(args, with_store=True)
+    app = _github_app()
+    reviewer: Reviewer | Callable[[Job], Reviewer] = (
+        _reviewer(args, with_store=True) if app is None else _app_reviewer_factory(args, app))
     if args.once:
         job = run_one(queue, reviewer)
         print("no job" if job is None else f"ran job {job.id}")

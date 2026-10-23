@@ -6,7 +6,7 @@ import difflib
 from collections import Counter
 
 from reviewhound.diff import Diff, parse_unified_diff
-from reviewhound.vcs.base import DictSnapshot, PullRequest, ReviewPayload, Snapshot
+from reviewhound.vcs.base import DictSnapshot, PostedComment, PullRequest, ReviewPayload, Snapshot
 
 
 def diff_file_maps(base: dict[str, str], head: dict[str, str]) -> Diff:
@@ -35,6 +35,9 @@ class MemoryVCS:
         self.head = head
         self.head_sha_now = pr.head_sha
         self.posted: list[ReviewPayload] = []
+        self.dismissed: list[tuple[str, str]] = []
+        self.dismiss_error: Exception | None = None
+        self.comments_error: Exception | None = None
 
     def get_pull(self, repo: str, number: int) -> PullRequest:
         return self.pr
@@ -57,3 +60,15 @@ class MemoryVCS:
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str:
         self.posted.append(review)
         return f"memory-review-{len(self.posted)}"
+
+    def review_comments(self, repo: str, number: int, review_id: str) -> list[PostedComment]:
+        if self.comments_error is not None:
+            raise self.comments_error
+        n = int(review_id.rsplit("-", 1)[1])
+        return [PostedComment(id=n * 1000 + i, path=c.path, line=c.line)
+                for i, c in enumerate(self.posted[n - 1].comments, start=1)]
+
+    def dismiss_review(self, repo: str, number: int, review_id: str, message: str) -> None:
+        if self.dismiss_error is not None:
+            raise self.dismiss_error
+        self.dismissed.append((review_id, message))

@@ -9,7 +9,9 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from reviewhound.github_feedback import FEEDBACK_EVENTS, handle_feedback_event
 from reviewhound.queue import JobQueue
+from reviewhound.store import Store
 
 log = logging.getLogger(__name__)
 PR_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
@@ -23,10 +25,15 @@ def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
     return hmac.compare_digest(expected.encode(), header.encode("utf-8", "replace"))
 
 
-def handle_event(queue: JobQueue, event: str, payload: dict[str, Any]) -> tuple[int, str]:
+def handle_event(queue: JobQueue, event: str, payload: dict[str, Any],
+                 store: Store | None = None, app_id: str | None = None) -> tuple[int, str]:
     """Return (HTTP status, message). Pure so it can be tested without a socket."""
     if event == "ping":
         return 200, "pong"
+    if event in FEEDBACK_EVENTS:
+        if store is None:
+            return 202, f"ignored event {event}: no store"
+        return handle_feedback_event(store, event, payload, app_id)
     if event != "pull_request":
         return 202, f"ignored event {event}"
     action = payload.get("action")
@@ -54,7 +61,8 @@ def handle_event(queue: JobQueue, event: str, payload: dict[str, Any]) -> tuple[
     return 202, f"job {job_id} {'queued' if created else 'already queued'}"
 
 
-def make_server(queue: JobQueue, secret: str, host: str, port: int) -> ThreadingHTTPServer:
+def make_server(queue: JobQueue, secret: str, host: str, port: int, store: Store | None = None,
+                app_id: str | None = None) -> ThreadingHTTPServer:
     if not secret:
         raise ValueError("webhook secret is required")
 
@@ -92,7 +100,8 @@ def make_server(queue: JobQueue, secret: str, host: str, port: int) -> Threading
                 self._reply(400, "body is not JSON")
                 return
             status, message = handle_event(queue, self.headers.get("X-GitHub-Event", ""),
-                                           payload if isinstance(payload, dict) else {})
+                                           payload if isinstance(payload, dict) else {},
+                                           store, app_id)
             self._reply(status, message)
 
         def log_message(self, format: str, *args: Any) -> None:

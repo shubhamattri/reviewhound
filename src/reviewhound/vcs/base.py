@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from reviewhound.diff import Diff
 
@@ -28,6 +28,15 @@ class ReviewComment:
     path: str
     line: int
     body: str
+
+
+@dataclass(frozen=True)
+class PostedComment:
+    """A review comment as GitHub stored it, read back after posting."""
+
+    id: int
+    path: str
+    line: int
 
 
 @dataclass
@@ -96,3 +105,12 @@ class VCS(Protocol):
     def current_head(self, repo: str, number: int) -> str: ...
 
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str: ...
+
+
+@runtime_checkable
+class ReviewThreads(Protocol):
+    """Optional VCS ability: read back posted comments and dismiss an earlier review."""
+
+    def review_comments(self, repo: str, number: int, review_id: str) -> list[PostedComment]: ...
+
+    def dismiss_review(self, repo: str, number: int, review_id: str, message: str) -> None: ...

@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from reviewhound.diff import Diff, parse_patch
-from reviewhound.vcs.base import DirSnapshot, PullRequest, ReviewPayload, Snapshot
+from reviewhound.vcs.base import DirSnapshot, PostedComment, PullRequest, ReviewPayload, Snapshot
 
 log = logging.getLogger(__name__)
 API = "https://api.github.com"
@@ -157,3 +157,20 @@ class GitHubVCS:
         d = self._request("POST", f"/repos/{pr.repo}/pulls/{pr.number}/reviews",
                           json=payload).json()
         return str(d.get("id", ""))
+
+    def review_comments(self, repo: str, number: int, review_id: str) -> list[PostedComment]:
+        out: list[PostedComment] = []
+        page = 1
+        while True:
+            items = self._request("GET", f"/repos/{repo}/pulls/{number}/reviews/{review_id}"
+                                  "/comments", params={"per_page": 100, "page": page}).json()
+            for c in items:
+                out.append(PostedComment(id=int(c["id"]), path=str(c.get("path") or ""),
+                                         line=int(c.get("line") or c.get("original_line") or 0)))
+            if len(items) < 100:
+                return out
+            page += 1
+
+    def dismiss_review(self, repo: str, number: int, review_id: str, message: str) -> None:
+        self._request("PUT", f"/repos/{repo}/pulls/{number}/reviews/{review_id}/dismissals",
+                      json={"message": message, "event": "DISMISS"})

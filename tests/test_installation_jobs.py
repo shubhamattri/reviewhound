@@ -162,3 +162,22 @@ def test_worker_factory_failure_is_classified_not_lost(tmp_path: Path) -> None:
     after = q.get(done.id)
     assert after is not None and after.state == "dead"
     assert after.last_error == "ConfigError: job has no installation id and no static token"
+
+
+def test_cli_app_factory_uses_installation_or_static_token(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+
+    from reviewhound.cli import _app_reviewer_factory
+    from reviewhound.vcs.github import GitHubVCS
+    app = GitHubApp("1", PEM)
+    monkeypatch.setattr(app, "installation_token", lambda iid: f"ghs_{iid}")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    build = _app_reviewer_factory(argparse.Namespace(home=str(tmp_path), fake_answer=None), app)
+    vcs = build(job(42)).vcs
+    assert isinstance(vcs, GitHubVCS) and vcs._token() == "ghs_42"
+    with pytest.raises(ConfigError, match="no installation id and GITHUB_TOKEN is not set"):
+        build(job(None))
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_static")
+    vcs = build(job(None)).vcs
+    assert isinstance(vcs, GitHubVCS) and vcs._token() == "ghp_static"

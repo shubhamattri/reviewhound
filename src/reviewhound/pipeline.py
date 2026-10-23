@@ -14,6 +14,7 @@ from reviewhound.config import CONFIG_FILENAME, RepoConfig, load_config
 from reviewhound.context import build_context
 from reviewhound.diff import Diff
 from reviewhound.findings import Finding, FindingsParseError, ModelReview, parse_model_review
+from reviewhound.github_feedback import after_post
 from reviewhound.index.conventions import learn_conventions
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.paths import language_of, matches_any
@@ -181,8 +182,11 @@ class Reviewer:
                 else:
                     result.outcome = "posted"
                     result.post_id = post_id
-        return self._finish(result, t, decision.post,
+        done = self._finish(result, t, decision.post,
                             [(f, r) for f, r in decision.held if r != "duplicate"])
+        if done.outcome == "posted" and self.store is not None:
+            after_post(self.vcs, self.store, done, cfg.policy)
+        return done
 
     def _finish(self, result: ReviewResult, t: _Timer, posted: list[Finding],
                 held: list[tuple[Finding, str]]) -> ReviewResult:

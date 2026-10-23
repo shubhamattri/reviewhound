@@ -120,7 +120,8 @@ class GitHubApp:
 
 
 class _HasInstallation(Protocol):
-    installation_id: int | None
+    @property
+    def installation_id(self) -> int | None: ...
 
 
 def token_for_job(app: GitHubApp | None, job: _HasInstallation,
