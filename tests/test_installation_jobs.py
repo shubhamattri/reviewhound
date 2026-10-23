@@ -304,3 +304,29 @@ def test_worker_marks_a_job_on_an_uninstalled_repo_dead_at_once(tmp_path: Path) 
     assert dead is not None and (dead.state, dead.attempts) == ("dead", 1)
     assert dead.last_error == ("AppNotInstalledError: GitHub App 12345 is not installed on "
                                "acme/shop (GET /repos/acme/shop/installation -> 404)")
+
+
+def test_serve_wires_queue_store_app_id_and_metrics_together(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import reviewhound.webhook
+    from reviewhound.cli import main
+    from reviewhound.store import Store
+    seen: dict[str, Any] = {}
+
+    class Server:
+        def serve_forever(self) -> None:
+            seen["served"] = True
+
+    def fake_make_server(queue: Any, secret: str, host: str, port: int, **kw: Any) -> Server:
+        seen.update(queue=queue, secret=secret, **kw)
+        return Server()
+    monkeypatch.setattr(reviewhound.webhook, "make_server", fake_make_server)
+    monkeypatch.delenv("REVIEWHOUND_DATABASE_URL", raising=False)
+    monkeypatch.setenv("REVIEWHOUND_WEBHOOK_SECRET", "s3")
+    monkeypatch.setenv("REVIEWHOUND_APP_ID", "123")
+    assert main(["--home", str(tmp_path), "serve"]) == 0
+    assert seen["served"] is True and seen["secret"] == "s3" and seen["app_id"] == "123"
+    assert isinstance(seen["queue"], SQLiteQueue) and isinstance(seen["store"], Store)
+    assert seen["store"].path == str(tmp_path / "reviewhound.db")
+    seen["queue"].enqueue("a/b", 1, "h1", installation_id=9)
+    assert 'queue_backlog{state="queued"} 1' in seen["metrics"]().splitlines()
