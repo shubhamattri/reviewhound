@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -122,7 +122,8 @@ class Reviewer:
         raise ProviderError(f"model answers did not match the schema: {last}")
 
     def review(self, repo: str, number: int, *, dry_run: bool,
-               expected_head: str | None = None) -> ReviewResult:
+               expected_head: str | None = None,
+               should_post: Callable[[], bool] | None = None) -> ReviewResult:
         t = _Timer()
         with t.stage("fetch"):
             pr = self.vcs.get_pull(repo, number)
@@ -194,6 +195,8 @@ class Reviewer:
                 result.outcome = "dry-run"
             elif not cfg.posting:
                 result.outcome = "shadow"
+            elif should_post is not None and not should_post():
+                result.outcome = "lease-lost"
             elif self.vcs.current_head(repo, number) != pr.head_sha:
                 result.outcome = "head-moved"
             elif self.store is not None and not self.store.claim_post(repo, number, pr.head_sha):

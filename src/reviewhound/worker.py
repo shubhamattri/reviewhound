@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import cast
 
 from reviewhound.config import ConfigError
-from reviewhound.heartbeat import LeaseHeartbeat
+from reviewhound.heartbeat import DEFAULT_MAX_JOB_SECONDS, LeaseHeartbeat
 from reviewhound.metrics import (
     BacklogAlarm,
     Increment,
@@ -51,8 +51,22 @@ def _reviewer_for(reviewer: Reviewer | Callable[[Job], Reviewer], job: Job) -> R
     return reviewer(job)
 
 
+LEASE_LOST_ERROR = ("LeaseLost: review ran past --max-job-seconds or lost its lease; "
+                    "nothing was posted")
+
+
+def _fail(queue: WorkerQueue, job: Job, error: str, retryable: bool, kind: str) -> None:
+    try:
+        state = queue.fail(job, error, retryable=retryable)
+    except LeaseLost:
+        log.warning("lease lost before recording failure", extra={"job": job.id})
+    else:
+        log.error("job failed", extra={"job": job.id, "error": kind, "new_state": state})
+
+
 def run_one(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
-            metrics: MetricsLog | None = None) -> Job | None:
+            metrics: MetricsLog | None = None,
+            max_job_seconds: float = DEFAULT_MAX_JOB_SECONDS) -> Job | None:
     """`reviewer` may be a factory, so each job can use its own installation's token."""
     job = queue.claim()
     if job is None:
@@ -61,18 +75,17 @@ def run_one(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
                                    "head": job.head_sha, "attempt": job.attempts})
     try:
         runner = _reviewer_for(reviewer, job)
-        with LeaseHeartbeat(queue, job):
-            result = runner.review(job.repo, job.pr, dry_run=False, expected_head=job.head_sha)
+        with LeaseHeartbeat(queue, job, max_job_seconds=max_job_seconds) as hb:
+            result = runner.review(job.repo, job.pr, dry_run=False, expected_head=job.head_sha,
+                                   should_post=lambda: not hb.lost)
     except Exception as exc:  # noqa: BLE001 - every failure must be classified, not lost
-        retry = is_retryable(exc)
-        try:
-            state = queue.fail(job, f"{type(exc).__name__}: {exc}", retryable=retry)
-        except LeaseLost:
-            log.warning("lease lost before recording failure", extra={"job": job.id})
-        else:
-            log.error("job failed", extra={"job": job.id, "error": type(exc).__name__,
-                                           "new_state": state})
+        _fail(queue, job, f"{type(exc).__name__}: {exc}", is_retryable(exc), type(exc).__name__)
         _record(metrics, failure_increments(type(exc).__name__), job)
+        return job
+    if result.outcome == "lease-lost":
+        # Nothing was posted: hand the job back (or to dead after max attempts), never done.
+        _fail(queue, job, LEASE_LOST_ERROR, True, "LeaseLost")
+        _record(metrics, review_increments(result.outcome, result.timings, result.cost_usd), job)
         return job
     try:
         queue.complete(job)
@@ -86,12 +99,13 @@ def run_one(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
 def run_forever(queue: WorkerQueue, reviewer: Reviewer | Callable[[Job], Reviewer],
                 idle_sleep_s: float = 5.0,
                 should_stop: Callable[[], bool] = lambda: False,
-                metrics: MetricsLog | None = None, alarm: BacklogAlarm | None = None) -> None:
+                metrics: MetricsLog | None = None, alarm: BacklogAlarm | None = None,
+                max_job_seconds: float = DEFAULT_MAX_JOB_SECONDS) -> None:
     while not should_stop():
         if alarm is not None:
             try:
                 alarm.check()
             except Exception as exc:  # noqa: BLE001 - the alarm must never stop the worker
                 log.error("backlog check failed", extra={"error": type(exc).__name__})
-        if run_one(queue, reviewer, metrics) is None:
+        if run_one(queue, reviewer, metrics, max_job_seconds) is None:
             time.sleep(idle_sleep_s)

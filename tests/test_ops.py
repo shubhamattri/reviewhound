@@ -2,6 +2,7 @@ import http.client
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -34,7 +35,8 @@ class StubReviewer:
         self.calls = 0
 
     def review(self, repo: str, number: int, *, dry_run: bool,
-               expected_head: str | None = None) -> SimpleNamespace:
+               expected_head: str | None = None,
+               should_post: Callable[[], bool] | None = None) -> SimpleNamespace:
         self.calls += 1
         time.sleep(self.sleep_s)
         if self.during is not None:
