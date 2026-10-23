@@ -137,3 +137,8 @@ class ReviewThreads(Protocol):
     def review_comments(self, repo: str, number: int, review_id: str) -> list[PostedComment]: ...
 
     def dismiss_review(self, repo: str, number: int, review_id: str, message: str) -> None: ...
+
+
+@runtime_checkable
+class ThreadedVCS(VCS, ReviewThreads, Protocol):
+    """A VCS with the thread abilities, so a follow-up can also re-read the PR head."""

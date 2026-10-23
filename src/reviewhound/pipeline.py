@@ -47,6 +47,8 @@ class ReviewResult:
     rendered: str = ""
     error: str = ""
     post_id: str = ""
+    snapshot: Snapshot | None = None  # the head this run reviewed, for follow-ups
+    changed_paths: list[str] = field(default_factory=list)
 
 
 class _Timer:
@@ -144,7 +146,8 @@ class Reviewer:
             return self._finish(result, t, [], [])
 
         with t.stage("index"):
-            head = self.vcs.snapshot(repo, pr.head_sha)
+            result.snapshot = head = self.vcs.snapshot(repo, pr.head_sha)
+            result.changed_paths = list(diff.changed_paths)
             index = build_index(head, diff, cfg)
             churn = self.vcs.churn(repo, pr.head_sha)
             conv = learn_conventions(index, churn, cfg.auth.guard_functions)

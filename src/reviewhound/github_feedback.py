@@ -4,11 +4,14 @@ and dismiss our own stale "changes requested" verdict once a new head has no ope
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
+from reviewhound.checker import find_quote, is_meaningful
 from reviewhound.config import PolicyConfig, Severity
+from reviewhound.scanners import secret_identities
 from reviewhound.store import ReviewStore
-from reviewhound.vcs.base import VCS, ReviewThreads
+from reviewhound.vcs.base import VCS, ReviewThreads, Snapshot, ThreadedVCS
 from reviewhound.vcs.github import GitHubError
 
 if TYPE_CHECKING:
@@ -101,7 +104,7 @@ def _comment_event(store: ReviewStore, repo: str, payload: dict[str, Any],
 
 def after_post(vcs: VCS, store: ReviewStore, result: ReviewResult, policy: PolicyConfig) -> None:
     """Follow-ups once a review is posted and recorded. They never fail the review."""
-    if not isinstance(vcs, ReviewThreads):
+    if not isinstance(vcs, ThreadedVCS):
         log.info("VCS cannot read back comments; feedback loop off", extra={"pr": result.pr.number})
         return
     for step in (link_comments, dismiss_stale_verdicts):
@@ -142,12 +145,56 @@ def has_open_blocker(result: ReviewResult, policy: PolicyConfig) -> bool:
                for f, reason in result.decision.held)
 
 
-def dismiss_stale_verdicts(vcs: ReviewThreads, store: ReviewStore, result: ReviewResult,
+def open_reason(row: Mapping[str, Any], head: Snapshot, changed: list[str]) -> str | None:
+    """Why an old blocker may still be in the code at `head`; None only when it is positively gone.
+
+    Gone means its quote (or, for a secret, the secret's identity) is absent from its file, the file
+    is deleted, and it did not move into another changed file."""
+    path, quote = str(row["file"]), str(row["evidence_quote"])
+    if row["side"] == "LEFT":
+        return "a deleted-line finding cannot be shown gone"
+    secret = row["category"] == "secret" and bool(row["identity"])
+    if not secret and not is_meaningful(quote):
+        return "no evidence quote to look for"
+    what = "the secret" if secret else "evidence quote"
+
+    def present(text: str) -> bool:
+        return row["identity"] in secret_identities(text) if secret else bool(find_quote(text, quote))
+    src = head.read(path)
+    if src is not None:
+        return f"{what} is still in {path}" if present(src) else None
+    for other in [path, *(p for p in changed if p != path)]:
+        text = head.read(other)
+        skip = head.skip_reason(other) if text is None else None
+        if skip is not None:
+            return f"{other} could not be read at head ({skip})"
+        if text is not None and present(text):
+            return f"{what} is now in {other}"
+    return None
+
+
+def dismiss_stale_verdicts(vcs: ThreadedVCS, store: ReviewStore, result: ReviewResult,
                            policy: PolicyConfig) -> None:
-    if has_open_blocker(result, policy):
+    """Dismiss an older REQUEST_CHANGES only when each of its blockers is positively gone."""
+    if has_open_blocker(result, policy) or result.snapshot is None:
         return
     pr = result.pr
+    blocking = Severity.parse(policy.blocking_severity)
     for review_id in store.blocking_reviews_to_dismiss(pr.repo, pr.number, result.post_id):
+        blockers = [r for r in store.posted_findings(pr.repo, pr.number, review_id)
+                    if r["severity"] >= blocking]
+        reasons = [open_reason(r, result.snapshot, result.changed_paths) for r in blockers]
+        kept = [r for r in reasons if r is not None] if blockers else [
+            "no blocking finding recorded for it"]
+        if kept:
+            log.info("stale verdict kept", extra={"repo": pr.repo, "pr": pr.number,
+                                                  "review_id": review_id, "reason": kept[0]})
+            continue
+        # A newer head may have brought the problem back: never dismiss on its behalf.
+        if vcs.current_head(pr.repo, pr.number) != pr.head_sha:
+            log.info("head moved; stale verdict kept", extra={"repo": pr.repo, "pr": pr.number,
+                                                             "review_id": review_id})
+            return
         try:
             vcs.dismiss_review(pr.repo, pr.number, review_id, DISMISS_MESSAGE)
         except Exception as exc:  # noqa: BLE001 - recorded and logged; retried after the next post

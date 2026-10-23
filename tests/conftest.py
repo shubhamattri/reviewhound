@@ -30,7 +30,7 @@ def clock() -> FakeClock:
 
 PG_URL = os.environ.get("REVIEWHOUND_TEST_PG", "")
 _PG_TABLES = ("jobs, reviews, findings, posts, feedback, metric_counters, comment_links, "
-              "dismissals, feedback_events")
+              "dismissals, feedback_events, review_findings")
 
 
 @pytest.fixture(params=["sqlite", "postgres"])

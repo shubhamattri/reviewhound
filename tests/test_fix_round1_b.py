@@ -1,4 +1,4 @@
-"""Fix round 1, track B: checker anchoring, fingerprints, child env, store ordering."""
+"""Fix round 1, track B: anchoring, fingerprints, child env, store order, feedback, dismissal."""
 
 from __future__ import annotations
 
@@ -17,18 +17,19 @@ import pytest
 from reviewhound.checker import ClaimChecker
 from reviewhound.config import RepoConfig, Severity
 from reviewhound.findings import Finding, ModelFinding
+from reviewhound.github_feedback import DISMISS_MESSAGE, open_reason
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.procenv import child_env
-from reviewhound.scanners import SemgrepScanner
+from reviewhound.scanners import SemgrepScanner, secret_identity
 from reviewhound.store import ReviewRecord
-from reviewhound.vcs.base import DictSnapshot
+from reviewhound.vcs.base import DictSnapshot, PullRequest, ReviewPayload
 from reviewhound.vcs.github import GitHubVCS
 from reviewhound.vcs.memory import diff_file_maps
 from reviewhound.webhook import make_server
 from reviewhound.worker import is_retryable
 from tests.conftest import PG_URL, Backend, answer, spy
-from tests.test_github_feedback import reviewer_on, state_of, thread
-from tests.test_pipeline import REAL
+from tests.test_github_feedback import FIXED, push, reviewer_on, state_of, thread
+from tests.test_pipeline import HEAD, REAL
 from tests.test_webhook import SECRET, sign
 
 # B7: a blank line added or removed inside a quote must not anchor unchanged code.
@@ -264,3 +265,136 @@ def test_replayed_signed_body_with_a_new_delivery_id_is_applied_once(backend: Ba
         assert _post(port, resolve, ev) == (202, "event already applied")
     assert state_of(store) == "reopened"
     assert [f["kind"] for f in store.feedback("acme/shop", 7)] == ["resolved", "reopened"]
+
+
+# B2: an old "changes requested" is dismissed only when each of its blockers is positively gone.
+
+SECOND = {"file": "app/admin.py", "line": 12, "severity": "blocker", "category": "logic",
+          "title": "always reports success", "body": "...", "evidence_quote": "return True"}
+ALL_FIXED = {"app/admin.py": FIXED["app/admin.py"].replace("    return True",
+                                                           "    return deleted")}
+
+
+def assert_kept(vcs: Any, store: Any) -> None:
+    assert vcs.dismissed == []
+    assert store.dismissals("acme/shop", 7) == []
+
+
+def test_model_silence_on_unchanged_code_never_dismisses(backend: Backend) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL), answer()])
+    assert reviewer.review("acme/shop", 7, dry_run=False).review.event == (  # type: ignore
+        "REQUEST_CHANGES")
+    push(vcs, "h2", {**HEAD, "app/other.py": "x = 1\n"})
+    second = reviewer.review("acme/shop", 7, dry_run=False)
+    assert (second.outcome, second.review.event) == ("posted", "COMMENT")  # type: ignore
+    assert_kept(vcs, store)
+
+
+def test_checker_dropping_the_blocker_never_dismisses(backend: Backend) -> None:
+    wrong = {**REAL, "claims": [{"kind": "symbol_exists", "name": "audit_log"}]}
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL), answer(wrong)])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    push(vcs, "h2", HEAD)
+    second = reviewer.review("acme/shop", 7, dry_run=False)
+    assert [r for _, r in second.dropped] == ["false claim: symbol audit_log does not exist"]
+    assert second.outcome == "posted"
+    assert_kept(vcs, store)
+
+
+def test_blocker_file_deleted_at_head_is_dismissed(backend: Backend) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL), answer()])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    push(vcs, "h2", {"app/other.py": "x = 1\n"})
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "posted"
+    assert vcs.dismissed == [("memory-review-1", DISMISS_MESSAGE)]
+    assert store.dismissals("acme/shop", 7) == [{"review_id": "memory-review-1", "ok": 1,
+                                                 "error": ""}]
+
+
+def test_blocker_quote_moved_to_another_file_keeps_the_verdict(backend: Backend) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL), answer()])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    push(vcs, "h2", {"app/users.py": HEAD["app/admin.py"]})
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "posted"
+    assert_kept(vcs, store)
+
+
+def test_every_blocker_of_the_old_review_must_be_gone(backend: Backend) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL, SECOND), answer(), answer()])
+    first = reviewer.review("acme/shop", 7, dry_run=False)
+    assert [c.line for c in first.review.comments] == [11, 12]  # type: ignore[union-attr]
+    push(vcs, "h2", FIXED)  # the first blocker's line is rewritten, "return True" is not
+    reviewer.review("acme/shop", 7, dry_run=False)
+    assert_kept(vcs, store)
+    push(vcs, "h3", ALL_FIXED)
+    reviewer.review("acme/shop", 7, dry_run=False)
+    assert vcs.dismissed == [("memory-review-1", DISMISS_MESSAGE)]
+
+
+def test_head_moving_just_before_the_dismissal_keeps_the_verdict(
+        backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer(REAL), answer()])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    push(vcs, "h2", FIXED)
+    real_post = vcs.post_review
+
+    def post_then_push(pr: PullRequest, review: ReviewPayload) -> str:
+        review_id = real_post(pr, review)
+        vcs.head_sha_now = "h3"
+        return review_id
+    monkeypatch.setattr(vcs, "post_review", post_then_push)
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "posted"
+    assert_kept(vcs, store)
+
+
+def test_an_old_review_with_no_recorded_findings_is_never_dismissed(backend: Backend) -> None:
+    vcs, reviewer, store = reviewer_on(backend, [answer()])
+    store.record_review(ReviewRecord(repo="acme/shop", pr=7, head_sha="h0", outcome="posted",
+                                     event="REQUEST_CHANGES", posted=True, post_id="legacy-1"),
+                        [], [])
+    assert reviewer.review("acme/shop", 7, dry_run=False).outcome == "posted"
+    assert store.blocking_reviews_to_dismiss("acme/shop", 7, "memory-review-1") == ["legacy-1"]
+    assert_kept(vcs, store)
+
+
+def test_posted_findings_are_stored_per_review_with_their_quote(backend: Backend) -> None:
+    _vcs, reviewer, store = reviewer_on(backend, [answer(REAL, SECOND)])
+    reviewer.review("acme/shop", 7, dry_run=False)
+    rows = store.posted_findings("acme/shop", 7, "memory-review-1")
+    assert [(r["file"], r["side"], r["severity"], r["evidence_quote"], r["identity"])
+            for r in rows] == [("app/admin.py", "RIGHT", 4, "db.delete(uid)", ""),
+                               ("app/admin.py", "RIGHT", 4, "return True", "")]
+    assert store.posted_findings("acme/shop", 7, "other") == []
+    assert store.posted_findings("acme/shop", 8, "memory-review-1") == []
+
+
+class _Head(DictSnapshot):
+    def skip_reason(self, path: str) -> str | None:
+        return "too big" if path == "big.py" else None
+
+
+AKIA = "AKIA" + "Q" * 16
+
+
+def _row(**kw: Any) -> dict[str, Any]:
+    return {"file": "a.py", "side": "RIGHT", "category": "auth",
+            "evidence_quote": "do_the_thing(x)", "identity": "", **kw}
+
+
+@pytest.mark.parametrize(("row", "files", "changed", "reason"), [
+    (_row(), {"a.py": "y = do_the_thing(x)\n"}, [], "evidence quote is still in a.py"),
+    (_row(), {"a.py": "y = 2\n"}, [], None),
+    (_row(), {}, [], None),
+    (_row(), {"b.py": "do_the_thing(x)\n"}, ["a.py", "b.py"], "evidence quote is now in b.py"),
+    (_row(), {"b.py": "do_the_thing(x)\n"}, ["a.py"], None),
+    (_row(file="big.py"), {}, [], "big.py could not be read at head (too big)"),
+    (_row(side="LEFT"), {"a.py": "y = 2\n"}, [], "a deleted-line finding cannot be shown gone"),
+    (_row(evidence_quote="x()"), {"a.py": "y = 2\n"}, [], "no evidence quote to look for"),
+    (_row(category="secret", identity=secret_identity(AKIA), evidence_quote="AKIA[redacted]"),
+     {"a.py": f'key = "{AKIA}"\n'}, [], "the secret is still in a.py"),
+    (_row(category="secret", identity=secret_identity(AKIA), evidence_quote="AKIA[redacted]"),
+     {"a.py": "key = env()\n"}, [], None),
+])
+def test_open_reason_needs_positive_evidence(row: dict[str, Any], files: dict[str, str],
+                                             changed: list[str], reason: str | None) -> None:
+    assert open_reason(row, _Head(files), changed) == reason

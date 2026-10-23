@@ -50,6 +50,13 @@ def secret_identity(value: str) -> str:
     return hashlib.sha256(b"reviewhound-secret\x00" + value.encode()).hexdigest()[:16]
 
 
+def secret_identities(text: str) -> set[str]:
+    """Identity of every secret-shaped value in `text`, placeholders included."""
+    return {secret_identity(m.groupdict().get("value") or m.group(0))
+            for line in text.splitlines() for _label, pat in _SECRET_PATTERNS
+            for m in pat.finditer(line)}
+
+
 def builds_sql(text: str) -> bool:
     for pat in _INTERPOLATED:
         for m in pat.finditer(text):

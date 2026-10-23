@@ -19,8 +19,9 @@ from tests.conftest import Backend, answer, make_pr, spy
 from tests.test_pipeline import BASE, HEAD, REAL
 
 CFG = {".reviewhound.yml": "posting: true\n"}
+# The fix rewrites the quoted line, so the blocker's evidence is positively gone.
 FIXED = {"app/admin.py": HEAD["app/admin.py"].replace(
-    "    db.delete(uid)", '    require_role(req, "admin")\n    db.delete(uid)')}
+    "    db.delete(uid)", '    require_role(req, "admin")\n    db.remove_user(uid)')}
 MINOR = {"file": "app/admin.py", "line": 12, "severity": "minor", "category": "style",
          "title": "returns a constant", "body": "...", "evidence_quote": "return True"}
 FP = Finding(file="app/admin.py", line=11, severity=4, category="auth",  # type: ignore[arg-type]
@@ -210,14 +211,17 @@ def test_blocker_still_present_keeps_the_verdict(backend: Backend) -> None:
     assert store.dismissals("acme/shop", 7) == []
 
 
-def test_resolved_blocker_no_longer_holds_the_verdict(backend: Backend) -> None:
+def test_resolved_blocker_still_in_the_code_keeps_the_verdict(backend: Backend) -> None:
     vcs, reviewer, store = reviewer_on(backend, [answer(REAL), answer(REAL)])
     reviewer.review("acme/shop", 7, dry_run=False)
     handle_event(backend.queue(), "pull_request_review_thread",
                  thread("resolved", 1001), store)
     push(vcs, "h2", HEAD)
-    reviewer.review("acme/shop", 7, dry_run=False)
-    assert vcs.dismissed == [("memory-review-1", DISMISS_MESSAGE)]
+    second = reviewer.review("acme/shop", 7, dry_run=False)
+    assert [r for _, r in second.decision.held] == [  # type: ignore[union-attr]
+        "developer resolved this earlier"]
+    assert vcs.dismissed == []
+    assert store.dismissals("acme/shop", 7) == []
 
 
 def test_new_blocking_review_dismisses_nothing(backend: Backend) -> None:
