@@ -494,12 +494,13 @@ def test_recovery_of_an_own_pr_review_records_the_comment_it_really_was(
     monkeypatch.setattr(store, "_tx", real_tx)
     assert vcs.posted[0].event == "COMMENT"
     reviewer.review(REPO, PR, dry_run=False)
-    assert [(r["outcome"], r["event"]) for r in store.reviews(REPO, PR)][0] == ("posted", "COMMENT")
+    assert [(r["outcome"], r["event"]) for r in store.reviews(REPO, PR)] == [
+        ("posted", "COMMENT"), ("recovered", "COMMENT")]
 
 
 def test_recovery_failing_to_record_is_retryable(backend: Backend,
                                                  monkeypatch: pytest.MonkeyPatch) -> None:
-    _vcs, reviewer, store, real_tx = _post_then_fail_record(backend, monkeypatch, [answer(REAL)])
+    _vcs, reviewer, store, _ = _post_then_fail_record(backend, monkeypatch, [answer(REAL)])
     spy(monkeypatch, store, "INSERT INTO reviews")
     with pytest.raises(RecordAfterPostError) as raised:
         reviewer.review(REPO, PR, dry_run=False, expected_head=H1)
@@ -1048,5 +1049,6 @@ def test_worker_warns_when_the_budget_cannot_fit_one_docker_run(
     caplog.set_level(logging.WARNING, logger="reviewhound.cli")
     assert main(["--home", str(tmp_path), "--max-proof-seconds", seconds, "worker", "--once"]) == 0
     msgs = [r.msg for r in caplog.records if r.name == "reviewhound.cli"]
-    assert msgs == (["--max-proof-seconds is below the Docker runner's own worst-case time: "
-                     "no Docker proof will run"] if warned else [])
+    want = ("--max-proof-seconds is below the Docker runner's own worst-case time: "
+            "no Docker proof will run")
+    assert msgs == ([want] if warned else [])
