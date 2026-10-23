@@ -61,7 +61,7 @@ class _Timer:
 
 
 def build_index(head: Snapshot, diff: Diff, cfg: RepoConfig) -> CodeIndex:
-    index = CodeIndex()
+    index = CodeIndex(cfg.languages)
     paths = [p for p in head.paths() if language_of(p) in cfg.languages
              and not matches_any(p, cfg.ignore_paths)]
     changed = set(diff.changed_paths)
@@ -77,6 +77,17 @@ def build_index(head: Snapshot, diff: Diff, cfg: RepoConfig) -> CodeIndex:
             if src is not None:
                 index.sources[path] = src
     return index
+
+
+def not_reviewed(diff: Diff, head: Snapshot, ignore_paths: list[str]) -> list[tuple[str, str]]:
+    """Changed files the review could not see: patch omitted by the host, or unreadable at head."""
+    out = dict(diff.skipped)
+    for path in diff.changed_paths:
+        if path not in out:
+            reason = head.skip_reason(path)
+            if reason is not None:
+                out[path] = reason
+    return sorted((p, r) for p, r in out.items() if not matches_any(p, ignore_paths))
 
 
 class Reviewer:
@@ -131,6 +142,9 @@ class Reviewer:
             index = build_index(head, diff, cfg)
             churn = self.vcs.churn(repo, pr.head_sha)
             conv = learn_conventions(index, churn, cfg.auth.guard_functions)
+            unseen = not_reviewed(diff, head, cfg.ignore_paths)
+            if unseen:
+                log.info("files not reviewed", extra={"pr": number, "files": unseen})
         reviewable = [p for p in diff.changed_paths if not matches_any(p, cfg.ignore_paths)]
         with t.stage("context"):
             touched = Counter({p: churn[p] for p in reviewable if churn.get(p)})
@@ -141,7 +155,8 @@ class Reviewer:
         with t.stage("model"):
             answer = self._ask_model(prompt, rt, result)
         with t.stage("verify"):
-            checker = ClaimChecker(diff, index, cfg.policy.snap_distance)
+            checker = ClaimChecker(diff, index, cfg.policy.snap_distance,
+                                   base_reader=lambda p: self.vcs.read_file(repo, pr.base_sha, p))
             if self.verify:
                 outcome = checker.check_all(answer.findings, f"model:{rt.model}")
             else:
@@ -161,7 +176,8 @@ class Reviewer:
         known = self.store.known_state(repo, number) if self.store else {}
         decision = apply_policy(outcome.kept + scanned, cfg.policy, known)
         result.decision = decision
-        result.review = build_review(pr.head_sha, decision, diff, rt.tier, result.reviewers)
+        result.review = build_review(pr.head_sha, decision, diff, rt.tier, result.reviewers,
+                                     not_reviewed=unseen)
         result.rendered = render_dry_run(result.review, decision)
 
         with t.stage("post"):

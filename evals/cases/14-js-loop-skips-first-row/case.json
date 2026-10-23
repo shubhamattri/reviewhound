@@ -1,0 +1,39 @@
+{
+  "title": "14-js-loop-skips-first-row",
+  "expected": [
+    {
+      "file": "src/report.js",
+      "line": 7,
+      "category": "correctness"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/report.js",
+        "severity": "major",
+        "category": "correctness",
+        "title": "First row is skipped",
+        "body": "The loop starts at 1, so rows[0] is never added to the total.",
+        "evidence_quote": "for (let i = 1; i < rows.length; i++) {",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "totalAmount"
+          }
+        ],
+        "line": 7
+      },
+      {
+        "file": "src/report.js",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Missing amounts become NaN",
+        "body": "The fallback to 0 is applied after the addition.",
+        "evidence_quote": "total += rows[i].amount || 0;",
+        "claims": [],
+        "line": 8
+      }
+    ]
+  }
+}

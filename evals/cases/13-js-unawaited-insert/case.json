@@ -1,0 +1,49 @@
+{
+  "title": "13-js-unawaited-insert",
+  "expected": [
+    {
+      "file": "src/users.js",
+      "line": 11,
+      "category": "async"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/users.js",
+        "severity": "major",
+        "category": "async",
+        "title": "insert is not awaited",
+        "body": "A rejected insert escapes the try/catch, so saveUser still returns true.",
+        "evidence_quote": "db.insert(\"users\", user);",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "saveUser",
+            "callee": "insert"
+          },
+          {
+            "kind": "symbol_exists",
+            "name": "saveUser"
+          }
+        ],
+        "line": 11
+      },
+      {
+        "file": "src/users.js",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Use UserRepo.insert for writes",
+        "body": "The repository already has an insert method that retries.",
+        "evidence_quote": "return false;",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "UserRepo.insert"
+          }
+        ],
+        "line": 13
+      }
+    ]
+  }
+}

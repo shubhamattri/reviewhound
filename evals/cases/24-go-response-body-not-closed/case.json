@@ -1,0 +1,51 @@
+{
+  "title": "24-go-response-body-not-closed",
+  "expected": [
+    {
+      "file": "fetch/fetch.go",
+      "line": 18,
+      "category": "resource-leak"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "fetch/fetch.go",
+        "severity": "major",
+        "category": "resource-leak",
+        "title": "Response body is never closed",
+        "body": "Each call leaks a connection; Status closes its body with defer.",
+        "evidence_quote": "resp, err := http.Get(url)",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "Body",
+            "callee": "Close"
+          },
+          {
+            "kind": "calls",
+            "caller": "Status",
+            "callee": "Close"
+          }
+        ],
+        "line": 18
+      },
+      {
+        "file": "fetch/fetch.go",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Body never reads the response",
+        "body": "The body is returned without being read.",
+        "evidence_quote": "return io.ReadAll(resp.Body)",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "Body",
+            "callee": "ReadAll"
+          }
+        ],
+        "line": 22
+      }
+    ]
+  }
+}

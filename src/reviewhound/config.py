@@ -8,6 +8,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from reviewhound.paths import LANGUAGES
+
 CONFIG_FILENAME = ".reviewhound.yml"
 
 
@@ -67,7 +69,7 @@ class BudgetConfig(_Strict):
 class RepoConfig(_Strict):
     version: int = 1
     posting: bool = False  # shadow mode until a repo opts in
-    languages: list[str] = Field(default_factory=lambda: ["python", "typescript"])
+    languages: list[str] = Field(default_factory=lambda: list(LANGUAGES))
     ignore_paths: list[str] = Field(
         default_factory=lambda: ["**/*.lock", "**/package-lock.json", "**/dist/**", "**/vendor/**",
                                  "**/node_modules/**", "**/.venv/**", "**/*.min.js"]
@@ -95,7 +97,7 @@ class RepoConfig(_Strict):
     @field_validator("languages")
     @classmethod
     def _known_languages(cls, v: list[str]) -> list[str]:
-        unknown = sorted(set(v) - {"python", "typescript"})
+        unknown = sorted(set(v) - set(LANGUAGES))
         if unknown:
             raise ValueError(f"unsupported languages: {unknown}")
         return v

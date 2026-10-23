@@ -18,6 +18,14 @@ def test_parse_patch_tracks_added_and_context_lines_on_head_side() -> None:
     assert fd.commentable_lines == {1, 2, 3, 4, 11, 12, 13}
 
 
+def test_parse_patch_tracks_deleted_lines_on_base_side() -> None:
+    patch = "@@ -4,6 +4,4 @@\n a\n-b\n-c\n d\n+D\n-e\n f\n@@ -20 +18,0 @@\n-z\n"
+    fd = parse_patch("f.py", patch)
+    assert fd.deleted_lines == {5, 6, 8, 20}
+    assert fd.added_lines == {6}
+    assert parse_patch("f.py", PATCH).deleted_lines == {2}
+
+
 def test_nearest_added_prefers_closest_then_lower_and_respects_distance() -> None:
     fd = parse_patch("f.py", PATCH)
     assert fd.nearest_added(7, 4) == 3
@@ -54,6 +62,8 @@ rename to b.py
     assert d.files["new.py"].status == "added"
     assert d.files["new.py"].added_lines == {1, 2}
     assert d.files["old.py"].status == "deleted"
+    assert d.files["old.py"].deleted_lines == {1}
+    assert d.files["b.py"].deleted_lines == {1}
     assert d.files["b.py"].status == "renamed"
     assert d.files["b.py"].old_path == "a.py"
     assert d.changed_paths == ["new.py", "b.py"]

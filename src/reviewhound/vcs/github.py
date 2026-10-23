@@ -119,6 +119,12 @@ class GitHubVCS:
                 fd = parse_patch(f["filename"], f.get("patch") or "", status,
                                  f.get("previous_filename"))
                 diff.files[f["filename"]] = fd
+                if not f.get("patch"):
+                    # GitHub drops the patch for very large diffs and for binary files.
+                    if int(f.get("changes") or 0) > 0:
+                        diff.skipped[f["filename"]] = "diff too large for GitHub to return"
+                    elif status in ("added", "modified"):
+                        diff.skipped[f["filename"]] = "no text diff (binary, empty or mode change)"
             if len(files) < 100:
                 return diff
             page += 1
@@ -183,7 +189,7 @@ class GitHubVCS:
 
     def post_review(self, pr: PullRequest, review: ReviewPayload) -> str:
         payload = {"commit_id": review.head_sha, "event": review.event, "body": review.body,
-                   "comments": [{"path": c.path, "line": c.line, "side": "RIGHT", "body": c.body}
+                   "comments": [{"path": c.path, "line": c.line, "side": c.side, "body": c.body}
                                 for c in review.comments]}
         d = self._request("POST", f"/repos/{pr.repo}/pulls/{pr.number}/reviews",
                           json=payload).json()
@@ -197,7 +203,8 @@ class GitHubVCS:
                                   "/comments", params={"per_page": 100, "page": page}).json()
             for c in items:
                 out.append(PostedComment(id=int(c["id"]), path=str(c.get("path") or ""),
-                                         line=int(c.get("line") or c.get("original_line") or 0)))
+                                         line=int(c.get("line") or c.get("original_line") or 0),
+                                         side=str(c.get("side") or "RIGHT")))
             if len(items) < 100:
                 return out
             page += 1

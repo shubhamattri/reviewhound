@@ -1,4 +1,7 @@
+import hashlib
+
 from reviewhound.config import RepoConfig, Severity
+from reviewhound.findings import Finding
 from reviewhound.scanners import BuiltinScanner
 from reviewhound.vcs.base import DictSnapshot
 from reviewhound.vcs.memory import diff_file_maps
@@ -16,6 +19,32 @@ def test_hard_coded_secret_is_a_blocker_and_redacted_in_the_comment() -> None:
     assert [(f.line, f.category, f.severity) for f in found] == [(2, "secret", Severity.BLOCKER)]
     assert "sk9Hf72kQpL0zXv3" not in found[0].evidence_quote
     assert found[0].evidence_quote == 'STRIPE_SECRET_KEY = "sk9H[redacted]"'
+
+
+def test_two_secrets_on_same_shaped_lines_get_different_fingerprints_without_raw_values() -> None:
+    a, b = "sk9Hf72kQpL0zXv3", "sk9Hq81mWnB4cYt6"
+    head = {"s.py": f'STRIPE_SECRET_KEY = "{a}"\n', "t.py": f'STRIPE_SECRET_KEY = "{a}"\n',
+            "u.py": f'STRIPE_SECRET_KEY = "{b}"\n'}
+    found = {f.file: f for f in BuiltinScanner().scan(diff_file_maps({}, head),
+                                                       DictSnapshot(head), RepoConfig())}
+    moved = Finding(file="s.py", line=9, severity=Severity.BLOCKER, category="secret",
+                    title="t", body="b", evidence_quote=found["s.py"].evidence_quote,
+                    source="scanner:builtin", identity=found["u.py"].identity)
+    assert found["s.py"].evidence_quote == found["u.py"].evidence_quote
+    assert found["s.py"].identity == found["t.py"].identity
+    assert found["s.py"].identity != found["u.py"].identity
+    assert len(found["s.py"].identity) == 16
+    assert moved.fingerprint != found["s.py"].fingerprint
+    assert moved.fingerprint == Finding(**{**vars(moved), "line": 1}).fingerprint
+    for f in found.values():
+        assert a not in repr(f) and b not in repr(f)
+
+
+def test_fingerprint_without_identity_is_unchanged() -> None:
+    f = Finding(file="a.py", line=3, severity=Severity.MAJOR, category="c", title="T",
+                body="b", evidence_quote="x  =  1", source="model:m")
+    assert f.identity == ""
+    assert f.fingerprint == hashlib.sha256(b"a.py\x00c\x00x = 1").hexdigest()[:16]
 
 
 def test_secret_lookalikes_are_not_flagged() -> None:

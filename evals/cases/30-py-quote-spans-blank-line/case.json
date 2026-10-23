@@ -1,0 +1,39 @@
+{
+  "title": "30-py-quote-spans-blank-line",
+  "expected": [
+    {
+      "file": "notify/send.py",
+      "line": 5,
+      "category": "error-handling"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "notify/send.py",
+        "severity": "major",
+        "category": "error-handling",
+        "title": "Send failures are swallowed",
+        "body": "Callers get None and cannot tell a failed send from an empty reply.",
+        "evidence_quote": "return client.post(msg)\n\n    except Exception:\n        return None",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "send"
+          }
+        ],
+        "line": 5
+      },
+      {
+        "file": "notify/send.py",
+        "severity": "minor",
+        "category": "error-handling",
+        "title": "Exception is not logged",
+        "body": "Log the error type.",
+        "evidence_quote": "except Exception as exc:",
+        "claims": [],
+        "line": 6
+      }
+    ]
+  }
+}

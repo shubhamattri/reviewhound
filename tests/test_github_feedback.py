@@ -270,12 +270,13 @@ def test_github_review_comments_and_dismissal_requests(tmp_path: Path) -> None:
                  for i in range(100 if page == 1 else 2)]
         if page == 2:
             items[1]["line"] = None
+            items[1]["side"] = "LEFT"
         return httpx.Response(200, json=items)
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.github.com")
     vcs = GitHubVCS("t", tmp_path, client=client)
     comments = vcs.review_comments("acme/shop", 7, "88")
     assert len(comments) == 102
-    assert comments[-2:] == [PostedComment(2000, "a.py", 0), PostedComment(2001, "a.py", 1)]
+    assert comments[-2:] == [PostedComment(2000, "a.py", 0), PostedComment(2001, "a.py", 1, "LEFT")]
     vcs.dismiss_review("acme/shop", 7, "88", "msg")
     assert seen == [
         ("GET", "/repos/acme/shop/pulls/7/reviews/88/comments", "per_page=100&page=1"),
@@ -376,3 +377,29 @@ def test_dismissal_states_decide_what_is_retried(backend: Backend) -> None:
     assert store.blocking_reviews_to_dismiss("acme/shop", 8, "r5") == []
     assert [(d["review_id"], d["ok"], len(d["error"] or "")) for d in
             store.dismissals("acme/shop", 7)] == [("r1", 1, 0), ("r2", 0, 500), ("r3", -1, 3)]
+
+
+def test_left_and_right_comments_on_the_same_line_number_link_to_their_own_findings(
+        backend: Backend) -> None:
+    from types import SimpleNamespace
+
+    from reviewhound.config import PolicyConfig
+    from reviewhound.github_feedback import link_comments
+    from reviewhound.vcs.base import ReviewComment, ReviewPayload
+    left = Finding(file="app/admin.py", line=6, severity=4,  # type: ignore[arg-type]
+                   category="auth", title="", body="", evidence_quote="require_role(req)",
+                   source="", side="LEFT")
+    right = Finding(file="app/admin.py", line=6, severity=4,  # type: ignore[arg-type]
+                    category="auth", title="", body="", evidence_quote="db.delete(uid)",
+                    source="")
+    assert left.fingerprint != right.fingerprint
+    vcs = MemoryVCS(make_pr(head="h1"), BASE, HEAD)
+    vcs.posted.append(ReviewPayload(head_sha="h1", event="COMMENT", body="", comments=[
+        ReviewComment(path="app/admin.py", line=6, body="r", side="RIGHT"),
+        ReviewComment(path="app/admin.py", line=6, body="l", side="LEFT")]))
+    result: Any = SimpleNamespace(pr=make_pr(head="h1"), post_id="memory-review-1",
+                                  decision=SimpleNamespace(post=[left, right], held=[]))
+    store = backend.store()
+    link_comments(vcs, store, result, PolicyConfig())
+    assert store.linked_findings("acme/shop", [1001, 1002]) == {
+        1001: (7, right.fingerprint), 1002: (7, left.fingerprint)}

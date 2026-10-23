@@ -1,3 +1,5 @@
+import pytest
+
 from reviewhound.config import RepoConfig, load_config
 from reviewhound.router import route
 from reviewhound.vcs.memory import diff_file_maps
@@ -20,6 +22,18 @@ def test_ordinary_code_is_standard_until_it_is_large() -> None:
     cfg = load_config("budget:\n  large_pr_lines: 5\n")
     big = route(diff_file_maps({}, {"app/cart.py": "".join(f"x{i} = 1\n" for i in range(5))}), cfg)
     assert big.tier == "deep"
+
+
+@pytest.mark.parametrize("path", ["web/app.js", "web/App.jsx", "web/a.mjs", "web/a.cjs",
+                                  "svc/main.go"])
+def test_javascript_and_go_code_gets_standard_tier(path: str) -> None:
+    r = route(diff_file_maps({}, {path: "x\n"}), RepoConfig())
+    assert (r.tier, r.model) == ("standard", "sonnet")
+
+
+def test_unknown_code_language_stays_light() -> None:
+    r = route(diff_file_maps({}, {"lib/a.rb": "x = 1\n"}), RepoConfig())
+    assert r.tier == "light"
 
 
 def test_only_ignored_files_are_skipped() -> None:

@@ -16,7 +16,7 @@ GitHub webhook ──> webhook.py ──> SQLite job queue (one job per repo + P
    ┌──────────────────────────────────────────────────────────────────────────────┐
    │ fetch PR + diff ─> config from BASE branch (.reviewhound.yml, defaults)        │
    │ risk router ─> tier (skip / light / standard / deep), model, byte budget       │
-   │ tree-sitter index of head (Python, TypeScript) + learned conventions           │
+   │ tree-sitter index of head (Python, TypeScript, JS, Go) + learned conventions   │
    │ context: diff with head line numbers, changed functions, callers, referenced   │
    │          types, recent history, all inside the byte budget                     │
    │ model registry (claude -p, fallback, circuit breaker) ─> JSON findings         │
@@ -63,7 +63,7 @@ leak into a review.
 
 ```yaml
 posting: false            # shadow mode until true
-languages: [python, typescript]
+languages: [python, typescript, javascript, go]
 ignore_paths: ["**/*.lock", "**/dist/**"]
 risk_paths:
   - {pattern: "**/billing/**", tier: deep}
@@ -85,10 +85,12 @@ Unknown keys or bad values fail the review loudly instead of being guessed.
 
 ## Evals
 
-`evals/build_cases.py` writes `evals/cases/*`: 12 small PRs (Python and TypeScript) with seeded
-bugs, two clean PRs, expected findings, and a recorded model answer that includes deliberate
-hallucinations (invented helpers, quotes that do not exist, bugs in unchanged code, false
-"missing guard" claims). Any prompt or checker change must not lower precision on this set.
+`evals/build_cases.py` writes `evals/cases/*`: 32 small PRs (Python, TypeScript, JavaScript, Go
+and one Ruby file) with seeded bugs, six clean PRs, expected findings, and a recorded model
+answer that includes deliberate hallucinations (invented helpers, `Owner.member` names that do
+not exist, quotes that do not exist, bugs in unchanged code, false "missing guard" claims). Two
+cases put the bug on a line the PR deleted, and one has two secrets on identically shaped lines.
+Any prompt or checker change must not lower precision on this set.
 
 ## Install as a GitHub App
 

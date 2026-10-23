@@ -1,0 +1,49 @@
+{
+  "title": "26-go-clean-helper-hallucinations",
+  "expected": [],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "strutil/trim.go",
+        "severity": "major",
+        "category": "correctness",
+        "title": "Trim should normalise case like Upper",
+        "body": "Trim calls Upper, which changes the text.",
+        "evidence_quote": "return strings.TrimSpace(s)",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "Trim",
+            "callee": "Upper"
+          }
+        ],
+        "line": 9
+      },
+      {
+        "file": "strutil/split.go",
+        "line": 4,
+        "severity": "major",
+        "category": "correctness",
+        "title": "Split ignores empty fields",
+        "body": "A file this PR does not touch.",
+        "evidence_quote": "strings.Split(s, sep)",
+        "claims": []
+      },
+      {
+        "file": "strutil/trim.go",
+        "severity": "minor",
+        "category": "correctness",
+        "title": "TrimSpace misses non-breaking spaces",
+        "body": "strings.TrimSpace only trims ASCII spaces.",
+        "evidence_quote": "return strings.TrimSpace(s)",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "strings.TrimSpace"
+          }
+        ],
+        "line": 10
+      }
+    ]
+  }
+}

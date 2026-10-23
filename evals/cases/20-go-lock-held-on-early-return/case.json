@@ -1,0 +1,51 @@
+{
+  "title": "20-go-lock-held-on-early-return",
+  "expected": [
+    {
+      "file": "counter/counter.go",
+      "line": 18,
+      "category": "concurrency"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "counter/counter.go",
+        "severity": "blocker",
+        "category": "concurrency",
+        "title": "Early return keeps the mutex locked",
+        "body": "Add returns before Unlock when d is 0, so the next Get or Add blocks forever. Get uses defer for this reason.",
+        "evidence_quote": "if d == 0 {\n        return\n    }",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "Counter.Add",
+            "callee": "Lock"
+          },
+          {
+            "kind": "quote",
+            "file": "counter/counter.go",
+            "text": "defer c.mu.Unlock()"
+          }
+        ],
+        "line": 18
+      },
+      {
+        "file": "counter/counter.go",
+        "severity": "major",
+        "category": "concurrency",
+        "title": "Get reads without a read lock",
+        "body": "Get should take RLock.",
+        "evidence_quote": "return c.n[k]",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "Counter.Get",
+            "callee": "RLock"
+          }
+        ],
+        "line": 13
+      }
+    ]
+  }
+}

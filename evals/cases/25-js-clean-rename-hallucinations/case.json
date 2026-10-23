@@ -1,0 +1,33 @@
+{
+  "title": "25-js-clean-rename-hallucinations",
+  "expected": [],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/format.js",
+        "severity": "major",
+        "category": "correctness",
+        "title": "line should pad through Formatter.pad",
+        "body": "Short lines are not padded to the width.",
+        "evidence_quote": "return value.slice(0, this.width);",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "Formatter.pad"
+          }
+        ],
+        "line": 7
+      },
+      {
+        "file": "src/format.js",
+        "severity": "major",
+        "category": "correctness",
+        "title": "substring drops the last character",
+        "body": "Use slice.",
+        "evidence_quote": "return value.substring(0, this.width);",
+        "claims": [],
+        "line": 6
+      }
+    ]
+  }
+}

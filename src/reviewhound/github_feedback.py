@@ -131,10 +131,12 @@ def link_comments(vcs: ReviewThreads, store: ReviewStore, result: ReviewResult,
                   policy: PolicyConfig) -> None:
     pr = result.pr
     posted = result.decision.post if result.decision else []
-    by_line = {(f.file, f.line): f.fingerprint for f in posted}
+    # A LEFT (deleted line) and a RIGHT comment can share a line number.
+    by_line: dict[tuple[str, str, int], str] = {(f.file, f.side, f.line): f.fingerprint
+                                               for f in posted}
     links: list[tuple[int, str]] = []
     for c in vcs.review_comments(pr.repo, pr.number, result.post_id):
-        fingerprint = by_line.get((c.path, c.line))
+        fingerprint = by_line.get((c.path, c.side, c.line))
         if fingerprint is None:
             log.warning("posted comment matches no finding", extra={
                 "repo": pr.repo, "pr": pr.number, "comment_id": c.id, "line": c.line})
