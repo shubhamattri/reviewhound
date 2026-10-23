@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -149,8 +150,9 @@ def classify(run: RunResult, expected_exception: str | None = None) -> tuple[Pro
             return "inconclusive", f"tests passed but pytest exited {run.returncode}"
         return "not_proven", "the generated test passes on the PR head"
     allowed = {"AssertionError"}
-    if expected_exception and expected_exception not in NOT_A_PROOF:
-        allowed.add(expected_exception.rsplit(".", 1)[-1])
+    claimed = expected_exception.rsplit(".", 1)[-1] if expected_exception else ""
+    if claimed and claimed not in NOT_A_PROOF:
+        allowed.add(claimed)
     for c in failed:
         if c.exc_type not in allowed:
             return "inconclusive", (f"test failed with {c.exc_type or 'an unknown error'}, "
@@ -191,11 +193,19 @@ def _tail(path: Path, limit: int = 2_000) -> str:
 def _read_junit(path: Path) -> str | None:
     """The report is written by code under test, so it is untrusted and size-capped."""
     try:
-        if path.stat().st_size > MAX_JUNIT_BYTES:
-            return "<oversized-report/>"
-        return path.read_text(encoding="utf-8", errors="replace")
+        # No-follow and non-blocking: a planted symlink or FIFO must not hang or flood us.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
+    except OSError:
+        return "<unreadable-report/>"
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            return "<unreadable-report/>"
+        data = fh.read(MAX_JUNIT_BYTES + 1)
+    if len(data) > MAX_JUNIT_BYTES:
+        return "<oversized-report/>"
+    return data.decode("utf-8", errors="replace")
 
 
 _PYTEST_FLAGS = ["-q", "-p", "no:cacheprovider", "-o", "junit_family=xunit2"]
@@ -482,6 +492,14 @@ def run_proof_stage(prover: Prover | None, decision: PolicyDecision, cfg: RepoCo
         for f in candidates:
             _attach(f, ProofResult("inconclusive", str(exc)))
         return
+    try:
+        _prove_each(prover, candidates, files, index, pc)
+    finally:
+        _reapply_floor_and_event(decision, cfg)
+
+
+def _prove_each(prover: Prover, candidates: list[Finding], files: Mapping[str, str],
+                index: CodeIndex, pc: ProofConfig) -> None:
     for f in candidates:
         try:
             result = prover.prove(f, files, index)
@@ -496,7 +514,6 @@ def run_proof_stage(prover: Prover | None, decision: PolicyDecision, cfg: RepoCo
                 f.severity == Severity.BLOCKER:
             f.severity = Severity.MAJOR
             f.notes.append("downgraded from blocker: the generated test did not reproduce it")
-    _reapply_floor_and_event(decision, cfg)
 
 
 def _attach(f: Finding, r: ProofResult) -> None:

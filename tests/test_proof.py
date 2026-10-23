@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -423,3 +424,47 @@ def test_cli_adds_the_local_runner_only_when_the_operator_opts_in() -> None:
     assert isinstance(runners["docker"], DockerRunner) and runners["docker"].image == "img:1"
     runners = _proof_runners(argparse.Namespace(allow_local_proof=True, proof_image="img:1"))
     assert sorted(runners) == ["docker", "local"]
+
+
+@pytest.mark.parametrize("claimed", ["builtins.ImportError", "builtins.ModuleNotFoundError"])
+def test_dotted_import_error_claim_is_still_not_a_proof(claimed: str) -> None:
+    assert classify(sample("import", 1), claimed) == (
+        "inconclusive", "test failed with ModuleNotFoundError, not the claimed behaviour")
+
+
+def test_planted_fifo_or_symlink_report_is_not_read(tmp_path: Path) -> None:
+    from reviewhound.proof import _read_junit
+
+    fifo = tmp_path / "fifo.xml"
+    os.mkfifo(fifo)
+    link = tmp_path / "link.xml"
+    link.symlink_to("/dev/zero")
+    assert (_read_junit(fifo), _read_junit(link)) == ("<unreadable-report/>",
+                                                      "<unreadable-report/>")
+    assert _read_junit(tmp_path / "missing.xml") is None
+
+
+def test_floor_and_verdict_are_reapplied_even_if_proving_crashes(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    def downgrade_then_crash(prover: object, candidates: list[Finding], *a: object) -> None:
+        candidates[0].severity = Severity.MAJOR
+        raise MemoryError("mid-stage")
+    monkeypatch.setattr("reviewhound.proof._prove_each", downgrade_then_crash)
+    f = finding()
+    cfg = load_config("proof:\n  enabled: true\n")
+    p = Prover(ProviderRegistry([FakeProvider([GOOD])]), RecordingRunner(sample("pass", 0)),
+               cfg.proof, "sonnet", 30)
+    decision = PolicyDecision(post=[f], event="REQUEST_CHANGES")
+    with pytest.raises(MemoryError):
+        run_proof_stage(p, decision, cfg, DictSnapshot(HEAD), CodeIndex.build(HEAD))
+    assert (decision.post, decision.event) == ([f], "COMMENT")
+
+
+def test_report_symlinked_to_a_regular_file_outside_is_not_followed(tmp_path: Path) -> None:
+    from reviewhound.proof import _read_junit
+
+    secret = tmp_path / "server_secret.xml"
+    secret.write_text((JUNIT / "assert.xml").read_text())
+    link = tmp_path / "junit.xml"
+    link.symlink_to(secret)
+    assert _read_junit(link) == "<unreadable-report/>"
