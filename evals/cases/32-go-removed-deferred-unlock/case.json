@@ -1,0 +1,52 @@
+{
+  "title": "32-go-removed-deferred-unlock",
+  "expected": [
+    {
+      "file": "cache/cache.go",
+      "line": 12,
+      "category": "concurrency",
+      "side": "LEFT"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "cache/cache.go",
+        "severity": "blocker",
+        "category": "concurrency",
+        "title": "Set no longer releases the mutex",
+        "body": "With the deferred Unlock gone, the second Set deadlocks.",
+        "evidence_quote": "defer c.mu.Unlock()",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "Cache.Set",
+            "callee": "Unlock"
+          },
+          {
+            "kind": "calls",
+            "caller": "Cache.Set",
+            "callee": "Lock"
+          }
+        ],
+        "line": 12
+      },
+      {
+        "file": "cache/cache.go",
+        "severity": "major",
+        "category": "concurrency",
+        "title": "Get reads without the lock",
+        "body": "Cache.Get should take the mutex.",
+        "evidence_quote": "c.data[k] = v",
+        "claims": [
+          {
+            "kind": "calls",
+            "caller": "Cache.Get",
+            "callee": "Lock"
+          }
+        ],
+        "line": 12
+      }
+    ]
+  }
+}

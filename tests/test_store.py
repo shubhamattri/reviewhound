@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -5,7 +6,7 @@ import pytest
 from reviewhound.config import Severity
 from reviewhound.findings import Finding
 from reviewhound.store import ReviewRecord, Store
-from tests.conftest import FakeClock
+from tests.conftest import Backend, FakeClock
 
 
 def fnd(quote: str) -> Finding:
@@ -13,8 +14,8 @@ def fnd(quote: str) -> Finding:
                    body="b", evidence_quote=quote, source="model:x", verified=True)
 
 
-def test_review_and_findings_written_together(tmp_path: Path, clock: FakeClock) -> None:
-    s = Store(tmp_path / "s.db", clock=clock)
+def test_review_and_findings_written_together(backend: Backend, clock: FakeClock) -> None:
+    s = backend.store(clock=clock)
     rid = s.record_review(ReviewRecord(repo="A/B", pr=1, head_sha="h1", outcome="posted",
                                        tier="standard", providers=("claude-cli:ok",),
                                        posted=True, cost_usd=0.02, timings={"model": 1.5}),
@@ -27,8 +28,8 @@ def test_review_and_findings_written_together(tmp_path: Path, clock: FakeClock) 
         ("posted", None), ("held", "unverified")}
 
 
-def test_developer_feedback_survives_a_re_review(tmp_path: Path, clock: FakeClock) -> None:
-    s = Store(tmp_path / "s.db", clock=clock)
+def test_developer_feedback_survives_a_re_review(backend: Backend, clock: FakeClock) -> None:
+    s = backend.store(clock=clock)
     f = fnd("x")
     s.record_review(ReviewRecord(repo="a/b", pr=1, head_sha="h1", outcome="posted", posted=True),
                     [f], [])
@@ -40,8 +41,8 @@ def test_developer_feedback_survives_a_re_review(tmp_path: Path, clock: FakeCloc
     assert (row["first_head"], row["last_head"]) == ("h1", "h2")
 
 
-def test_shadow_finding_can_be_posted_later(tmp_path: Path, clock: FakeClock) -> None:
-    s = Store(tmp_path / "s.db", clock=clock)
+def test_shadow_finding_can_be_posted_later(backend: Backend, clock: FakeClock) -> None:
+    s = backend.store(clock=clock)
     f = fnd("x")
     s.record_review(ReviewRecord(repo="a/b", pr=1, head_sha="h1", outcome="shadow"), [f], [])
     assert s.known_state("a/b", 1) == {f.fingerprint: "stored"}
@@ -50,16 +51,16 @@ def test_shadow_finding_can_be_posted_later(tmp_path: Path, clock: FakeClock) ->
     assert s.known_state("a/b", 1) == {f.fingerprint: "posted"}
 
 
-def test_feedback_rejects_unknown_kind_and_unknown_finding(tmp_path: Path) -> None:
-    s = Store(tmp_path / "s.db")
+def test_feedback_rejects_unknown_kind_and_unknown_finding(backend: Backend) -> None:
+    s = backend.store()
     with pytest.raises(ValueError):
         s.add_feedback("a/b", 1, "f", "liked")
     assert s.add_feedback("a/b", 1, "nope", "resolved") is False
 
 
 @pytest.mark.parametrize("state", ["resolved", "posted", "reopened", "declined"])
-def test_feedback_and_posted_states_survive_a_held_re_review(tmp_path: Path, state: str) -> None:
-    s = Store(tmp_path / "s.db")
+def test_feedback_and_posted_states_survive_a_held_re_review(backend: Backend, state: str) -> None:
+    s = backend.store()
     f = fnd("x")
     s.record_review(ReviewRecord(repo="a/b", pr=1, head_sha="h1", outcome="posted", posted=True),
                     [f], [])
@@ -70,8 +71,8 @@ def test_feedback_and_posted_states_survive_a_held_re_review(tmp_path: Path, sta
     assert s.known_state("a/b", 1) == {f.fingerprint: state}
 
 
-def test_fixed_finding_that_comes_back_is_posted_once_then_remembered(tmp_path: Path) -> None:
-    s = Store(tmp_path / "s.db")
+def test_fixed_finding_that_comes_back_is_posted_once_then_remembered(backend: Backend) -> None:
+    s = backend.store()
     f = fnd("x")
     s.record_review(ReviewRecord(repo="a/b", pr=1, head_sha="h1", outcome="posted", posted=True),
                     [f], [])
@@ -81,8 +82,27 @@ def test_fixed_finding_that_comes_back_is_posted_once_then_remembered(tmp_path: 
     assert s.known_state("a/b", 1) == {f.fingerprint: "posted"}
 
 
-def test_only_one_post_per_head(tmp_path: Path) -> None:
-    s = Store(tmp_path / "s.db")
+def test_only_one_post_per_head(backend: Backend) -> None:
+    s = backend.store()
     assert s.claim_post("A/b", 1, "h1") is True
     assert s.claim_post("a/b", 1, "h1") is False
     assert s.claim_post("a/b", 1, "h2") is True
+
+
+def test_released_post_can_be_claimed_again_and_only_that_head(backend: Backend) -> None:
+    s = backend.store()
+    assert s.claim_post("a/b", 1, "h1") is True
+    assert s.claim_post("a/b", 1, "h2") is True
+    s.release_post("A/b", 1, "h1")
+    assert s.claim_post("a/b", 1, "h1") is True
+    assert s.claim_post("a/b", 1, "h2") is False
+
+
+def test_new_sqlite_store_is_in_wal_mode_once_constructed(tmp_path: Path) -> None:
+    # Before any transaction: writers racing to switch a fresh file to WAL can hit "locked".
+    Store(tmp_path / "s.db")
+    c = sqlite3.connect(tmp_path / "s.db")
+    try:
+        assert c.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        c.close()

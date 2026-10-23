@@ -37,9 +37,17 @@ def matches_any(path: str, patterns: list[str]) -> bool:
     return any(path_matches(path, p) for p in patterns)
 
 
+_EXTENSIONS: dict[str, tuple[str, ...]] = {
+    "python": (".py",),
+    "typescript": (".ts", ".tsx", ".mts", ".cts"),
+    "javascript": (".js", ".jsx", ".mjs", ".cjs"),
+    "go": (".go",),
+}
+LANGUAGES: tuple[str, ...] = tuple(_EXTENSIONS)
+
+
 def language_of(path: str) -> str | None:
-    if path.endswith(".py"):
-        return "python"
-    if path.endswith((".ts", ".tsx", ".mts", ".cts")):
-        return "typescript"
+    for lang, exts in _EXTENSIONS.items():
+        if path.endswith(exts):
+            return lang
     return None

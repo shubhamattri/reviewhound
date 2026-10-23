@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="0.012" timestamp="2026-10-23T21:13:06.522341+05:30" hostname="sandbox"><testcase classname="test_type" name="test_a" time="0.000"><failure message="TypeError: 'NoneType' object is not subscriptable">def test_a():
+&gt;       f(None)
+
+test_type.py:3: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+x = None
+
+    def f(x):
+&gt;       return x["a"]
+               ^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+m.py:2: TypeError</failure></testcase></testsuite></testsuites>

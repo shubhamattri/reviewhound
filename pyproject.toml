@@ -14,11 +14,14 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
+    "defusedxml>=0.7.1",
     "httpx>=0.28.1",
     "pydantic>=2.14.1",
     "pyjwt[crypto]>=2.15.1",
     "pyyaml>=6.0.3",
     "tree-sitter>=0.26.0",
+    "tree-sitter-go>=0.25.0",
+    "tree-sitter-javascript>=0.25.0",
     "tree-sitter-python>=0.25.0",
     "tree-sitter-typescript>=0.23.2",
 ]
@@ -31,13 +34,20 @@ build-backend = "uv_build"
 dev = [
     "mypy>=2.4.0",
     "playwright>=1.64.1",
+    "psycopg[binary]>=3.3.6",
     "pytest>=9.1.1",
     "ruff>=0.17.2",
+    "types-defusedxml>=0.7.0.20260504",
     "types-pyyaml>=6.0.12.20260906",
 ]
 
 [project.scripts]
 reviewhound = "reviewhound.cli:main"
+
+[project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.3.6",
+]
 
 [tool.mypy]
 strict = true
@@ -45,7 +55,8 @@ python_version = "3.12"
 files = ["src/reviewhound", "qa"]
 
 [[tool.mypy.overrides]]
-module = ["tree_sitter_python", "tree_sitter_typescript"]
+module = ["tree_sitter_python", "tree_sitter_typescript", "tree_sitter_javascript",
+          "tree_sitter_go"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -1,0 +1,29 @@
+{
+  "title": "18-js-two-secrets-same-shape",
+  "expected": [
+    {
+      "file": "src/config.js",
+      "line": 4,
+      "category": "secret"
+    },
+    {
+      "file": "src/config.js",
+      "line": 8,
+      "category": "secret"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "src/config.js",
+        "severity": "minor",
+        "category": "config",
+        "title": "Region is hard-coded",
+        "body": "Read the region from the environment.",
+        "evidence_quote": "export const region = \"eu-west-1\";",
+        "claims": [],
+        "line": 1
+      }
+    ]
+  }
+}

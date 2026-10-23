@@ -33,6 +33,11 @@ def test_bad_config_is_rejected_not_guessed(text: str, fragment: str) -> None:
         load_config(text)
 
 
+def test_javascript_and_go_are_allowed_and_on_by_default() -> None:
+    assert RepoConfig().languages == ["python", "typescript", "javascript", "go"]
+    assert load_config("languages: [javascript, go]\n").languages == ["javascript", "go"]
+
+
 def test_severity_parse_and_order() -> None:
     assert Severity.parse(" Major ") is Severity.MAJOR
     assert Severity.BLOCKER > Severity.MAJOR > Severity.MINOR > Severity.NIT

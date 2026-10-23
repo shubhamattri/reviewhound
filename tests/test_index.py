@@ -1,3 +1,5 @@
+import pytest
+
 from reviewhound.index.conventions import learn_conventions
 from reviewhound.index.treesitter import CodeIndex
 
@@ -75,6 +77,94 @@ def test_unsupported_files_keep_text_but_no_definitions() -> None:
     idx = CodeIndex.build({"README.md": "# hi\n"})
     assert idx.sources == {"README.md": "# hi\n"}
     assert list(idx.iter_definitions()) == []
+
+
+JS = '''import { db } from "./db.js";
+
+export async function placeOrder(order) {
+  await db.save(order);
+  audit(order.id);
+}
+
+export const audit = (id) => {
+  console.log(id);
+};
+
+const legacy = function (x) {
+  return helper(x);
+};
+
+class Repo {
+  find(id) {
+    return new Order(id);
+  }
+}
+'''
+GO = '''package store
+
+import "fmt"
+
+type Store struct {
+\tdb *DB
+}
+
+type Saver interface {
+\tSave(id string) error
+}
+
+func (s *Store) Save(id string) error {
+\tif err := s.db.Exec(id); err != nil {
+\t\treturn fmt.Errorf("save: %w", err)
+\t}
+\treturn validate(id)
+}
+
+func (s Store) Count() int {
+\treturn len(s.db.rows)
+}
+
+func validate(id string) error {
+\treturn nil
+}
+
+func NewStore(db *DB) *Store {
+\treturn &Store{db: db}
+}
+'''
+
+
+@pytest.mark.parametrize("path", ["src/orders.js", "src/orders.jsx", "src/orders.mjs",
+                                  "src/orders.cjs"])
+def test_javascript_definitions_calls_and_callers(path: str) -> None:
+    idx = CodeIndex.build({path: JS})
+    names = {(d.qualified, d.kind) for d in idx.iter_definitions()}
+    assert names == {("placeOrder", "function"), ("audit", "function"),
+                     ("legacy", "function"), ("Repo", "class"), ("Repo.find", "function")}
+    assert idx.calls_of("placeOrder") == {"save", "audit"}
+    assert idx.calls_of("legacy") == {"helper"}
+    assert idx.calls_of("Repo.find") == {"Order"}
+    assert idx.callers_of("audit") == [f"{path}::placeOrder"]
+    encl = idx.enclosing_definition(path, 18)
+    assert encl is not None and encl.qualified == "Repo.find"
+    assert idx.files[path].language == "javascript"
+    assert idx.files[path].parse_errors is False
+
+
+def test_go_methods_are_qualified_by_receiver_and_selector_calls_are_indexed() -> None:
+    idx = CodeIndex.build({"store/store.go": GO})
+    names = {(d.qualified, d.kind) for d in idx.iter_definitions()}
+    assert names == {("Store", "type"), ("Saver", "type"), ("Store.Save", "function"),
+                     ("Store.Count", "function"), ("validate", "function"),
+                     ("NewStore", "function")}
+    assert idx.calls_of("Store.Save") == {"Exec", "Errorf", "validate"}
+    assert idx.calls_of("Store.Count") == {"len"}
+    assert idx.callers_of("validate") == ["store/store.go::Store.Save"]
+    assert idx.is_defined("Store.Save") is True
+    encl = idx.enclosing_definition("store/store.go", 15)
+    assert encl is not None and encl.qualified == "Store.Save"
+    assert idx.has_symbol("Exec") is True
+    assert idx.files["store/store.go"].language == "go"
+    assert idx.files["store/store.go"].parse_errors is False
 
 
 def test_conventions_find_used_auth_helper_logging_and_hot_folders() -> None:

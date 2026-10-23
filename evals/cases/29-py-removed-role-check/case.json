@@ -1,0 +1,45 @@
+{
+  "title": "29-py-removed-role-check",
+  "expected": [
+    {
+      "file": "app/orders.py",
+      "line": 5,
+      "category": "auth",
+      "side": "LEFT"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "app/orders.py",
+        "severity": "blocker",
+        "category": "auth",
+        "title": "Role check removed from cancel_order",
+        "body": "Any signed-in user can now cancel any order.",
+        "evidence_quote": "require_role(request, \"support\")",
+        "claims": [
+          {
+            "kind": "not_calls",
+            "caller": "cancel_order",
+            "callee": "require_role"
+          },
+          {
+            "kind": "symbol_exists",
+            "name": "require_role"
+          }
+        ],
+        "line": 5
+      },
+      {
+        "file": "app/orders.py",
+        "severity": "major",
+        "category": "auth",
+        "title": "Admin check removed",
+        "body": "The admin role check is gone.",
+        "evidence_quote": "require_role(request, \"admin\")",
+        "claims": [],
+        "line": 5
+      }
+    ]
+  }
+}

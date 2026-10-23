@@ -1,0 +1,2 @@
+policy:
+  drop_unverified: false

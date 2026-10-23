@@ -1,0 +1,44 @@
+{
+  "title": "31-rb-finding-in-unindexed-language",
+  "expected": [
+    {
+      "file": "lib/billing.rb",
+      "line": 3,
+      "category": "error-handling"
+    }
+  ],
+  "recorded_answer": {
+    "findings": [
+      {
+        "file": "lib/billing.rb",
+        "severity": "major",
+        "category": "error-handling",
+        "title": "Failed charges return nil silently",
+        "body": "charge hides gateway errors, so the caller treats a failure as done.",
+        "evidence_quote": "rescue StandardError\n  nil",
+        "claims": [
+          {
+            "kind": "symbol_exists",
+            "name": "charge"
+          },
+          {
+            "kind": "calls",
+            "caller": "charge",
+            "callee": "charge"
+          }
+        ],
+        "line": 3
+      },
+      {
+        "file": "lib/billing.rb",
+        "severity": "major",
+        "category": "error-handling",
+        "title": "Error is bound but unused",
+        "body": "Remove the unused variable.",
+        "evidence_quote": "rescue => e",
+        "claims": [],
+        "line": 4
+      }
+    ]
+  }
+}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -41,6 +42,11 @@ _INTERPOLATED = [re.compile(r'\bf"([^"]*)"'), re.compile(r"""\bf'([^']*)'"""),
                  re.compile(r"`([^`]*\$\{[^`]*)`")]
 _JOINED = [re.compile(r""""([^"]*)"\s*(?:\+|%|\.format\()"""),
            re.compile(r"""'([^']*)'\s*(?:\+|%|\.format\()""")]
+
+
+def secret_identity(value: str) -> str:
+    """Short one-way id for a secret value, so the value itself is never kept."""
+    return hashlib.sha256(b"reviewhound-secret\x00" + value.encode()).hexdigest()[:16]
 
 
 def builds_sql(text: str) -> bool:
@@ -92,7 +98,8 @@ class BuiltinScanner:
                     title=f"Possible {label} committed",
                     body="This looks like a real credential in source. Move it to the "
                          "environment or a secret store and rotate it.",
-                    evidence_quote=redacted, source="scanner:builtin", verified=True))
+                    evidence_quote=redacted, source="scanner:builtin", verified=True,
+                    identity=secret_identity(value)))
                 break
         if builds_sql(text):
             found.append(Finding(

@@ -69,7 +69,7 @@ class MemoryVCS:
         if self.comments_error is not None:
             raise self.comments_error
         n = int(review_id.rsplit("-", 1)[1])
-        return [PostedComment(id=n * 1000 + i, path=c.path, line=c.line)
+        return [PostedComment(id=n * 1000 + i, path=c.path, line=c.line, side=c.side)
                 for i, c in enumerate(self.posted[n - 1].comments, start=1)]
 
     def dismiss_review(self, repo: str, number: int, review_id: str, message: str) -> None:

@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from reviewhound.findings import Finding
 
@@ -85,12 +85,53 @@ class ReviewRecord:
     error: str = ""
 
 
+class ReviewStore(Protocol):
+    """What the pipeline and CLI need from a store; SQLite and Postgres both provide it."""
+
+    def known_state(self, repo: str, pr: int) -> dict[str, str]: ...
+
+    def record_review(self, rec: ReviewRecord, posted: list[Finding],
+                      held: list[tuple[Finding, str]]) -> int: ...
+
+    def claim_post(self, repo: str, pr: int, head_sha: str) -> bool: ...
+
+    def release_post(self, repo: str, pr: int, head_sha: str) -> None: ...
+
+    def add_feedback(self, repo: str, pr: int, fingerprint: str, kind: str,
+                     detail: str = "") -> bool: ...
+
+    def reviews(self, repo: str, pr: int) -> list[dict[str, Any]]: ...
+
+    def findings(self, repo: str, pr: int) -> list[dict[str, Any]]: ...
+
+    def link_comments(self, repo: str, pr: int, review_id: str,
+                      links: list[tuple[int, str]]) -> None: ...
+
+    def linked_findings(self, repo: str, comment_ids: list[int]) -> dict[int, tuple[int, str]]: ...
+
+    def claim_event(self, key: str) -> bool: ...
+
+    def release_event(self, key: str) -> None: ...
+
+    def blocking_reviews_to_dismiss(self, repo: str, pr: int,
+                                    current_post_id: str) -> list[str]: ...
+
+    def record_dismissal(self, repo: str, pr: int, review_id: str, ok: bool,
+                         error: str = "", permanent: bool = False) -> None: ...
+
+    def dismissals(self, repo: str, pr: int) -> list[dict[str, Any]]: ...
+
+    def feedback(self, repo: str, pr: int) -> list[dict[str, Any]]: ...
+
+
 class Store:
     def __init__(self, path: Path | str, clock: Callable[[], float] = time.time) -> None:
         self.path = str(path)
         self._clock = clock
         c = sqlite3.connect(self.path, timeout=30)
         try:
+            # Switch to WAL once here: racing writers switching it later can fail with "locked".
+            c.execute("PRAGMA journal_mode=WAL")
             c.executescript(_SCHEMA)
             c.executescript(_GITHUB_SCHEMA)
         finally:

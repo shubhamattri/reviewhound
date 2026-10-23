@@ -1,4 +1,4 @@
-"""Unified diff parsing: which head-side lines a pull request added or touched."""
+"""Unified diff parsing: which head-side lines a PR added, and which base-side lines it deleted."""
 
 from __future__ import annotations
 
@@ -14,6 +14,9 @@ class Hunk:
     new_count: int
     added: list[int] = field(default_factory=list)
     context: list[int] = field(default_factory=list)
+    old_start: int = 0
+    deleted: list[int] = field(default_factory=list)  # base-side line numbers
+    deleted_text: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -27,6 +30,15 @@ class FileDiff:
     @property
     def added_lines(self) -> set[int]:
         return {n for h in self.hunks for n in h.added}
+
+    @property
+    def deleted_lines(self) -> set[int]:
+        return {n for h in self.hunks for n in h.deleted}
+
+    @property
+    def deleted_text(self) -> dict[int, str]:
+        """Base line number -> the text the patch shows being deleted there."""
+        return {n: t for h in self.hunks for n, t in h.deleted_text.items()}
 
     @property
     def commentable_lines(self) -> set[int]:
@@ -46,6 +58,7 @@ class FileDiff:
 @dataclass
 class Diff:
     files: dict[str, FileDiff] = field(default_factory=dict)
+    skipped: dict[str, str] = field(default_factory=dict)  # path -> why its patch is missing
 
     @property
     def changed_paths(self) -> list[str]:
@@ -74,15 +87,15 @@ def parse_patch(path: str, patch: str, status: str = "modified",
     """Parse one file's hunks (the `patch` field GitHub returns per file)."""
     fd = FileDiff(path=path, old_path=old_path, status=status, patch=patch)
     hunk: Hunk | None = None
-    new_line = 0
+    new_line = old_line = 0
     for raw in patch.splitlines():
         m = _HUNK_RE.match(raw)
         if m:
             new_start = int(m.group(3))
             new_count = int(m.group(4)) if m.group(4) is not None else 1
-            hunk = Hunk(new_start=new_start, new_count=new_count)
+            hunk = Hunk(new_start=new_start, new_count=new_count, old_start=int(m.group(1)))
             fd.hunks.append(hunk)
-            new_line = new_start
+            new_line, old_line = new_start, hunk.old_start
             continue
         if hunk is None or raw.startswith("\\"):
             continue
@@ -90,10 +103,13 @@ def parse_patch(path: str, patch: str, status: str = "modified",
             hunk.added.append(new_line)
             new_line += 1
         elif raw.startswith("-"):
-            continue
+            hunk.deleted.append(old_line)
+            hunk.deleted_text[old_line] = raw[1:]
+            old_line += 1
         else:
             hunk.context.append(new_line)
             new_line += 1
+            old_line += 1
     return fd
 
 
