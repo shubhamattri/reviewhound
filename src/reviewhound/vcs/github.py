@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -29,22 +30,32 @@ class GitHubError(RuntimeError):
 
 
 class GitHubVCS:
-    def __init__(self, token: str, cache_dir: Path, client: httpx.Client | None = None,
-                 max_attempts: int = 4, history_depth: int = 50) -> None:
+    def __init__(self, token: str | Callable[[], str], cache_dir: Path,
+                 client: httpx.Client | None = None, max_attempts: int = 4,
+                 history_depth: int = 50) -> None:
+        """`token` is a static token, or a provider called per request (App installation tokens)."""
         if not token:
             raise GitHubError("GitHub token is empty; set GITHUB_TOKEN")
-        self._token = token
+        self._token_source = token
         self.cache_dir = cache_dir
         self.max_attempts = max_attempts
         self.history_depth = history_depth
         self._http = client or httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
-        self._headers = {"Authorization": f"Bearer {token}",
-                         "Accept": "application/vnd.github+json",
+        self._headers = {"Accept": "application/vnd.github+json",
                          "X-GitHub-Api-Version": "2022-11-28"}
+
+    def _token(self) -> str:
+        if isinstance(self._token_source, str):
+            return self._token_source
+        token = self._token_source()
+        if not token:
+            raise GitHubError("token provider returned an empty token")
+        return token
 
     def _request(self, method: str, url: str, headers_extra: dict[str, str] | None = None,
                  **kw: Any) -> httpx.Response:
-        headers = {**self._headers, **(headers_extra or {})}
+        headers = {**self._headers, "Authorization": f"Bearer {self._token()}",
+                   **(headers_extra or {})}
         # A POST that timed out may have landed; retrying it could post a review twice.
         attempts = self.max_attempts if method == "GET" else 1
         delay = 1.0
@@ -92,7 +103,7 @@ class GitHubVCS:
         return self.get_pull(repo, number).head_sha
 
     def _git_env(self) -> dict[str, str]:
-        basic = base64.b64encode(f"x-access-token:{self._token}".encode()).decode()
+        basic = base64.b64encode(f"x-access-token:{self._token()}".encode()).decode()
         return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "http.extraHeader",
                 "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}"}
