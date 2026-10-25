@@ -3,9 +3,10 @@
 useDefault = true
 
 [allowlist]
-description = "Fake secrets in scanner tests and eval cases"
+description = "Fake secrets in scanner tests and eval cases, and their bytecode caches"
 paths = [
-  '''^evals/cases/''',
-  '''^evals/build_cases\.py$''',
-  '''^tests/test_scanners\.py$''',
+  '''(^|/)evals/cases/''',
+  '''(^|/)evals/build_cases\.py$''',
+  '''(^|/)tests/test_scanners\.py$''',
+  '''(^|/)__pycache__/''',
 ]

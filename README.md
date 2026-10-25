@@ -6,10 +6,9 @@ Reviewhound reviews GitHub pull requests with an LLM, but it does not post what 
 on trust. The model must back every finding with claims that code can check: the quoted line
 exists, it is on a line the PR changed, the functions and types it names exist in the head
 commit, a call it says is missing really is missing. One false claim drops the finding. The
-reason is that the usual failure of LLM reviewers is not missed bugs but confident comments
-about helpers, lines and guards that are not there, and a reviewer people learn to ignore is
-worse than none. Every change to the prompt or the checker is measured against a replay set
-for precision and recall.
+failure this targets is confident comments about helpers, lines and guards that are not there: a
+reviewer that makes them gets ignored, and then its real findings are ignored too. Every change
+to the prompt or the checker is measured against a replay set for precision and recall.
 
 ## Results
 
@@ -31,8 +30,9 @@ Read these with care:
   can reproduce them offline in a few seconds.
 - **The live row** asked the real model through `claude -p`. The miss was a JavaScript loop that
   skips its first row. The cost is the CLI's reported `total_cost_usd` averaged over the 36
-  cases. Two proof cases were skipped because no Docker sandbox was available. Live runs vary:
-  recall ranged from 0.86 to 1.00 across runs during development. Raw output:
+  cases. The two proof cases were skipped: they use the local runner, and a live run only allows
+  the Docker runner. Recall ranged from 0.86 to 1.00 across live runs during development, as
+  the checker changed; those earlier runs are not kept in the repo. Raw output:
   [`docs/evals/live-2026-10-24-ee526ac.txt`](docs/evals/live-2026-10-24-ee526ac.txt).
 
 ## Quickstart
@@ -81,7 +81,7 @@ flowchart TD
         R --> I[tree-sitter index of head: changed functions, callers, types]
         I --> M[model proposes findings with claims]
         M --> K[claim checker: quotes, changed lines, symbols, calls]
-        K --> SC[rule scanners: secrets, SQL string joins, personal data in logs]
+        K --> SC[rule scanners: secrets, SQL string joins, personal data in logs, Semgrep if installed]
         SC --> PO[policy: severity floor, dedupe, never repeat a declined finding]
         PO --> PR[optional proof: generated failing test in a Docker sandbox]
     end
@@ -102,16 +102,18 @@ The code is in `src/reviewhound/`: `webhook.py`, `queue.py`, `worker.py`, `pipel
 quote and a list of claims (`quote`, `symbol_exists`, `calls`, `not_calls`). The checker finds
 the quote in the head commit (or in the lines the PR deleted), anchors the finding on a changed
 line, and tests each claim against the diff and the tree-sitter index. A false claim drops the
-finding. A finding whose quote is missing, or with a claim the checker cannot decide, is marked
-unverified and by default not posted. The cost is recall: a real bug the model cannot back with
-checkable evidence is held back. The eval shows what
-the checker buys on the replay set (precision 0.52 without it, 1.00 with it).
+finding, and so does a quote that cannot be found. A finding with no quote, or with a claim the
+checker cannot decide, is marked unverified and by default not posted. The cost is recall: a
+real bug the model cannot back with checkable evidence is held back. The eval shows what the
+checker buys on the replay set (precision 0.52 without it, 1.00 with it).
 
 **A queue between the webhook and the review.** A review takes from seconds to minutes, and
 GitHub expects a webhook answer within 10 seconds, so `serve` only verifies the signature and
-writes a job. The job key is repo + PR + head SHA, so redeliveries are ignored and a newer push
-supersedes the older head. Workers take a lease with a heartbeat; a worker that dies leaves the
-lease to expire and the job is retried with backoff, then dead-lettered with its error. Posting
+writes a job. The job key is repo + PR + head SHA, so redeliveries are ignored, and a newer push
+supersedes jobs for that PR that are still queued (a review already running finishes). Workers
+take a lease with a heartbeat. A failed job is retried with backoff and dead-lettered with its
+error once it runs out of attempts; a worker that dies leaves its lease to expire, and the job is
+picked up again (or dead-lettered if that was its last attempt). Posting
 is guarded so a retry never posts twice: a claim on the head, a check of the lease and head
 right before the POST, and a check of GitHub for a review that already landed. SQLite is enough
 for one machine; Postgres lets several workers share the queue.
@@ -231,7 +233,7 @@ not closed), 29 (Python role check removed) and 32 (Go deferred unlock removed) 
 ## Install as a GitHub App
 
 Running as an App means each repo is reviewed with a short-lived installation token instead of
-one person's token, and reactions on GitHub flow back as feedback.
+one person's token, and resolved threads and replies on GitHub flow back as feedback.
 
 1. Create the App at *Settings > Developer settings > GitHub Apps*, or start from
    [`app-manifest.json`](app-manifest.json) (set your webhook URL first).
@@ -257,11 +259,12 @@ REVIEWHOUND_WEBHOOK_SECRET=... REVIEWHOUND_APP_ID=123456 uv run reviewhound serv
 REVIEWHOUND_APP_ID=123456 REVIEWHOUND_APP_PRIVATE_KEY_PATH=~/reviewhound.pem uv run reviewhound worker
 ```
 
-What the App does with events: `pull_request` queues a review for the new head; resolving a
-review thread records the finding as `resolved` so it is not posted again; a reply to one of its
-comments is stored as feedback; when a new head has no open blocking finding, its earlier
-"changes requested" reviews on that PR are dismissed. The webhook only writes to the local
-database and never calls GitHub. How each posting outcome maps to the job state is in
+What the App does with events: `pull_request` (opened, synchronize, reopened, ready for review;
+drafts are skipped) queues a review for the new head; resolving a review thread records the
+finding as `resolved` so it is not posted again; a reply to one of its comments is stored as
+feedback; when every blocker of an earlier "changes requested" review is gone from the new head,
+that review is dismissed. The webhook only writes to the local database and never calls GitHub.
+How each posting outcome maps to the job state is in
 [docs/deploy.md](docs/deploy.md#how-a-posting-job-ends).
 
 ## Limitations and roadmap
@@ -281,6 +284,17 @@ database and never calls GitHub. How each posting outcome maps to the job state 
   accepted a review but does not list it yet, or a worker freezes for longer than a lease right
   before its POST, a second review could be posted. When the token cannot say which account it
   is, no existing review is adopted, so a crash right after a POST can lead to a duplicate
-  rather than a silenced review.
+  rather than a silenced review. Each `claim-busy` retry uses up an attempt, so with a very short
+  lease a job can end up dead.
+- **Adopted or recovered reviews use this run's answer.** The verdict, id and comments come from
+  GitHub, but the blockers and finding list come from this run's model answer; a comment that
+  matches none of them stays unlinked, so replies to it are ignored. If saving the post id and
+  saving the review both fail, the next run adopts the review from GitHub, which needs a VCS
+  that can list reviews.
+- **Dismissal evidence has blind spots.** A blocker whose quote only survives in an ignored or
+  non-indexed file, or past the 5,000-file index cap, counts as gone.
+- **Webhook.** Header bytes trickled slowly can still hold a webhook thread (the body has a 30 s
+  total deadline; headers only have the 10 s per-read timeout). A resolve event redelivered byte
+  for byte after an unresolve of the same thread is treated as already applied.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Licensed under Apache-2.0.
