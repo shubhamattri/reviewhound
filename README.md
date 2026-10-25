@@ -2,66 +2,149 @@
 
 [![ci](https://github.com/shubhamattri/reviewhound/actions/workflows/ci.yml/badge.svg)](https://github.com/shubhamattri/reviewhound/actions/workflows/ci.yml)
 
-A pull-request reviewer that developers can trust. The model proposes findings; code checks
-every one of them before anything is posted. It measures its own precision on a replay set.
+Reviewhound reviews GitHub pull requests with an LLM, but it does not post what the model says
+on trust. The model must back every finding with claims that code can check: the quoted line
+exists, it is on a line the PR changed, the functions and types it names exist in the head
+commit, a call it says is missing really is missing. One false claim drops the finding. The
+reason is that the usual failure of LLM reviewers is not missed bugs but confident comments
+about helpers, lines and guards that are not there, and a reviewer people learn to ignore is
+worse than none. Every change to the prompt or the checker is measured against a replay set
+for precision and recall.
 
-## How it works
+## Results
 
-```
-GitHub webhook ──> webhook.py ──> SQLite job queue (one job per repo + PR + head commit)
-                                        │
-                                   worker.py (lease, retry with backoff, dead-letter)
-                                        │
-                                   pipeline.py
-   ┌──────────────────────────────────────────────────────────────────────────────┐
-   │ fetch PR + diff ─> config from BASE branch (.reviewhound.yml, defaults)        │
-   │ risk router ─> tier (skip / light / standard / deep), model, byte budget       │
-   │ tree-sitter index of head (Python, TypeScript, JS, Go) + learned conventions   │
-   │ context: diff with head line numbers, changed functions, callers, referenced   │
-   │          types, recent history, all inside the byte budget                     │
-   │ model registry (claude -p, fallback, circuit breaker) ─> JSON findings         │
-   │ claim checker: quote exists, evidence is on changed lines, symbols exist,      │
-   │                calls / not_calls hold. One false claim drops the finding.      │
-   │ rule scanners (built-in + Semgrep if installed): secrets, SQL joins, PII logs  │
-   │ policy: severity floor, verified only, one comment per line, max comments,     │
-   │         never repeat a posted or declined finding, verdict                     │
-   │ proof (opt-in): a generated pytest that must fail on the head, run in a sandbox│
-   │ post (only if config says posting: true and the head did not move) or store    │
-   └──────────────────────────────────────────────────────────────────────────────┘
-                                        │
-                     store.py: reviews, findings with stable fingerprints, feedback
-```
+| Eval (36 cases, 30 planted bugs) | Precision | Recall | Notes |
+|---|---|---|---|
+| Replayed model answers, checker on | 1.00 | 1.00 (30 of 30) | checker drops 34 false findings |
+| Replayed model answers, checker off | 0.52 | 1.00 | 28 false findings get through |
+| Live model, checker on (2026-10-24, commit `ee526ac`) | 1.00 | 0.97 (29 of 30) | about $0.018 per PR |
 
-Design rules: the engine has no team words in it (everything team-specific is in
-`.reviewhound.yml`); a new repo runs in shadow mode (stores findings, posts nothing) until its
-config says `posting: true`; config is read from the base branch so a PR cannot change how
-it is reviewed.
+Read these with care:
 
-## Run it
+- **The cases were written by the author**, who also tuned the checker. They are small PRs in
+  Python, TypeScript, JavaScript, Go and one Ruby file: 29 with seeded bugs and 7 where the right
+  answer is no finding. This is a regression set, not an independent benchmark.
+- **The replayed rows measure the checker and policy only.** The recorded model answers include
+  deliberate hallucinations (invented helpers, member names that do not exist, quotes that are
+  not in the file, bugs in unchanged code, false "missing guard" claims). The first two rows are
+  `uv run reviewhound eval` and `uv run reviewhound eval --no-checker` on the current commit; you
+  can reproduce them offline in a few seconds.
+- **The live row** asked the real model through `claude -p`. The miss was a JavaScript loop that
+  skips its first row. The cost is the CLI's reported `total_cost_usd` averaged over the 36
+  cases. Two proof cases were skipped because no Docker sandbox was available. Live runs vary:
+  recall ranged from 0.86 to 1.00 across runs during development. Raw output:
+  [`docs/evals/live-2026-10-24-ee526ac.txt`](docs/evals/live-2026-10-24-ee526ac.txt).
+
+## Quickstart
+
+Needs [uv](https://docs.astral.sh/uv/) (it fetches Python 3.12 if you do not have it).
 
 ```bash
+git clone https://github.com/shubhamattri/reviewhound.git
+cd reviewhound
 uv sync
 uv run pytest -q                      # no network needed
-uv run reviewhound eval               # replay recorded answers: precision / recall
-uv run reviewhound eval --no-checker  # same, with the claim checker switched off
-uv run reviewhound eval --live        # ask the real model (uses `claude -p`, your subscription)
-
-# Review a real PR and print the exact review it would post. Token from GITHUB_TOKEN or gh.
-uv run reviewhound --gh-user <account> review owner/repo 12 --dry-run
-
-# Service mode
-REVIEWHOUND_WEBHOOK_SECRET=... uv run reviewhound serve --port 8787
-uv run reviewhound worker
-uv run reviewhound enqueue owner/repo 12     # manual / missed-PR sweep
-uv run reviewhound feedback owner/repo 12 <fingerprint> declined --detail "intended"
+uv run reviewhound eval               # replay recorded answers: precision and recall
+uv run reviewhound eval --no-checker  # the same with the claim checker switched off
 ```
 
-Model calls go through `claude -p` in an empty working directory with only local settings loaded,
-so no other project's instructions leak into a review. The `claude` process gets only `PATH`,
-`HOME`, `USER`, `LOGNAME`, `LANG`, `TMPDIR`, `SHELL`, `CLAUDE_CODE_OAUTH_TOKEN` and
-`CLAUDE_CONFIG_DIR`: never `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, the database URL or the webhook
-secret. `git` and `semgrep` get `PATH`, `HOME`, `LANG`, the proxy variables (`HTTPS_PROXY`,
-`HTTP_PROXY`, `NO_PROXY`, either case) and `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`.
+Reviewing a real PR needs the [`claude` CLI](https://docs.anthropic.com/en/docs/claude-code)
+logged in, and a GitHub token from `GITHUB_TOKEN` or `gh`:
+
+```bash
+uv run reviewhound eval --live                                # the eval against the real model
+uv run reviewhound review owner/repo 12 --dry-run             # print the review it would post
+```
+
+As a service (see [Install as a GitHub App](#install-as-a-github-app) and
+[docs/deploy.md](docs/deploy.md)):
+
+```bash
+REVIEWHOUND_WEBHOOK_SECRET=... uv run reviewhound serve --port 8787
+uv run reviewhound worker
+uv run reviewhound enqueue owner/repo 12      # manual or missed-PR sweep
+uv run reviewhound stats                      # reviews, cost, failures, backlog
+```
+
+## Architecture
+
+```mermaid
+flowchart TD
+    GH[GitHub webhook] -->|signed POST| S[serve: verify HMAC, owner allowlist]
+    S -->|one job per repo + PR + head SHA| Q[(job queue: SQLite or Postgres)]
+    Q --> W[worker: lease, heartbeat, retry with backoff, dead-letter]
+    W --> P
+
+    subgraph P[review pipeline]
+        direction TB
+        C[config from the BASE branch] --> R[risk router: skip / light / standard / deep]
+        R --> I[tree-sitter index of head: changed functions, callers, types]
+        I --> M[model proposes findings with claims]
+        M --> K[claim checker: quotes, changed lines, symbols, calls]
+        K --> SC[rule scanners: secrets, SQL string joins, personal data in logs]
+        SC --> PO[policy: severity floor, dedupe, never repeat a declined finding]
+        PO --> PR[optional proof: generated failing test in a Docker sandbox]
+    end
+
+    P -->|posting: true and head unchanged| OUT[GitHub review]
+    P -->|shadow mode| DB[(store: findings, fingerprints, feedback)]
+    OUT --> DB
+    GH -.->|thread resolved, replies| DB
+```
+
+The code is in `src/reviewhound/`: `webhook.py`, `queue.py`, `worker.py`, `pipeline.py`,
+`router.py`, `index/`, `providers.py`, `checker.py`, `scanners.py`, `policy.py`, `proof.py`,
+`poster.py`, `store.py`, with Postgres adapters in `backends/` and GitHub in `vcs/`.
+
+## Design decisions
+
+**The model proposes, code verifies.** A finding is JSON with a file, a line, an evidence
+quote and a list of claims (`quote`, `symbol_exists`, `calls`, `not_calls`). The checker finds
+the quote in the head commit (or in the lines the PR deleted), anchors the finding on a changed
+line, and tests each claim against the diff and the tree-sitter index. A false claim drops the
+finding. A finding whose quote is missing, or with a claim the checker cannot decide, is marked
+unverified and by default not posted. The cost is recall: a real bug the model cannot back with
+checkable evidence is held back. The eval shows what
+the checker buys on the replay set (precision 0.52 without it, 1.00 with it).
+
+**A queue between the webhook and the review.** A review takes from seconds to minutes, and
+GitHub expects a webhook answer within 10 seconds, so `serve` only verifies the signature and
+writes a job. The job key is repo + PR + head SHA, so redeliveries are ignored and a newer push
+supersedes the older head. Workers take a lease with a heartbeat; a worker that dies leaves the
+lease to expire and the job is retried with backoff, then dead-lettered with its error. Posting
+is guarded so a retry never posts twice: a claim on the head, a check of the lease and head
+right before the POST, and a check of GitHub for a review that already landed. SQLite is enough
+for one machine; Postgres lets several workers share the queue.
+
+**Proofs run in a sandbox, and never decide anything.** For a blocking Python finding the model
+can be asked for a pytest that should fail on the PR head. A test that fails as claimed is
+stronger evidence for a human than a paragraph. But it runs code from the pull request, so it is
+off by default, runs in Docker with no network, a read-only root, dropped capabilities and
+memory, CPU and process limits, and its result can label a comment but never changes the verdict
+(PR code in the same sandbox could fake the report). Details below.
+
+**The PR cannot change how it is reviewed.** `.reviewhound.yml` is read from the base branch,
+unknown keys fail loudly, and a new repo runs in shadow mode (stores findings, posts nothing)
+until its config says `posting: true`. Nothing team-specific is hard-coded in the engine.
+
+**The model gets a clean, small environment.** `claude -p` runs in an empty directory with only
+local settings, and its process gets `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `TMPDIR`,
+`SHELL`, `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_CONFIG_DIR`: never `ANTHROPIC_API_KEY`,
+`GITHUB_TOKEN`, the database URL or the webhook secret. `git` and `semgrep` get `PATH`, `HOME`,
+`LANG`, the proxy variables and the CA bundle variables.
+
+## Testing
+
+- `uv run pytest -q`: 650 tests, no network; model calls go through `FakeProvider`. Another 190
+  run the same queue and store tests against Postgres when `REVIEWHOUND_TEST_PG=postgresql://...`
+  is set, and are skipped otherwise.
+- `uv run ruff check src tests evals qa` and `uv run mypy` (strict).
+- `uv run reviewhound eval`: the replay set above. CI runs all four on every push to `main`
+  and every pull request.
+- `qa/github_qa.py`: an end-to-end run against a sandbox repo. It opens a PR with planted bugs,
+  lets Reviewhound post a real review, checks through the API that every planted bug got a
+  comment and nothing else did, then opens the PR in Playwright and records a video. It needs a
+  sandbox repo and a GitHub login, so it is not part of CI.
 
 ## Config (`.reviewhound.yml`, all optional)
 
@@ -104,202 +187,100 @@ result is read from pytest's `--junitxml` report, never from its console text:
 - **proven**: every test failed with `AssertionError`, or with the exception the model said the
   bug raises. Import, syntax, collection and fixture errors never count.
 - **not_proven**: the test passed. With `downgrade_unproven: true` a not-proven blocker becomes
-  major (and is held if that is below `min_severity_to_post`), but the review's verdict stays
-  what it was before proofs (see the threat model below).
+  major (and is held if that is below `min_severity_to_post`), but the verdict does not change.
 - **inconclusive**: anything else, including a timeout, a malformed model answer, Docker not
   running, or a runner crash. Severity is never changed.
 
 A proven finding's comment says "Reproduced by a generated test" and carries the test in a
-collapsed `<details>` block. A held, downgraded blocker is still named in the review body. A
-proof problem never fails the review, and all proofs in one review share a time budget
-(`--max-proof-seconds`, default 300). The budget counts the Docker runner's own worst case
-(`docker info`, start, exec slack, two read-backs and `rm`: 115 s with the default 30 s start
-grace) on top of each test's timeout, so a budget under about 116 s runs no Docker proof.
+collapsed `<details>` block. A proof problem never fails the review. All proofs in one review
+share a time budget (`--max-proof-seconds`, default 300) that counts the Docker runner's own
+worst case (115 s with the default start grace) on top of each test's timeout, so a budget under
+about 116 s runs no Docker proof.
 
-**Threat model.** The generated test runs in the same sandbox as the PR's own code, and that
-code (a `conftest.py`, a `sitecustomize.py`, an import side effect) can rewrite the report or
-make any assertion pass or fail. A proof result is therefore evidence for a human, never a
-security decision: it never dismisses a review, never turns REQUEST_CHANGES into COMMENT and
-never removes a finding from the verdict. "Reproduced" means the test failed as claimed on
-this head, not that the bug is certain.
+**Threat model.** The generated test runs in the same sandbox as the PR's code, and that code
+(a `conftest.py`, a `sitecustomize.py`, an import side effect) can rewrite the report or make
+any assertion pass or fail. A proof result is evidence for a human, never a security decision:
+it never dismisses a review, never turns REQUEST_CHANGES into COMMENT and never removes a
+finding from the verdict.
 
-**This executes code from the pull request.** It is off by default and the repo must turn it on
-in `.reviewhound.yml` on its base branch.
-
-- `runner: docker` (default) starts a container from `reviewhound-proof:latest` (build it from
+- `runner: docker` (default) starts `reviewhound-proof:latest` (build it from
   `Dockerfile.proof`; it is never pulled) as user 65534 with `--network none --read-only
-  --memory 512m --cpus 1 --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges`,
-  the tree mounted read-only and copied into a tmpfs `/tmp`, and the report in a size-limited
-  tmpfs `/out` that is read back through `docker exec` and never touches a host path. The
-  worker needs the Docker CLI and socket; see docs/deploy.md. When the Docker daemon is not
-  reachable the proof is inconclusive ("docker unavailable").
-- `runner: local` is a plain subprocess with an allowlisted environment (no tokens, `HOME` in
-  the temp dir), CPU, file-size and (on Linux) address-space limits, and its process group
-  killed on timeout. It is **not a sandbox**. A repo's config cannot enable it: the operator
-  names each repo that may use it with `--allow-local-proof-repo owner/name`; every other repo
-  gets "proof runner 'local' is not enabled on this server". List only repos whose every PR
-  author you would let run code on the machine.
+  --memory 512m --cpus 1 --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges`. The
+  tree is mounted read-only and copied into a tmpfs `/tmp`; the report is read back from a
+  size-limited tmpfs through `docker exec` and never touches a host path. If the Docker daemon is
+  not reachable the proof is inconclusive.
+- `runner: local` is a plain subprocess with an allowlisted environment and resource limits. It
+  is **not a sandbox**. A repo's config cannot enable it: the operator names each allowed repo
+  with `--allow-local-proof-repo owner/name`.
 - With `downgrade_unproven: true`, PR code can influence a finding's label and whether its
-  comment is posted (a test that passes downgrades it), though never the verdict. Keep it off
-  for repos with untrusted authors.
-
-TypeScript proofs are not built yet (next: a vitest or jest runner behind the same interface).
+  comment is posted, though never the verdict. Keep it off for repos with untrusted authors.
 
 ## Evals
 
-`evals/build_cases.py` writes `evals/cases/*`: 36 small PRs (Python, TypeScript, JavaScript, Go
-and one Ruby file) with seeded bugs, six clean PRs, expected findings, and a recorded model
-answer that includes deliberate hallucinations (invented helpers, `Owner.member` names that do
-not exist, quotes that do not exist, bugs in unchanged code, false "missing guard" claims). Two
-cases put the bug on a line the PR deleted, and one has two secrets on identically shaped lines.
-Any prompt or checker change must not lower precision on this set.
-Cases 33 and 34 turn proof on (local runner, recorded proof tests): 33 must be proven, 34 is a
-false blocker whose test passes, so it is downgraded and held. The eval reports any case whose
-proof verdict differs from `expected_proofs`.
+`evals/build_cases.py` writes `evals/cases/*`. Each case has base and head files, the expected
+findings, and a recorded model answer. Two cases put the bug on a line the PR deleted, and one
+has two secrets on identically shaped lines. Cases 33 and 34 turn proof on with the local runner
+and recorded tests: 33 must be proven; 34 is a false blocker whose test passes, so it is
+downgraded and held.
 
-### Accuracy: two different numbers
-
-- **Replayed-answer eval** (`reviewhound eval`): the model's answers are recorded, so this
-  measures the claim checker and policy only. It reads `precision 1.00, recall 1.00` on 36
-  cases. That is a regression test for the checker, **not** the tool's accuracy: the recorded
-  answers were written with the seeded bugs in mind.
-- **Live eval** (`reviewhound eval --live`): asks the real model on the same cases, so it
-  measures model plus checker. It is closer to real use, but read it with care: the cases were
-  written by the same people who tuned the checker, there are only 30 planted bugs, and results
-  vary between runs. It is a smoke test, not an independent benchmark.
-
-  Live eval on 2026-10-24 at commit ee526ac (real model through `claude -p`, checker on, 36
-  cases; raw output in `docs/evals/live-2026-10-24-ee526ac.txt`): precision 1.00, recall 0.97 (29 of 30 planted bugs; the miss was a JavaScript loop that skips its first row, which the model did not report), about $0.018 per PR. Two proof cases were skipped because no Docker sandbox was available. Live results vary from run to run; runs during development scored recall between 0.86 and 1.00 as the checker changed.
-
-### Alternative fair anchors
-
-A few bugs can fairly be flagged on more than one line. An expected finding may list `also`
-anchors; a report on any of them counts, and each expected finding matches **once only**, so
-reporting both anchors gives one true positive and one false alarm. Three cases use it:
-
-- **24 (Go response body not closed):** the leak can be flagged where the response is opened
-  or where its body is read without being closed.
-- **29 (Python role check removed):** the guard is gone, so it can be flagged on the deleted
-  line (LEFT) or on the head line right after the gap.
-- **32 (Go deferred unlock removed):** same shape: the deleted `defer` line, or the `Lock()`
-  line it used to follow.
+A few bugs can fairly be flagged on more than one line, so an expected finding may list `also`
+anchors. A report on any of them counts, and each expected finding matches once only, so
+reporting both anchors gives one true positive and one false alarm. Cases 24 (Go response body
+not closed), 29 (Python role check removed) and 32 (Go deferred unlock removed) use it.
 
 ## Install as a GitHub App
 
-Running as an App means each repo is reviewed with a short-lived installation token instead
-of one person's token, and developers' reactions on GitHub flow back as feedback.
+Running as an App means each repo is reviewed with a short-lived installation token instead of
+one person's token, and reactions on GitHub flow back as feedback.
 
-1. Create the App. Either fill in the form at *Settings > Developer settings > GitHub Apps*,
-   or start from [`app-manifest.json`](app-manifest.json) (set your webhook URL first).
+1. Create the App at *Settings > Developer settings > GitHub Apps*, or start from
+   [`app-manifest.json`](app-manifest.json) (set your webhook URL first).
    - Permissions: **Pull requests: read and write**, **Contents: read**, **Metadata: read**.
-   - Subscribe to events: **`pull_request`**, **`pull_request_review_thread`**,
+   - Events: **`pull_request`**, **`pull_request_review_thread`**,
      **`pull_request_review_comment`**.
    - Webhook URL: `https://<your host>/webhook`, with a webhook secret.
-2. Generate a private key for the App and save the `.pem` file where the worker can read it.
+2. Generate a private key and save the `.pem` file where the worker can read it.
 3. Install the App on the repos to review.
-4. Run both processes with these environment variables:
+4. Run both processes with these variables:
 
 | Variable | Used by | What it is |
 |---|---|---|
 | `REVIEWHOUND_WEBHOOK_SECRET` | `serve` | The App's webhook secret. Required. |
 | `REVIEWHOUND_APP_ID` | `serve`, `worker` | The App id. `serve` uses it to ignore the App's own replies. |
 | `REVIEWHOUND_APP_PRIVATE_KEY_PATH` | `worker` | Path to the App's private key (`.pem`). |
-| `REVIEWHOUND_ALLOWED_OWNERS` | `serve` | Comma-separated repo owners (users or orgs) to accept events for; `--allowed-owner` adds more. Others get a 202 "ignored" and no job. Unset (or empty) accepts every owner, and `serve` warns at start. Set to only spaces or commas, `serve` refuses to start. **Set it.** |
-| `REVIEWHOUND_METRICS_TOKEN` | `serve` | `/metrics` then needs `Authorization: Bearer <token>`; anything else gets 401. Unset leaves `/metrics` open, and `serve` warns at start. **Set it.** |
-| `GITHUB_TOKEN` | `enqueue` | Reads the PR head for a manual `enqueue`. The worker does not use it in App mode: a job with no installation id (manual `enqueue`, sweep) looks the installation up by repo, and a repo without the App installed fails the job at once. |
+| `REVIEWHOUND_ALLOWED_OWNERS` | `serve` | Comma-separated repo owners to accept events for; others get a 202 "ignored" and no job. Unset accepts every owner (with a warning). **Set it.** |
+| `REVIEWHOUND_METRICS_TOKEN` | `serve` | `/metrics` then needs `Authorization: Bearer <token>`. Unset leaves it open (with a warning). **Set it.** |
+| `GITHUB_TOKEN` | `enqueue` | Reads the PR head for a manual `enqueue`. The worker does not use it in App mode. |
 
 ```bash
 REVIEWHOUND_WEBHOOK_SECRET=... REVIEWHOUND_APP_ID=123456 uv run reviewhound serve --port 8787
 REVIEWHOUND_APP_ID=123456 REVIEWHOUND_APP_PRIVATE_KEY_PATH=~/reviewhound.pem uv run reviewhound worker
 ```
 
-Set both App variables or neither; half a configuration stops the worker at start. Without
-them everything works as before with `GITHUB_TOKEN` or `gh`. The key and tokens are never
-logged. Tokens are cached per installation and renewed 5 minutes before they expire.
+What the App does with events: `pull_request` queues a review for the new head; resolving a
+review thread records the finding as `resolved` so it is not posted again; a reply to one of its
+comments is stored as feedback; when a new head has no open blocking finding, its earlier
+"changes requested" reviews on that PR are dismissed. The webhook only writes to the local
+database and never calls GitHub. How each posting outcome maps to the job state is in
+[docs/deploy.md](docs/deploy.md#how-a-posting-job-ends).
 
-What the App does with the events:
+## Limitations and roadmap
 
-- `pull_request`: queues a review for the new head, remembering the installation.
-- After a review posts, the worker reads back the comment ids GitHub assigned and links each
-  one to its finding.
-- `pull_request_review_thread`: resolving a thread records the finding as `resolved` (it is
-  not posted again); unresolving records `reopened`.
-- `pull_request_review_comment`: a reply to one of our comments is recorded as `reply`
-  feedback (first 500 characters). Replies made by the App itself are ignored.
-- When a new head's review has no open blocking finding, our earlier "changes requested"
-  reviews on that PR are dismissed. A failed dismissal is logged, recorded, and retried after
-  the next posted review; it never fails the review.
+- **Small, author-built eval set.** 36 cases is enough to catch regressions in the checker, not
+  to claim accuracy on real code. Next: add real public PRs with known review outcomes.
+- **Proofs are Python only.** TypeScript would need a vitest or jest runner behind the same
+  interface.
+- **One model backend.** Model calls go through the `claude` CLI; the provider interface has a
+  registry, fallback and circuit breaker, but only that provider and a fake one exist.
+- **GitHub only.** The VCS layer is an interface (`vcs/base.py`) with GitHub and in-memory
+  implementations.
+- **Dismissal is narrow.** A removed-guard blocker counts as fixed only when the same deleted
+  lines come back in the same file; an equivalent fix written differently keeps the old verdict.
+- **Posting edge cases.** A POST that times out is recorded as uncertain and retried after
+  checking GitHub, which can take up to one queue lease (30 minutes by default). If GitHub
+  accepted a review but does not list it yet, or a worker freezes for longer than a lease right
+  before its POST, a second review could be posted. When the token cannot say which account it
+  is, no existing review is adopted, so a crash right after a POST can lead to a duplicate
+  rather than a silenced review.
 
-The webhook only writes to the local database; it never calls GitHub. A request body must
-arrive within 30 seconds in total (and no single read may stall past 10 seconds); a slower
-client gets 408 and its connection is closed.
-
-How one posting job ends:
-
-| What happened | Review outcome | Job | Head claim |
-|---|---|---|---|
-| Posted (or posted with comments moved into the body after a 400/422) | `posted` | done | kept, with the review id |
-| Before each POST, GitHub already shows our review of this head (an earlier run crashed after posting) | `posted` (adopted: not posted again; only findings GitHub shows are marked posted) | done | kept, with that review's id |
-| PR head moved, checked right before each POST | `head-moved` | done | freed |
-| Lease lost, checked right before each POST | `lease-lost` | retried | freed |
-| Another run holds the claim with no id, younger than one queue lease, nothing on GitHub | `claim-busy` | retried once the claim can be stale | the other run's |
-| Another run's claim with no id is older than one queue lease | taken over; the GitHub check runs before the POST | as for a normal post | this run's |
-| 400/422 again after the body retry | `post-rejected` | dead, with GitHub's reason | freed |
-| 401, 403, 408, 429 on the POST | (raised) | retried | freed |
-| 404 or another 4xx on the POST | (raised) | dead | freed |
-| 5xx, timeout: it may have landed | `post-uncertain` | done | kept, never posted twice |
-| Anything raised before the POST (token lookup, head lookup) | (raised) | by error class | freed |
-| Posted, but recording it failed | (raised) | retried; before any model call the retry records the post with the verdict that was posted, then finishes the follow-ups (outcome `recovered`) without posting again | kept |
-
-Known limit: a resolve event redelivered byte for byte after an unresolve of the same thread is
-treated as already applied, so the finding stays `reopened`. GitHub sends a fresh body (new
-timestamps) for a real second resolve, so this needs a manual redelivery to happen.
-
-## Open risks
-
-Known gaps that remain after fix round 4, in plain words:
-
-- **An uncertain post is retried slowly.** A POST that times out or gets a 5xx is recorded as
-  `post-uncertain` with its findings `stored`, not posted, and the job goes back to the queue.
-  The retry asks GitHub first and adopts the review if it landed, or posts it if it did not. While
-  the first claim is still fresh the retry waits, so this can take up to one queue lease (30
-  minutes by default), and a run that keeps failing ends in the dead-job list.
-- **The GitHub check trusts what GitHub lists.** If GitHub accepted a review but does not list
-  it yet, a run that took over a stale claim could post a second one.
-- **Unknown account.** When the token cannot say which account it is (`GET /user` failed), no
-  existing review is adopted, because anyone can start a review with "Reviewhound (". A crash
-  right after a POST can then lead to a duplicate review on that head, never a silenced one.
-- **A stalled worker.** If a worker freezes for longer than one queue lease and then wakes right
-  before its POST, another run may already have taken over its claim; both could post.
-- **A busy claim uses up attempts.** Each `claim-busy` retry counts as an attempt; with a very
-  short lease and many retries a job can go dead (its error says why).
-- **Adopted or recovered reviews use this run's answer.** The verdict, id and comments come from
-  GitHub, but the blockers and the finding list come from this run's model answer. A comment
-  GitHub shows that matches none of them stays unlinked (logged), so replies to it are ignored.
-- **Recording can fail twice.** If saving the post id and saving the review both fail after a
-  POST, the next run finds the review on GitHub and adopts it; with a VCS that cannot list
-  reviews it would not.
-- **Dismissal is evidence based but narrow.** A blocker's quote that only survives in an ignored,
-  non-indexed or past-the-5,000-file-cap file counts as gone. A removed-guard blocker counts as
-  fixed only when the same deleted lines come back in the same file; an equivalent fix written
-  differently keeps the old verdict.
-- **Findings next to a deletion need a true claim.** A real removed-guard finding without a
-  confirming claim is held as unverified; whether the live model supplies one is measured by
-  the live eval, not assumed.
-- **Docker proofs and budget.** `--max-proof-seconds` below about 116 s disables Docker proofs
-  (warned at start). The `claude` child gets no proxy or CA variables. Header bytes trickled
-  slowly can still hold a webhook thread.
-- **Byte-identical resolve redelivery** after an unresolve is treated as already applied (see
-  the known limit above).
-
-## Contributing and roadmap
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [ROADMAP.md](ROADMAP.md). Licensed under Apache-2.0.
-
-## Not in milestone 1
-
-- Proof by generated failing test: done in milestone 4, see "Proof by failing test".
-- Feedback from GitHub events and App installation tokens: done in milestone 3, see
-  "Install as a GitHub App".
-- Comments on deleted lines: done in milestone 5 (posted on the LEFT side).
-- A post that times out is recorded as `post-uncertain` and retried; see "Open risks".
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Licensed under Apache-2.0.

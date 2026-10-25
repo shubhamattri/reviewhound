@@ -19,7 +19,7 @@ from tests.conftest import Backend, answer, make_pr
 from tests.test_github_app import PEM, PUBLIC, T0, TokenServer
 from tests.test_pipeline import BASE, HEAD
 
-# The jobs table exactly as milestone 1 and 2 created it, before installation_id existed.
+# The original jobs table, before installation_id existed.
 OLD_SCHEMA = """
 CREATE TABLE jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,7 +82,7 @@ def _old_jobs_table(backend: Backend) -> None:
 
     from reviewhound.backends.postgres import QUEUE_DDL
     with psycopg.connect(backend.url, autocommit=True) as pg:
-        pg.execute(QUEUE_DDL[0])  # the jobs table as milestone 6 created it
+        pg.execute(QUEUE_DDL[0])  # the first Postgres jobs table
         pg.execute("INSERT" + OLD_SCHEMA.split("INSERT", 1)[1])
 
 

@@ -165,6 +165,27 @@ size-capped), then `docker rm -f`. Nothing is written to a host path by the cont
 container that cannot be removed logs `could not remove proof container` and stops itself when
 its `sleep` ends.
 
+## How a posting job ends
+
+| What happened | Review outcome | Job | Head claim |
+|---|---|---|---|
+| Posted (or posted with comments moved into the body after a 400/422) | `posted` | done | kept, with the review id |
+| Before each POST, GitHub already shows our review of this head (an earlier run crashed after posting) | `posted` (adopted: not posted again; only findings GitHub shows are marked posted) | done | kept, with that review's id |
+| PR head moved, checked right before each POST | `head-moved` | done | freed |
+| Lease lost, checked right before each POST | `lease-lost` | retried | freed |
+| Another run holds the claim with no id, younger than one queue lease, nothing on GitHub | `claim-busy` | retried once the claim can be stale | the other run's |
+| Another run's claim with no id is older than one queue lease | taken over; the GitHub check runs before the POST | as for a normal post | this run's |
+| 400/422 again after the body retry | `post-rejected` | dead, with GitHub's reason | freed |
+| 401, 403, 408, 429 on the POST | (raised) | retried | freed |
+| 404 or another 4xx on the POST | (raised) | dead | freed |
+| 5xx, timeout: it may have landed | `post-uncertain` | done | kept, never posted twice |
+| Anything raised before the POST (token lookup, head lookup) | (raised) | by error class | freed |
+| Posted, but recording it failed | (raised) | retried; before any model call the retry records the post with the verdict that was posted, then finishes the follow-ups (outcome `recovered`) without posting again | kept |
+
+Known limit: a resolve event redelivered byte for byte after an unresolve of the same thread is
+treated as already applied, so the finding stays `reopened`. GitHub sends a fresh body (new
+timestamps) for a real second resolve, so this needs a manual redelivery to happen.
+
 ## Backups
 
 - Postgres: `pg_dump --format=custom "$REVIEWHOUND_DATABASE_URL" > reviewhound.dump` on a
@@ -184,6 +205,6 @@ its `sleep` ends.
    by a later version will be listed with its migration in the release notes.
 4. Running jobs are not lost: a worker stopped mid-review leaves its lease to expire and the
    job is retried. To avoid the wait, stop workers between jobs.
-5. Checkouts left half-written by versions before M6 (a directory without
+5. Checkouts left half-written by older versions (a directory without
    `.reviewhound-complete`) are replaced automatically.
 6. Check `/healthz`, then `/metrics` for a rising `jobs_failed_total`.

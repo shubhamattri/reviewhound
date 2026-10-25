@@ -1,0 +1,11 @@
+# Deliberate fake secrets used as test and eval fixtures for the secret scanner.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake secrets in scanner tests and eval cases"
+paths = [
+  '''^evals/cases/''',
+  '''^evals/build_cases\.py$''',
+  '''^tests/test_scanners\.py$''',
+]

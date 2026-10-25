@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS feedback (
 );
 """
 
-# Milestone 3: GitHub comment ids we posted, verdicts we dismissed, webhook events already applied.
+# GitHub App state: comment ids we posted, verdicts we dismissed, webhook events already applied.
 _GITHUB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS comment_links (
     repo TEXT NOT NULL, comment_id INTEGER NOT NULL, pr INTEGER NOT NULL,

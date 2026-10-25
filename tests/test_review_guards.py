@@ -1,4 +1,5 @@
-"""Fix round 1, track B: anchoring, fingerprints, child env, store order, feedback, dismissal."""
+"""Review guards: quote anchoring, fingerprints, child process env, store order, owner allowlist,
+metrics token, webhook body timeout, and when an old "changes requested" review is dismissed."""
 
 from __future__ import annotations
 

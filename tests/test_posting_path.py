@@ -1,4 +1,5 @@
-"""Fix round 2: the posting path as one guarded unit, durable post ids, dismissal evidence."""
+"""The posting path as one guarded unit: lease and head checks before every POST, durable post
+ids, dismissal evidence, Postgres write retries, child env and the proof time budget."""
 
 from __future__ import annotations
 
@@ -30,9 +31,9 @@ from reviewhound.vcs.github import GitHubError
 from reviewhound.vcs.memory import MemoryVCS
 from reviewhound.worker import is_retryable, run_one
 from tests.conftest import Backend, answer, make_pr, spy
-from tests.test_fix_round1_b import REJECTED, scripted_posts
 from tests.test_github_feedback import CFG, FIXED, FP, push, reviewer_on
 from tests.test_pipeline import BASE, HEAD, REAL
+from tests.test_review_guards import REJECTED, scripted_posts
 
 REPO, PR, H1 = "acme/shop", 7, "h1"
 
@@ -53,7 +54,7 @@ def on_claim(store: ReviewStore, monkeypatch: pytest.MonkeyPatch, then: Callable
     monkeypatch.setattr(store, "claim_post", claim)
 
 
-# --- P1: the lease and the head are checked right before every POST --------------------------
+# --- the lease and the head are checked right before every POST --------------------------
 
 def test_head_moving_after_the_claim_posts_nothing_and_frees_the_claim(
         backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,7 +131,7 @@ def test_head_is_read_after_the_claim_not_before(backend: Backend,
     assert order[-3:] == ["claim", "head", "POST"]
 
 
-# --- P2: anything raised between the claim and the POST frees the claim and re-raises --------
+# --- anything raised between the claim and the POST frees the claim and re-raises --------
 
 def test_viewer_login_failure_frees_the_claim_and_reraises(backend: Backend,
                                                           monkeypatch: pytest.MonkeyPatch) -> None:
@@ -197,7 +198,7 @@ def test_interrupt_during_the_post_keeps_the_claim(backend: Backend,
     assert claim_free(store) is False  # it may have landed: never post this head twice
 
 
-# --- P3: only 400 and 422 get the body retry; other refusals raise and free the claim -------
+# --- only 400 and 422 get the body retry; other refusals raise and free the claim -------
 
 def test_http_400_is_retried_in_the_body(backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
     vcs, reviewer, _store = reviewer_on(backend, [answer(REAL)])
@@ -317,7 +318,7 @@ def test_capped_retry_is_what_gets_posted(backend: Backend,
     assert calls[1].body.endswith("\n\n1 more findings not shown.")
 
 
-# --- P4: the job's state follows the review outcome ---------------------------------------
+# --- the job's state follows the review outcome ---------------------------------------
 
 def _worker_run(backend: Backend, reviewer: Reviewer) -> tuple[str, str | None]:
     q: WorkerQueue = backend.queue(backoff_base_s=0)
@@ -362,7 +363,7 @@ def test_lease_lost_still_fails_retryable(backend: Backend,
     assert (state, error is not None and error.startswith("LeaseLost")) == ("queued", True)
 
 
-# --- P5: the post id is durable the moment the POST succeeds; a retry recovers ------------
+# --- the post id is durable the moment the POST succeeds; a retry recovers ------------
 
 def test_post_id_is_written_before_the_review_record(backend: Backend,
                                                      monkeypatch: pytest.MonkeyPatch) -> None:
@@ -603,7 +604,7 @@ def test_old_postgres_posts_table_gets_the_post_id_column(backend: Backend) -> N
     assert store.unrecorded_post(REPO, PR, "h0") == ("r1", "COMMENT")
 
 
-# --- D1: blocking evidence is kept as decided before any proof downgrade or hold ----------
+# --- blocking evidence is kept as decided before any proof downgrade or hold ----------
 
 def _proof_moves(monkeypatch: pytest.MonkeyPatch, how: str) -> None:
     """Stand in for a proof stage that downgrades or holds the blocker (verdict kept)."""
@@ -691,7 +692,7 @@ def test_legacy_review_without_blocker_rows_falls_back_to_posted_findings(
     assert vcs.dismissed == [("legacy-1", DISMISS_MESSAGE)]
 
 
-# --- D2: "gone" means gone from its file AND every other file in the head index -----------
+# --- "gone" means gone from its file AND every other file in the head index -----------
 
 def test_quote_still_in_an_unchanged_file_keeps_the_verdict(backend: Backend) -> None:
     legacy = {"app/legacy.py": "def purge(uid):\n    db.delete(uid)\n"}
@@ -732,7 +733,7 @@ def test_open_reason_searches_every_indexed_file(files: dict[str, str], changed:
     assert open_reason(ROW, _Head(files), changed, sources) == reason
 
 
-# --- H5: a Postgres write transaction retries once on deadlock or serialization failure ----
+# --- a Postgres write transaction retries once on deadlock or serialization failure ----
 
 class _Flaky:
     """A connection whose first `fails` statements matching `marker` raise `error`."""
@@ -824,7 +825,7 @@ def test_webhook_enqueue_rides_out_one_deadlock(backend: Backend,
     assert handle_event(q, "pull_request", body) == (202, "job 1 queued")
 
 
-# --- H1: a set-but-empty owner allowlist refuses to start ---------------------------------
+# --- a set-but-empty owner allowlist refuses to start ---------------------------------
 
 class _Idle:
     def serve_forever(self) -> None:
@@ -868,14 +869,14 @@ def test_serve_starts_when_the_allowlist_is_unset_empty_or_named(
     assert _serve(monkeypatch, tmp_path, owners) == [allowed]
 
 
-# --- H2: the webhook body read has a total deadline ---------------------------------------
+# --- the webhook body read has a total deadline ---------------------------------------
 
 def test_body_trickled_past_the_deadline_gets_408_and_frees_the_thread(tmp_path: Any) -> None:
     import socket
     import time
 
     from reviewhound.queue import SQLiteQueue
-    from tests.test_fix_round1_b import serving
+    from tests.test_review_guards import serving
     q = SQLiteQueue(tmp_path / "q.db")
     with serving(queue=q, read_timeout_s=0.5, body_deadline_s=1.0) as port:
         sock = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -913,7 +914,7 @@ def test_body_sent_in_pieces_within_the_deadline_is_accepted(tmp_path: Any) -> N
     import time
 
     from reviewhound.queue import SQLiteQueue
-    from tests.test_fix_round1_b import pr_body, serving
+    from tests.test_review_guards import pr_body, serving
     from tests.test_webhook import sign
     q = SQLiteQueue(tmp_path / "q.db")
     body = json.dumps(pr_body()).encode()
@@ -931,7 +932,7 @@ def test_body_sent_in_pieces_within_the_deadline_is_accepted(tmp_path: Any) -> N
     assert reply.endswith(b'{"message": "job 1 queued"}')
 
 
-# --- H3, H4: child process environments ---------------------------------------------------
+# --- child process environments ---------------------------------------------------
 
 CLAUDE_OK = {"PATH": "/usr/bin", "HOME": "/home/rh", "USER": "rh", "LOGNAME": "rh",
              "LANG": "C.UTF-8", "TMPDIR": "/tmp/rh", "SHELL": "/bin/sh",
@@ -986,7 +987,7 @@ def test_git_and_semgrep_keep_proxy_and_ca_settings(monkeypatch: pytest.MonkeyPa
                                     **NETWORK, "EXTRA": "1"}
 
 
-# --- H6: the proof budget counts Docker's own time, not only the test timeout -------------
+# --- the proof budget counts Docker's own time, not only the test timeout -------------
 
 class _ClockedDocker:
     """A docker CLI where every call takes its full timeout: the worst case."""

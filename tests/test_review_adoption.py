@@ -1,4 +1,4 @@
-"""Fix round 4: GitHub decides whether a review landed, 429 is a refusal, recovery marks only what
+"""GitHub decides whether a review landed, 429 is a refusal, recovery marks only what
 GitHub shows, removed-guard blockers can be dismissed, beside-deletion findings need a true claim,
 and dry runs write nothing."""
 
@@ -34,10 +34,10 @@ from reviewhound.vcs.github_app import GitHubApp
 from reviewhound.vcs.memory import MemoryVCS, diff_file_maps
 from reviewhound.worker import is_retryable, run_one
 from tests.conftest import Backend, FakeClock, answer, make_pr
-from tests.test_fix_round1_b import REJECTED, SECOND, scripted_posts
 from tests.test_github_app import PEM
 from tests.test_github_feedback import CFG, FP
 from tests.test_pipeline import BASE, HEAD, REAL
+from tests.test_review_guards import REJECTED, SECOND, scripted_posts
 
 REPO, PR, H1 = "acme/shop", 7, "h1"
 STALE = 600.0
@@ -84,7 +84,7 @@ def crash_after_the_post(vcs: MemoryVCS, monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(vcs, "post_review", post)
 
 
-# --- N1: GitHub is the source of truth for "did it land" -----------------------------------
+# --- GitHub is the source of truth for "did it land" -----------------------------------
 
 def test_crash_after_the_post_is_adopted_by_the_next_run_not_posted_again(
         backend: Backend, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -191,7 +191,7 @@ def test_remote_check_runs_before_every_post_and_the_lease_is_read_after_it(
     assert order == ["lease", "list", "lease", "POST", "list", "lease", "POST"]
 
 
-# --- N1: stale claims ------------------------------------------------------------------------
+# --- stale claims ------------------------------------------------------------------------
 
 def test_stale_claim_without_an_id_is_taken_over_and_posted(backend: Backend) -> None:
     clock = FakeClock()
@@ -330,7 +330,7 @@ def test_two_takers_of_one_stale_claim_only_one_wins(backend: Backend) -> None:
             second.take_stale_claim(REPO, PR, H1, STALE)] == [True, False]
 
 
-# --- N1b: 429 on the POST is a refusal ---------------------------------------------------------
+# --- 429 on the POST is a refusal ---------------------------------------------------------
 
 RATE_LIMITED = GitHubError("POST /x -> HTTP 429: rate limited", 429)
 
@@ -372,7 +372,7 @@ def test_worker_requeues_a_429_and_the_retry_posts(backend: Backend,
     assert [r["outcome"] for r in store.reviews(REPO, PR)] == ["posted"]
 
 
-# --- N2: only findings GitHub shows are marked posted ------------------------------------------
+# --- only findings GitHub shows are marked posted ------------------------------------------
 
 def _recorded_post_then_crash(backend: Backend, monkeypatch: pytest.MonkeyPatch
                               ) -> tuple[MemoryVCS, ReviewStore]:
@@ -434,7 +434,7 @@ def test_a_review_this_run_posted_itself_marks_its_findings_posted(backend: Back
     assert states(store) == {11: "posted", 12: "posted"}
 
 
-# --- N3: a removed-guard blocker is dismissed once the deleted code is back --------------------
+# --- a removed-guard blocker is dismissed once the deleted code is back --------------------
 
 GUARD_BASE = ("from app.auth import require_role\n\n\ndef cancel_order(request, order_id):\n"
               '    require_role(request, "support")\n    orders.cancel(order_id)\n'
@@ -628,7 +628,7 @@ def test_removed_guard_verdict_is_kept_while_the_guard_is_still_missing(backend:
     assert vcs.dismissed == []
 
 
-# --- N4: next to a deletion, verified needs a claim checked true -------------------------------
+# --- next to a deletion, verified needs a claim checked true -------------------------------
 
 def test_beside_with_a_true_claim_is_verified() -> None:
     f, reason = guard_checker().check(mfind(claims=[NOT_CALLS]), "m")
@@ -684,7 +684,7 @@ def test_quote_of_deleted_code_does_not_hold_for_a_finding_on_an_added_line() ->
     assert reason == "false claim: quoted text not found in a.py"
 
 
-# --- N5: dry runs write nothing ----------------------------------------------------------------
+# --- dry runs write nothing ----------------------------------------------------------------
 
 class NoStore:
     """Any use of the store fails the test."""
@@ -834,7 +834,7 @@ def test_app_bot_login_refuses_a_malformed_answer(body: Any) -> None:
         GitHubApp("123", PEM, client=client).bot_login()
 
 
-# --- review fixes: a second copy of the guard, adopted blockers, uncertain posts, a freed claim --
+# --- edge cases: a second copy of the guard, adopted blockers, uncertain posts, a freed claim --
 
 TWO_GUARDS_BASE = GUARD_BASE + ('\n\ndef refund_order(request, order_id):\n'
                                 '    require_role(request, "support")\n'
