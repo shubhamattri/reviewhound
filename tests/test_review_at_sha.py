@@ -117,7 +117,7 @@ def test_merged_pr_is_reviewed_in_a_dry_run_at_the_pinned_commit() -> None:
 
 
 def test_closed_pr_without_a_pinned_commit_is_still_skipped_in_a_dry_run() -> None:
-    vcs, reviewer, provider = pinned_setup([])
+    _, reviewer, provider = pinned_setup([])
     result = reviewer.review("acme/shop", 7, dry_run=True)
     assert (result.outcome, result.error) == ("skipped", "PR is closed")
     assert provider.prompts == []
@@ -133,7 +133,7 @@ def test_pinned_review_is_refused_outside_a_dry_run_before_any_fetch() -> None:
 
 
 def test_pinned_review_of_a_commit_not_on_the_pr_raises_and_asks_no_model() -> None:
-    vcs, reviewer, provider = pinned_setup([answer(REAL)])
+    _, reviewer, provider = pinned_setup([answer(REAL)])
     with pytest.raises(ShaNotOnPull):
         reviewer.review("acme/shop", 7, dry_run=True, at_sha="h9")
     assert provider.prompts == []
