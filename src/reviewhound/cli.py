@@ -28,11 +28,13 @@ from reviewhound.proof import (
 from reviewhound.providers import ClaudeCliProvider, FakeProvider, Provider, ProviderRegistry
 from reviewhound.queue import DEFAULT_LEASE_S, Job
 from reviewhound.scanners import BuiltinScanner, Scanner, SemgrepScanner
+from reviewhound.vcs.base import ShaNotOnPull
 
 if TYPE_CHECKING:
     from reviewhound.vcs.github_app import GitHubApp
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SHA_RE = re.compile(r"^[0-9A-Fa-f]{7,40}$")
 DEFAULT_HOME = Path(os.environ.get("REVIEWHOUND_HOME", Path.home() / ".reviewhound"))
 
 
@@ -118,6 +120,12 @@ def _repo_name(value: str) -> str:
     return value
 
 
+def _commit_sha(value: str) -> str:
+    if not _SHA_RE.match(value):
+        raise argparse.ArgumentTypeError(f"expected a 7 to 40 hex digit sha, got {value!r}")
+    return value.lower()
+
+
 def _positive_seconds(value: str) -> float:
     try:
         seconds = float(value)
@@ -162,8 +170,13 @@ def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp,
 
 
 def cmd_review(args: argparse.Namespace) -> int:
+    if args.at_sha and not args.dry_run:
+        raise SystemExit("--at-sha reviews a past commit and needs --dry-run")
     reviewer = _reviewer(args, with_store=not args.dry_run)
-    result = reviewer.review(args.repo, args.pr, dry_run=args.dry_run)
+    try:
+        result = reviewer.review(args.repo, args.pr, dry_run=args.dry_run, at_sha=args.at_sha)
+    except ShaNotOnPull as exc:
+        raise SystemExit(f"--at-sha: {exc}") from None
     rt = result.route
     print(f"PR {result.pr.repo}#{result.pr.number} head {result.pr.head_sha[:12]}")
     if rt:
@@ -294,6 +307,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("pr", type=int)
     r.add_argument("--dry-run", action="store_true", help="print the review, post nothing")
     r.add_argument("--fake-answer", help="file with a recorded model answer (no model call)")
+    r.add_argument("--at-sha", type=_commit_sha, default=None, metavar="SHA",
+                   help="with --dry-run: review the PR as it stood at this commit of its own, "
+                        "even if the PR is closed or merged")
     r.set_defaults(func=cmd_review)
 
     e = sub.add_parser("eval", help="replay the eval cases and print precision and recall")

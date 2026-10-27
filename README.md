@@ -54,7 +54,11 @@ logged in, and a GitHub token from `GITHUB_TOKEN` or `gh`:
 ```bash
 uv run reviewhound eval --live                                # the eval against the real model
 uv run reviewhound review owner/repo 12 --dry-run             # print the review it would post
+uv run reviewhound review owner/repo 12 --dry-run --at-sha 1a2b3c4  # as it stood at that commit
 ```
+
+`--at-sha` takes one of the PR's own commits, also on a closed or merged PR, and diffs it from
+its merge base as GitHub showed the PR then. It only works with `--dry-run`, so nothing is posted.
 
 As a service (see [Install as a GitHub App](#install-as-a-github-app) and
 [docs/deploy.md](docs/deploy.md)):

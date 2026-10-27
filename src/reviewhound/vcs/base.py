@@ -152,6 +152,17 @@ class ReviewThreads(Protocol):
     def dismiss_review(self, repo: str, number: int, review_id: str, message: str) -> None: ...
 
 
+class ShaNotOnPull(ValueError):
+    """The commit asked for is not exactly one of the pull request's own commits."""
+
+
+@runtime_checkable
+class PinnedPulls(Protocol):
+    """Optional VCS ability: a pull request as it stood at one of its own commits."""
+
+    def pull_at(self, pr: PullRequest, sha: str) -> tuple[PullRequest, Diff]: ...
+
+
 @runtime_checkable
 class ThreadedVCS(VCS, ReviewThreads, Protocol):
     """A VCS with the thread abilities, so a follow-up can also re-read the PR head."""
