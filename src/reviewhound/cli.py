@@ -29,6 +29,7 @@ from reviewhound.providers import ClaudeCliProvider, FakeProvider, Provider, Pro
 from reviewhound.queue import DEFAULT_LEASE_S, Job
 from reviewhound.scanners import BuiltinScanner, Scanner, SemgrepScanner
 from reviewhound.vcs.base import ShaNotOnPull
+from reviewhound.vcs.github import GitHubError
 
 if TYPE_CHECKING:
     from reviewhound.vcs.github_app import GitHubApp
@@ -177,6 +178,10 @@ def cmd_review(args: argparse.Namespace) -> int:
         result = reviewer.review(args.repo, args.pr, dry_run=args.dry_run, at_sha=args.at_sha)
     except ShaNotOnPull as exc:
         raise SystemExit(f"--at-sha: {exc}") from None
+    except GitHubError as exc:
+        if args.at_sha:
+            raise SystemExit(f"--at-sha {args.at_sha}: {exc}") from None
+        raise
     rt = result.route
     print(f"PR {result.pr.repo}#{result.pr.number} head {result.pr.head_sha[:12]}")
     if rt:

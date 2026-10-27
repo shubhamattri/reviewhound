@@ -77,6 +77,17 @@ def test_pull_at_names_githubs_commit_cap_when_the_sha_is_missing(tmp_path: Path
         gh(commits, [PATCH], [], tmp_path).pull_at(make_pr(), FULL)
 
 
+def test_pull_at_refuses_a_compare_that_names_no_merge_base(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/commits"):
+            return httpx.Response(200, json=[{"sha": FULL}])
+        return httpx.Response(200, json={"files": [PATCH]})
+    client = httpx.Client(base_url="https://api.github.com",
+                          transport=httpx.MockTransport(handler))
+    with pytest.raises(GitHubError, match="named no merge base"):
+        GitHubVCS("t0ken", tmp_path, client=client).pull_at(make_pr(), FULL)
+
+
 def test_pull_at_refuses_a_compare_cut_short_at_githubs_file_cap(tmp_path: Path) -> None:
     files = [{**PATCH, "filename": f"f{i}.py"} for i in range(300)]
     with pytest.raises(GitHubError, match="300 files"):
@@ -86,6 +97,7 @@ def test_pull_at_refuses_a_compare_cut_short_at_githubs_file_cap(tmp_path: Path)
 def pinned_setup(answers: list[str]) -> tuple[MemoryVCS, Reviewer, FakeProvider]:
     vcs = MemoryVCS(make_pr(head="h2", state="closed"), dict(BASE), dict(HEAD))
     vcs.commits = ["h1", "h2"]
+    vcs.merge_base = "mb1"
     provider = FakeProvider(answers)
     return vcs, Reviewer(vcs, ProviderRegistry([provider]), [BuiltinScanner()], None), provider
 
@@ -99,6 +111,9 @@ def test_merged_pr_is_reviewed_in_a_dry_run_at_the_pinned_commit() -> None:
     assert [(c.path, c.line) for c in result.review.comments] == [("app/admin.py", 11)]
     assert len(provider.prompts) == 1
     assert vcs.posted == []
+    assert result.pr.base_sha == "mb1"
+    assert {("snapshot", "h1"), ("churn", "h1"), ("read_file", "mb1")} <= set(vcs.reads)
+    assert {sha for _, sha in vcs.reads} <= {"h1", "mb1"}
 
 
 def test_closed_pr_without_a_pinned_commit_is_still_skipped_in_a_dry_run() -> None:
@@ -142,3 +157,15 @@ def test_cli_turns_a_sha_not_on_the_pr_into_a_one_line_exit(
     monkeypatch.setattr(cli, "_reviewer", lambda args, with_store: reviewer)
     with pytest.raises(SystemExit, match="^--at-sha: abc1234 is not exactly one commit"):
         cli.main(["review", "acme/shop", "7", "--dry-run", "--at-sha", "ABC1234"])
+
+
+def test_cli_turns_a_github_refusal_of_the_pinned_review_into_a_one_line_exit(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    vcs, reviewer, _ = pinned_setup([])
+
+    def too_big(pr: object, sha: str) -> None:
+        raise GitHubError("compare lists 300 files, GitHub's cap, so the diff may be cut short")
+    vcs.pull_at = too_big  # type: ignore[method-assign,assignment]
+    monkeypatch.setattr(cli, "_reviewer", lambda args, with_store: reviewer)
+    with pytest.raises(SystemExit, match="^--at-sha abcdef1: compare lists 300 files"):
+        cli.main(["review", "acme/shop", "7", "--dry-run", "--at-sha", "ABCDEF1"])

@@ -174,7 +174,10 @@ class GitHubVCS:
                               "may be cut short")
         diff = Diff()
         _add_files(diff, files)
-        return replace(pr, head_sha=full, base_sha=data["merge_base_commit"]["sha"]), diff
+        merge_base = (data.get("merge_base_commit") or {}).get("sha")
+        if not merge_base:
+            raise GitHubError(f"compare of {pr.base_sha}...{full} named no merge base")
+        return replace(pr, head_sha=full, base_sha=merge_base), diff
 
     def _own_commit(self, pr: PullRequest, sha: str) -> str:
         shas: list[str] = []
@@ -189,10 +192,11 @@ class GitHubVCS:
         hits = [s for s in shas if s.startswith(sha.lower())]
         if len(hits) == 1:
             return hits[0]
-        where = f"{pr.repo}#{pr.number}" + (
-            f" (GitHub lists only its first {len(shas)} commits)"
-            if len(shas) >= _PULL_COMMIT_CAP else "")
-        raise ShaNotOnPull(f"{sha} {'is ambiguous' if hits else 'is not a commit'} on {where}")
+        if hits:
+            raise ShaNotOnPull(f"{sha} is ambiguous on {pr.repo}#{pr.number}")
+        cap = (f" (GitHub lists only its first {_PULL_COMMIT_CAP} commits)"
+               if len(shas) >= _PULL_COMMIT_CAP else "")
+        raise ShaNotOnPull(f"{sha} is not a commit on {pr.repo}#{pr.number}{cap}")
 
     def current_head(self, repo: str, number: int) -> str:
         return self.get_pull(repo, number).head_sha
