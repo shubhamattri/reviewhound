@@ -29,6 +29,7 @@ from reviewhound.scanners import Scanner
 from reviewhound.store import Blocker, ReviewRecord, ReviewStore
 from reviewhound.vcs.base import (
     VCS,
+    PinnedPulls,
     PostedComment,
     PostedReview,
     PullRequest,
@@ -202,8 +203,14 @@ class Reviewer:
 
     def review(self, repo: str, number: int, *, dry_run: bool,
                expected_head: str | None = None,
-               should_post: Callable[[], bool] | None = None) -> ReviewResult:
-        """`should_post` is asked right before each post; False (lease lost) posts nothing."""
+               should_post: Callable[[], bool] | None = None,
+               at_sha: str | None = None) -> ReviewResult:
+        """`should_post` is asked right before each post; False (lease lost) posts nothing.
+        `at_sha` reviews the PR as it stood at one of its own commits, even closed; dry run only."""
+        if at_sha is not None and not dry_run:
+            raise ValueError("at_sha reviews a past commit, so it is allowed only in a dry run")
+        if at_sha is not None and not isinstance(self.vcs, PinnedPulls):
+            raise ValueError("this VCS cannot review a PR at a past commit")
         t = _Timer()
         with t.stage("fetch"):
             pr = self.vcs.get_pull(repo, number)
@@ -211,7 +218,7 @@ class Reviewer:
         if not dry_run:
             result.recovered_id, result.recovered_event = self._record_landed(
                 repo, number, expected_head or pr.head_sha)
-        if pr.state != "open":
+        if pr.state != "open" and at_sha is None:
             result.outcome = "skipped"
             result.error = f"PR is {pr.state}"
             return self._finish(result, t, [], [])
@@ -220,7 +227,11 @@ class Reviewer:
             result.error = f"PR head is now {pr.head_sha[:12]}"
             return self._finish(result, t, [], [])
         with t.stage("diff"):
-            diff = self.vcs.get_diff(pr)
+            if isinstance(self.vcs, PinnedPulls) and at_sha is not None:
+                pr, diff = self.vcs.pull_at(pr, at_sha)
+                result.pr = pr
+            else:
+                diff = self.vcs.get_diff(pr)
             cfg = load_config(self.vcs.read_file(repo, pr.base_sha, CONFIG_FILENAME))
         result.route = rt = route(diff, cfg)
         if rt.tier == "skip":

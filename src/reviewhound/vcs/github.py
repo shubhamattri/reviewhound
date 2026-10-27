@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from reviewhound.vcs.base import (
     PostedReview,
     PullRequest,
     ReviewPayload,
+    ShaNotOnPull,
     Snapshot,
 )
 
@@ -68,6 +70,23 @@ def _install(tmp: Path, dest: Path) -> Path:
                 return dest
             raise
     return dest
+
+
+_COMPARE_FILE_CAP = 300  # the compare API lists no more files than this
+_PULL_COMMIT_CAP = 250  # nor the pull commits API more commits than this
+
+
+def _add_files(diff: Diff, files: list[dict[str, Any]]) -> None:
+    for f in files:
+        status = {"removed": "deleted"}.get(f["status"], f["status"])
+        diff.files[f["filename"]] = parse_patch(f["filename"], f.get("patch") or "", status,
+                                                f.get("previous_filename"))
+        if not f.get("patch"):
+            # GitHub drops the patch for very large diffs and for binary files.
+            if int(f.get("changes") or 0) > 0:
+                diff.skipped[f["filename"]] = "diff too large for GitHub to return"
+            elif status in ("added", "modified"):
+                diff.skipped[f["filename"]] = "no text diff (binary, empty or mode change)"
 
 
 class GitHubError(RuntimeError):
@@ -140,20 +159,44 @@ class GitHubVCS:
         while True:
             files = self._request("GET", f"/repos/{pr.repo}/pulls/{pr.number}/files",
                                   params={"per_page": 100, "page": page}).json()
-            for f in files:
-                status = {"removed": "deleted"}.get(f["status"], f["status"])
-                fd = parse_patch(f["filename"], f.get("patch") or "", status,
-                                 f.get("previous_filename"))
-                diff.files[f["filename"]] = fd
-                if not f.get("patch"):
-                    # GitHub drops the patch for very large diffs and for binary files.
-                    if int(f.get("changes") or 0) > 0:
-                        diff.skipped[f["filename"]] = "diff too large for GitHub to return"
-                    elif status in ("added", "modified"):
-                        diff.skipped[f["filename"]] = "no text diff (binary, empty or mode change)"
+            _add_files(diff, files)
             if len(files) < 100:
                 return diff
             page += 1
+
+    def pull_at(self, pr: PullRequest, sha: str) -> tuple[PullRequest, Diff]:
+        """The PR at one of its own commits, diffed from its merge base as GitHub shows a PR."""
+        full = self._own_commit(pr, sha)
+        data = self._request("GET", f"/repos/{pr.repo}/compare/{pr.base_sha}...{full}").json()
+        files = data.get("files") or []
+        if len(files) >= _COMPARE_FILE_CAP:
+            raise GitHubError(f"compare lists {len(files)} files, GitHub's cap, so the diff "
+                              "may be cut short")
+        diff = Diff()
+        _add_files(diff, files)
+        merge_base = (data.get("merge_base_commit") or {}).get("sha")
+        if not merge_base:
+            raise GitHubError(f"compare of {pr.base_sha}...{full} named no merge base")
+        return replace(pr, head_sha=full, base_sha=merge_base), diff
+
+    def _own_commit(self, pr: PullRequest, sha: str) -> str:
+        shas: list[str] = []
+        page = 1
+        while True:
+            batch = self._request("GET", f"/repos/{pr.repo}/pulls/{pr.number}/commits",
+                                  params={"per_page": 100, "page": page}).json()
+            shas += [c["sha"] for c in batch]
+            if len(batch) < 100:
+                break
+            page += 1
+        hits = [s for s in shas if s.startswith(sha.lower())]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise ShaNotOnPull(f"{sha} is ambiguous on {pr.repo}#{pr.number}")
+        cap = (f" (GitHub lists only its first {_PULL_COMMIT_CAP} commits)"
+               if len(shas) >= _PULL_COMMIT_CAP else "")
+        raise ShaNotOnPull(f"{sha} is not a commit on {pr.repo}#{pr.number}{cap}")
 
     def current_head(self, repo: str, number: int) -> str:
         return self.get_pull(repo, number).head_sha

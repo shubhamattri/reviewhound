@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 from collections import Counter
+from dataclasses import replace
 
 from reviewhound.diff import Diff, parse_unified_diff
 from reviewhound.vcs.base import (
@@ -12,6 +13,7 @@ from reviewhound.vcs.base import (
     PostedReview,
     PullRequest,
     ReviewPayload,
+    ShaNotOnPull,
     Snapshot,
 )
 
@@ -43,6 +45,10 @@ class MemoryVCS:
         self.base = base
         self.head = head
         self.head_sha_now = pr.head_sha
+        self.commits = [pr.head_sha]  # the PR's commits, for pull_at
+        self.merge_base = ""  # what pull_at reports as the base; empty keeps the PR's own
+        self.pinned = ""  # the commit pull_at last pinned, served as the head
+        self.reads: list[tuple[str, str]] = []  # (method, sha) for every snapshot/read/churn
         self.posted: list[ReviewPayload] = []
         self.viewer = "reviewhound-bot"
         self.dismissed: list[tuple[str, str]] = []
@@ -55,13 +61,25 @@ class MemoryVCS:
     def get_diff(self, pr: PullRequest) -> Diff:
         return diff_file_maps(self.base, self.head)
 
+    def pull_at(self, pr: PullRequest, sha: str) -> tuple[PullRequest, Diff]:
+        """The one head this fake holds stands for whichever of `commits` is asked for."""
+        hits = [c for c in self.commits if c.startswith(sha)]
+        if len(hits) != 1:
+            raise ShaNotOnPull(f"{sha} is not exactly one commit on {pr.repo}#{pr.number}")
+        self.pinned = hits[0]
+        return (replace(pr, head_sha=hits[0], base_sha=self.merge_base or pr.base_sha),
+                diff_file_maps(self.base, self.head))
+
     def snapshot(self, repo: str, sha: str) -> Snapshot:
-        return DictSnapshot(self.head if sha == self.pr.head_sha else self.base)
+        self.reads.append(("snapshot", sha))
+        return DictSnapshot(self.head if sha in (self.pr.head_sha, self.pinned) else self.base)
 
     def read_file(self, repo: str, sha: str, path: str) -> str | None:
-        return (self.head if sha == self.pr.head_sha else self.base).get(path)
+        self.reads.append(("read_file", sha))
+        return (self.head if sha in (self.pr.head_sha, self.pinned) else self.base).get(path)
 
     def churn(self, repo: str, sha: str) -> Counter[str]:
+        self.reads.append(("churn", sha))
         return Counter()
 
     def current_head(self, repo: str, number: int) -> str:
