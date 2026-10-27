@@ -218,7 +218,7 @@ class Reviewer:
         if not dry_run:
             result.recovered_id, result.recovered_event = self._record_landed(
                 repo, number, expected_head or pr.head_sha)
-        if pr.state != "open":
+        if pr.state != "open" and at_sha is None:
             result.outcome = "skipped"
             result.error = f"PR is {pr.state}"
             return self._finish(result, t, [], [])
