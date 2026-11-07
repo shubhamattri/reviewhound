@@ -84,3 +84,12 @@ def test_rules_file_added_by_the_pr_itself_is_not_trusted(tmp_path: Path) -> Non
 def test_identical_claude_and_agents_files_are_included_once(tmp_path: Path) -> None:
     files = {"CLAUDE.md": RULE, "AGENTS.md": RULE}
     assert _review(files, files, tmp_path).count(RULE) == 1
+
+
+def test_prompt_makes_a_broken_written_rule_a_defect_and_asks_about_derived_values() -> None:
+    from reviewhound.config import RepoConfig
+    from reviewhound.prompt import build_prompt
+
+    text = build_prompt("CTX", RepoConfig())
+    assert "an added line that breaks a written house rule is a defect" in text
+    assert "list everything computed from it" in text

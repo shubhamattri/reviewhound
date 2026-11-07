@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from reviewhound.config import RepoConfig, Severity
 from reviewhound.design_tokens import DesignTokenScanner, load_tokens
 from reviewhound.findings import Finding
@@ -139,3 +141,16 @@ def test_pipeline_runs_the_check_only_when_the_base_config_turns_it_on(tmp_path:
 
 def test_a_pr_cannot_turn_the_check_on_from_its_own_head_config(tmp_path: Path) -> None:
     assert _pipeline_findings(None, "design_tokens: true\n", tmp_path) == []
+
+
+def test_cli_reviewer_runs_the_design_token_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+
+    from reviewhound import cli
+
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    args = argparse.Namespace(home=str(tmp_path), gh_user=None, database_url=None, fake_answer=None,
+                              max_proof_seconds=60, proof_image="img", allow_local_proof_repo=[],
+                              repo="o/r")
+    reviewer = cli._reviewer(args, with_store=False)
+    assert [type(s).__name__ for s in reviewer.scanners].count("DesignTokenScanner") == 1
