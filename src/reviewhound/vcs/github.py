@@ -75,6 +75,7 @@ def _install(tmp: Path, dest: Path) -> Path:
 
 _COMPARE_FILE_CAP = 300  # the compare API lists no more files than this
 _PULL_COMMIT_CAP = 250  # nor the pull commits API more commits than this
+_PULL_FILES_CAP = 3_000  # nor the pull files API more files than this
 
 
 def _add_files(diff: Diff, files: list[dict[str, Any]]) -> None:
@@ -165,6 +166,7 @@ class GitHubVCS:
                                   params={"per_page": 100, "page": page}).json()
             _add_files(diff, files)
             if len(files) < 100:
+                diff.maybe_cut = len(diff.files) >= _PULL_FILES_CAP
                 return diff
             page += 1
 

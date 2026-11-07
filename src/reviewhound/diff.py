@@ -70,6 +70,7 @@ class FileDiff:
 class Diff:
     files: dict[str, FileDiff] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)  # path -> why its patch is missing
+    maybe_cut: bool = False  # the host may have listed only some of the changed files
 
     @property
     def changed_paths(self) -> list[str]:

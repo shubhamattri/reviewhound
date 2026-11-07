@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -16,6 +17,13 @@ _MAX_RULES_BYTES = 16_000
 _RULES_SHARE = 5  # rules get at most a fifth of the budget, ahead of the diff
 _MIN_RULES_BYTES = 1_000
 _CUT = "\n[rules file cut here to fit the review budget]"
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def header_safe(text: str) -> str:
+    """`text` on one line: control characters and line breaks shown as escapes, so a file
+    name cannot open a section of its own."""
+    return _CONTROL.sub(lambda m: m.group(0).encode("unicode_escape").decode("ascii"), text)
 
 
 @dataclass
@@ -23,6 +31,7 @@ class Context:
     text: str
     included: list[str] = field(default_factory=list)
     omitted: list[str] = field(default_factory=list)
+    rules_marker: str = ""  # names the block holding the real rules files; empty when none
 
     @property
     def size(self) -> int:
@@ -87,8 +96,12 @@ def _cut_to(text: str, limit: int) -> str:
     return kept + _CUT if kept else ""
 
 
+def _rules_block(marker: str, sections: list[str]) -> str:
+    return f"<rules-{marker}>\n" + "\n\n".join(sections) + f"\n</rules-{marker}>"
+
+
 def _diff_block(fd: FileDiff) -> str:
-    return f"## Diff: {fd.path} ({fd.status})\n{render_hunks(fd)}"
+    return f"## Diff: {header_safe(fd.path)} ({fd.status})\n{render_hunks(fd)}"
 
 
 def _bytes_taken(blocks: list[str], room: int) -> int:
@@ -118,22 +131,31 @@ def build_context(pr: PullRequest, diff: Diff, index: CodeIndex, budget_bytes: i
     ctx = Context(text="")
     b = _Budget(budget_bytes)
     body = pr.body[:_MAX_BODY_BYTES]
-    b.add(f"## Pull request\nTitle: {pr.title}\n\n{body}".rstrip())
+    b.add(f"## Pull request\nTitle: {header_safe(pr.title)}\n\n{body}".rstrip())
     if conventions:
         b.add(f"## Repository conventions (learned)\n{conventions}")
 
     diff_blocks = [(path, _diff_block(diff.files[path])) for path in reviewable]
     reserved = _bytes_taken([block for _, block in diff_blocks], b.free + 2)
     rules_left = min(_MAX_RULES_BYTES, budget_bytes // _RULES_SHARE, b.free - reserved)
+    marker = secrets.token_hex(8)
+    room = min(rules_left, b.free) - len(_rules_block(marker, [""]).encode("utf-8"))
+    sections: list[tuple[str, str]] = []
     for path, text in house_rules:
-        title = f"## Repository rules: {path} (the team's own rules for this repo)\n"
-        size = min(rules_left, b.free) - len(title.encode("utf-8"))
+        title = f"## Repository rules: {header_safe(path)} (the team's own rules for this repo)\n"
+        gap = 2 if sections else 0  # the blank line between two rules files
+        size = room - gap - len(title.encode("utf-8"))
         rules_body = _cut_to(text.strip(), size) if size >= _MIN_RULES_BYTES else ""
-        if rules_body and b.add(title + rules_body):
-            rules_left -= len((title + rules_body).encode("utf-8")) + 2
-            ctx.included.append(f"rules:{path}")
+        if rules_body:
+            room -= gap + len((title + rules_body).encode("utf-8"))
+            sections.append((path, title + rules_body))
         else:
             ctx.omitted.append(f"rules:{path}")
+    if sections and b.add(_rules_block(marker, [section for _, section in sections])):
+        ctx.rules_marker = marker
+        ctx.included.extend(f"rules:{path}" for path, _ in sections)
+    else:
+        ctx.omitted.extend(f"rules:{path}" for path, _ in sections)
 
     for path, block in diff_blocks:
         if b.add(block):
@@ -144,7 +166,7 @@ def build_context(pr: PullRequest, diff: Diff, index: CodeIndex, budget_bytes: i
     changed = changed_definitions(diff, index)
     for d in changed:
         src = index.sources.get(d.file, "")
-        block = f"## Changed function at head: {d.qualified} ({d.file})\n" \
+        block = f"## Changed function at head: {d.qualified} ({header_safe(d.file)})\n" \
                 f"{numbered(src, d.start_line, d.end_line)}"
         (ctx.included if b.add(block) else ctx.omitted).append(f"def:{d.file}:{d.qualified}")
 
@@ -155,7 +177,7 @@ def build_context(pr: PullRequest, diff: Diff, index: CodeIndex, budget_bytes: i
             if not defs or (path, qualified) == (d.file, d.qualified):
                 continue
             c = defs[0]
-            block = f"## Caller of {d.name}: {c.qualified} ({c.file})\n" \
+            block = f"## Caller of {d.name}: {c.qualified} ({header_safe(c.file)})\n" \
                     f"{numbered(index.sources[c.file], c.start_line, c.end_line)}"
             (ctx.included if b.add(block) else ctx.omitted).append(f"caller:{c.file}:{c.qualified}")
 
@@ -171,7 +193,7 @@ def build_context(pr: PullRequest, diff: Diff, index: CodeIndex, budget_bytes: i
         for d in index.definitions(name)[:1]:
             if d.qualified in changed_names:
                 continue
-            block = f"## Referenced {d.kind}: {d.qualified} ({d.file})\n" \
+            block = f"## Referenced {d.kind}: {d.qualified} ({header_safe(d.file)})\n" \
                     f"{numbered(index.sources[d.file], d.start_line, min(d.end_line, d.start_line + 60))}"
             (ctx.included if b.add(block) else ctx.omitted).append(f"ref:{d.file}:{d.qualified}")
 

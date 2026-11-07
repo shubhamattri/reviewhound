@@ -6,15 +6,18 @@ from collections.abc import Callable, Iterable
 
 RULES_FILENAMES = ("CLAUDE.md", "AGENTS.md")
 MAX_RULES_FILES = 8
+MAX_FOLDER_DEPTH = 10  # rules deeper than this in a changed file's path are not looked for
+MAX_RULES_FOLDERS = 200  # folders looked in per review, root included
 
 
 def rules_file_candidates(changed_paths: Iterable[str]) -> list[str]:
-    """Root first, then every folder holding a changed file, shallowest first."""
+    """Root first, then each folder holding a changed file, shallowest first, down to
+    MAX_FOLDER_DEPTH levels and MAX_RULES_FOLDERS folders in all."""
     folders = {""}
     for path in changed_paths:
-        parts = path.split("/")[:-1]
+        parts = path.split("/", MAX_FOLDER_DEPTH)[:-1]
         folders.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
-    ordered = sorted(folders, key=lambda f: (f.count("/") + bool(f), f))
+    ordered = sorted(folders, key=lambda f: (f.count("/") + bool(f), f))[:MAX_RULES_FOLDERS]
     return [f"{f}/{name}" if f else name for f in ordered for name in RULES_FILENAMES]
 
 

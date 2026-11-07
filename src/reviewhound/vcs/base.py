@@ -94,7 +94,8 @@ class DictSnapshot:
 
 class BaseView:
     """The base tree read through the head checkout: a file the diff touches comes from
-    `read_base`, any other file from `head`, so nothing the PR changed is read."""
+    `read_base`, any other file from `head`, so nothing the PR changed is read. When the diff
+    may be cut short, an unlisted file may be changed too, so every file comes from `read_base`."""
 
     def __init__(self, head: Snapshot, diff: Diff,
                  read_base: Callable[[str], str | None]) -> None:
@@ -104,9 +105,12 @@ class BaseView:
         self._gone = {p for p, fd in diff.files.items() if fd.status == "deleted"}
         self._gone |= {fd.old_path for fd in diff.files.values() if fd.old_path}
         self._touched = set(diff.files) | self._gone
+        self._trust_head = not diff.maybe_cut
 
     def read(self, path: str) -> str | None:
-        return self._read_base(path) if path in self._touched else self._head.read(path)
+        if self._trust_head and path not in self._touched:
+            return self._head.read(path)
+        return self._read_base(path)
 
     def paths(self) -> list[str]:
         return sorted((set(self._head.paths()) - self._new) | self._gone)

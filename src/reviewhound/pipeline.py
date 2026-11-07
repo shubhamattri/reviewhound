@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from reviewhound.checker import CheckOutcome, ClaimChecker
 from reviewhound.config import CONFIG_FILENAME, PolicyConfig, RepoConfig, Severity, load_config
-from reviewhound.context import build_context
+from reviewhound.context import build_context, header_safe
 from reviewhound.diff import Diff
 from reviewhound.findings import Finding, FindingsParseError, ModelReview, parse_model_review
 from reviewhound.github_feedback import after_post
@@ -259,13 +259,16 @@ class Reviewer:
             read_base = self._base_reader(repo, pr)
             base = BaseView(head, diff, read_base)
             # Rules text comes from the base commit itself: a base symlink may point at a PR edit.
-            rules = (read_rules_files(reviewable, lambda p: base.read(p) is not None, read_base)
+            base_paths = set(base.paths())
+            rules = (read_rules_files(reviewable,
+                                      lambda p: diff.maybe_cut or p in base_paths, read_base)
                      if pr.targets_default_branch else [])
             touched = Counter({p: churn[p] for p in reviewable if churn.get(p)})
-            churn_note = "\n".join(f"{p}: {n} recent commits" for p, n in touched.most_common(10))
+            churn_note = "\n".join(f"{header_safe(p)}: {n} recent commits"
+                                   for p, n in touched.most_common(10))
             ctx = build_context(pr, diff, index, rt.context_bytes, reviewable, conv.summary(),
                                 churn_note, house_rules=rules)
-            prompt = build_prompt(ctx.text, cfg)
+            prompt = build_prompt(ctx.text, cfg, ctx.rules_marker)
         with t.stage("model"):
             answer = self._ask_model(prompt, rt, result)
         with t.stage("verify"):

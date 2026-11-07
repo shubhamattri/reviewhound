@@ -221,3 +221,62 @@ def test_stacked_pr_leaves_the_token_check_off(tmp_path: Path) -> None:
         assert decision is not None
         posted.append([f"{f.file}:{f.line}" for f in decision.post])
     assert posted == [["src/PortalTable.css:3"], []]
+
+
+def test_hostile_values_cannot_stall_the_scanner() -> None:
+    import time
+    from collections.abc import Callable
+
+    from reviewhound.design_tokens import _LITERAL, _css_lines, _replacements
+
+    tokens = {("spacing", "4px"): ["--sp-1"]}
+    checks: list[Callable[[], object]] = [
+        lambda: list(_LITERAL.finditer("1" * 200_000)),
+        lambda: _replacements([("padding", "(" * 48_000 + "4px" + ")" * 48_000)], tokens),
+        lambda: _css_lines("a.vue", "<style" * 50_000 + "\n"),
+        lambda: _css_lines("a.vue", "<style>\n" + "a" * 300_000),
+    ]
+    for check in checks:
+        started = time.perf_counter()
+        check()
+        assert time.perf_counter() - started < 1.0
+    assert _replacements([("padding", "(" * 3 + "4px" + ")" * 3 + " 4px")], tokens) == [
+        ("--sp-1", "4px")]
+
+
+def test_added_lines_over_two_kilobytes_are_not_checked() -> None:
+    assert [f.line for f in scan("  padding: 4px;" + " " * 1_900 + "\n")] == [3]
+    assert scan("  padding: 4px;" + " " * 2_100 + "\n") == []
+
+
+def test_token_check_is_skipped_when_the_diff_may_be_cut_short() -> None:
+    base = {"CLAUDE.md": RULES, "a.css": CSS_BASE}
+    head = {**base, "a.css": CSS_BASE.replace("  color: red;\n", "  color: red;\n  gap: 4px;\n")}
+    diff = diff_file_maps(base, head)
+    assert DesignTokenScanner().scan(diff, DictSnapshot(head), ON, DictSnapshot(base))
+    diff.maybe_cut = True
+    assert DesignTokenScanner().scan(diff, DictSnapshot(head), ON, DictSnapshot(base)) == []
+
+
+def test_base_view_reads_every_file_from_the_base_when_the_diff_may_be_cut_short() -> None:
+    from reviewhound.diff import Diff
+    from reviewhound.vcs.base import BaseView
+
+    base = {"a.css": ".a{\n}\n", "same.css": ":root { --sp-1: 4px; }\n"}
+    head = {"a.css": ".a{\n  padding: 13px;\n}\n", "same.css": ":root { --sp-1: 13px; }\n",
+            "zzz/tokens.css": ":root{ --sp-evil: 13px; }\n", "CLAUDE.md": "--sp-evil2: 13px\n"}
+    cut = Diff(maybe_cut=True)
+    cut.files["a.css"] = diff_file_maps(base, head).files["a.css"]
+    view = BaseView(DictSnapshot(head), cut, base.get)
+    assert [view.read(p) for p in ("zzz/tokens.css", "CLAUDE.md", "same.css")] == [
+        None, None, base["same.css"]]
+
+
+def test_a_secret_on_the_quoted_line_is_redacted() -> None:
+    secret = "ghp_" + "A1b2C3d4" * 5
+    base = {"CLAUDE.md": RULES, "A.jsx": "x\n"}
+    head = {**base, "A.jsx": f"x\n<div style={{{{ padding: '8px' }}}} data-k=\"{secret}\" />\n"}
+    found = DesignTokenScanner().scan(diff_file_maps(base, head), DictSnapshot(head), ON,
+                                      DictSnapshot(base))
+    assert [f.line for f in found] == [2]
+    assert secret not in found[0].evidence_quote and "ghp_[redacted]" in found[0].evidence_quote

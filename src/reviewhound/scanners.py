@@ -60,6 +60,16 @@ def secret_identities(text: str) -> set[str]:
             for m in pat.finditer(line)}
 
 
+def redact_secrets(text: str) -> str:
+    """`text` with each real-looking secret cut to its first four characters."""
+    for _label, pat in _SECRET_PATTERNS:
+        for m in pat.finditer(text):
+            value = m.groupdict().get("value") or m.group(0)
+            if not _PLACEHOLDER.search(value):
+                text = text.replace(value, value[:4] + "[redacted]")
+    return text
+
+
 def builds_sql(text: str) -> bool:
     for pat in _INTERPOLATED:
         for m in pat.finditer(text):
@@ -104,13 +114,12 @@ class BuiltinScanner:
                 continue
             value = m.groupdict().get("value") or m.group(0)
             if not _PLACEHOLDER.search(value):
-                redacted = quote.replace(value, value[:4] + "[redacted]")
                 found.append(Finding(
                     file=path, line=n, severity=Severity.BLOCKER, category="secret",
                     title=f"Possible {label} committed",
                     body="This looks like a real credential in source. Move it to the "
                          "environment or a secret store and rotate it.",
-                    evidence_quote=redacted, source="scanner:builtin", verified=True,
+                    evidence_quote=redact_secrets(quote), source="scanner:builtin", verified=True,
                     identity=secret_identity(value)))
                 break
         if builds_sql(text):

@@ -20,6 +20,7 @@ from reviewhound.diff import Diff
 from reviewhound.findings import Finding
 from reviewhound.house_rules import read_rules_files
 from reviewhound.paths import matches_any
+from reviewhound.scanners import redact_secrets
 from reviewhound.vcs.base import Snapshot
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ STYLE_BLOCK_EXT = (".html", ".vue", ".svelte")  # files that can hold a <style> 
 INLINE_EXT = (".jsx", ".tsx", ".js", ".ts", *STYLE_BLOCK_EXT)  # one-line style= attributes
 MAX_STYLE_FILES = 3_000
 MAX_FINDINGS = 5  # so a new stylesheet cannot crowd out the model's findings
+MAX_LINE_CHARS = 2_000  # longer added lines are minified or hostile, and are not checked
 SPACING, RADIUS = "spacing", "radius"
 _STYLE_ATTR, _DELETED = "style=", "deleted"
 
@@ -35,7 +37,7 @@ _FAMILY_TOKEN = {SPACING: re.compile(r"^--(?:sp|space|spacing)-[A-Za-z0-9_-]+$")
                  RADIUS: re.compile(r"^--(?:r|radius)-[A-Za-z0-9_-]+$")}
 _TOKENISH = re.compile(r"^--(?:sp|space|spacing|r|radius)(?:-|$)")
 _NAME = r"--(?:sp|space|spacing|r|radius)-[A-Za-z0-9_-]+"
-_LEN = r"(\d*\.?\d+)(px|rem|em)"
+_LEN = r"(\d+(?:\.\d+)?|\.\d+)(px|rem|em)"  # no optional-digit prefix: linear on digit runs
 # CSS: one plain length per token. Rules file: several per line.
 # ASCII: in Unicode mode IGNORECASE lets "ſ" match "s", a name no token family then accepts.
 _CSS_DEF = re.compile(rf"({_NAME})\s*:\s*{_LEN}\s*(?:!important\s*)?(?:;|\}}|$)",
@@ -44,9 +46,9 @@ _RULES_DEF = re.compile(rf"({_NAME})`?\s*:\s*`?{_LEN}(?![\w.%(])", re.IGNORECASE
 _DECL = re.compile(r"(?:^|(?<=[\s;{]))(--[A-Za-z][\w-]*|[a-z][a-z-]*)\s*:\s*([^;{}]+)")
 _INLINE = re.compile(r"""\b([a-zA-Z]+)\s*:\s*['"]([^'"]+)['"]""")
 _LITERAL = re.compile(rf"(?<![\w.#$@-]){_LEN}(?![\w%(])", re.IGNORECASE | re.ASCII)
-_PARENS = re.compile(r"\([^()]*\)")
 _BLOCK_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.DOTALL)
-_STYLE_BLOCK = re.compile(r"<style\b[^>]*>(.*?)(?:</style\s*>|\Z)", re.DOTALL | re.IGNORECASE)
+_STYLE_OPEN = re.compile(r"<style(?:\s[^<>\n]{0,200})?>", re.IGNORECASE)
+_STYLE_CLOSE = re.compile(r"</style\s*>", re.IGNORECASE)
 _SPACING_NAME = re.compile(r"padding|margin|gap|(?<!letter-)(?<!word-)spacing")
 _SPACING_PROPS = {"padding", "margin", "gap", "row-gap", "column-gap", "grid-gap", "grid-row-gap",
                   "grid-column-gap", "inset", "top", "left", "right", "bottom"}
@@ -99,11 +101,16 @@ def _css_lines(path: str, src: str) -> dict[int, str]:
     if path.endswith(STYLE_EXT):
         return dict(enumerate(_blank_comments(src).split("\n"), 1))
     out: dict[int, str] = {}
-    if path.endswith(STYLE_BLOCK_EXT):
-        for m in _STYLE_BLOCK.finditer(src):
-            first = src.count("\n", 0, m.start(1)) + 1
-            for offset, css in enumerate(_blank_comments(m.group(1)).split("\n")):
-                out[first + offset] = css
+    if not path.endswith(STYLE_BLOCK_EXT):
+        return out
+    pos = 0
+    while (opening := _STYLE_OPEN.search(src, pos)) is not None:
+        closing = _STYLE_CLOSE.search(src, opening.end())
+        end = closing.start() if closing else len(src)
+        first = src.count("\n", 0, opening.end()) + 1
+        for offset, css in enumerate(_blank_comments(src[opening.end():end]).split("\n")):
+            out[first + offset] = css
+        pos = closing.end() if closing else len(src)
     return out
 
 
@@ -124,15 +131,29 @@ def _inline_declarations(text: str) -> list[tuple[str, str]]:
     return out
 
 
+def _outside_parens(value: str) -> str:
+    """`value` with each parenthesised part, nested or unclosed, replaced by one space."""
+    kept: list[str] = []
+    depth = 0
+    for char in value:
+        if char == "(":
+            if depth == 0:
+                kept.append(" ")
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+        elif depth == 0:
+            kept.append(char)
+    return "".join(kept)
+
+
 def _replacements(decls: list[tuple[str, str]], tokens: Tokens) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     for prop, value in decls:
         family = family_of(prop)
         if family is None:
             continue
-        bare = value
-        while _PARENS.search(bare):  # calc(), var() fallbacks and the like stay as written
-            bare = _PARENS.sub(" ", bare)
+        bare = _outside_parens(value)  # calc(), var() fallbacks and the like stay as written
         for m in _LITERAL.finditer(bare):
             literal = _norm(m.group(1), m.group(2))
             if literal in ("0px", "0rem", "0em", "1px"):
@@ -153,6 +174,9 @@ class DesignTokenScanner:
         if base is None:
             log.warning("design-token check skipped: no base tree to read tokens from")
             return []
+        if diff.maybe_cut:
+            log.info("design-token check skipped: the host may have listed only part of the diff")
+            return []
         targets = [p for p, fd in diff.files.items()
                    if fd.status != _DELETED and p.endswith(STYLE_EXT + INLINE_EXT)
                    and not matches_any(p, cfg.ignore_paths)]
@@ -169,7 +193,7 @@ class DesignTokenScanner:
             lines = src.splitlines()
             css = _css_lines(path, src)
             for n in sorted(diff.files[path].added_lines):
-                if not 0 < n <= len(lines):
+                if not 0 < n <= len(lines) or len(lines[n - 1]) > MAX_LINE_CHARS:
                     continue
                 decls = (_css_declarations(css[n]) if n in css
                          else _inline_declarations(lines[n - 1]) if path.endswith(INLINE_EXT)
@@ -184,9 +208,10 @@ class DesignTokenScanner:
         return out
 
     def _tokens(self, base: Snapshot, targets: list[str], cfg: RepoConfig) -> Tokens:
-        rules = read_rules_files(targets, lambda p: base.read(p) is not None, base.read)
+        paths = base.paths()
+        rules = read_rules_files(targets, set(paths).__contains__, base.read)
         styles: list[tuple[str, str]] = []
-        for path in base.paths():
+        for path in paths:
             if len(styles) >= MAX_STYLE_FILES:
                 break
             if path.endswith(STYLE_EXT) and not matches_any(path, cfg.ignore_paths):
@@ -203,4 +228,4 @@ class DesignTokenScanner:
             title=f"Use {pairs}",
             body=f"The repo defines a design token with this exact value. Use {pairs}, so the "
                  "value follows the design system when the token changes.",
-            evidence_quote=line.strip(), source="scanner:design-tokens", verified=True)
+            evidence_quote=redact_secrets(line.strip()), source="scanner:design-tokens", verified=True)
