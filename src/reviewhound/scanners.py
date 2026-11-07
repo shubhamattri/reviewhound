@@ -24,7 +24,10 @@ log = logging.getLogger(__name__)
 class Scanner(Protocol):
     name: str
 
-    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig) -> list[Finding]: ...
+    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig,
+             base: Snapshot | None = None) -> list[Finding]:
+        """`base` is the base tree for checks that must not trust the PR's own files."""
+        ...
 
 
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -74,7 +77,8 @@ _PLACEHOLDER = re.compile(
 class BuiltinScanner:
     name = "builtin"
 
-    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig) -> list[Finding]:
+    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig,
+             base: Snapshot | None = None) -> list[Finding]:
         out: list[Finding] = []
         pii = [t.lower() for t in cfg.personal_data_terms]
         for path, fd in diff.files.items():
@@ -139,7 +143,8 @@ class SemgrepScanner:
         self.timeout_s = timeout_s
         self.binary = shutil.which("semgrep")
 
-    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig) -> list[Finding]:
+    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig,
+             base: Snapshot | None = None) -> list[Finding]:
         if self.binary is None:
             log.info("semgrep not installed; skipping")
             return []

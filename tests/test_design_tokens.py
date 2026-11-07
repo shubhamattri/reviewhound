@@ -26,7 +26,8 @@ def scan(added: str, extra: dict[str, str] | None = None, path: str = "src/Porta
          cfg: RepoConfig = ON) -> list[Finding]:
     base = {"CLAUDE.md": RULES, path: CSS_BASE, **(extra or {})}
     head = {**base, path: CSS_BASE.replace("  color: red;\n", "  color: red;\n" + added)}
-    return DesignTokenScanner().scan(diff_file_maps(base, head), DictSnapshot(head), cfg)
+    return DesignTokenScanner().scan(diff_file_maps(base, head), DictSnapshot(head), cfg,
+                                     DictSnapshot(base))
 
 
 def test_check_is_off_unless_the_repo_config_turns_it_on() -> None:
@@ -76,14 +77,14 @@ def test_no_token_definitions_anywhere_means_no_findings() -> None:
     base = {"a.css": CSS_BASE}
     head = {"a.css": CSS_BASE.replace("  color: red;\n", "  color: red;\n  padding: 4px;\n")}
     assert DesignTokenScanner().scan(diff_file_maps(base, head), DictSnapshot(head),
-                                     ON) == []
+                                     ON, DictSnapshot(base)) == []
 
 
 def test_only_added_lines_are_checked() -> None:
     base = {"CLAUDE.md": RULES, "a.css": ".a {\n  padding: 4px;\n}\n"}
     head = {**base, "a.css": ".a {\n  padding: 4px;\n  color: red;\n}\n"}
     assert DesignTokenScanner().scan(diff_file_maps(base, head), DictSnapshot(head),
-                                     ON) == []
+                                     ON, DictSnapshot(base)) == []
 
 
 def test_inline_style_on_a_jsx_line_is_checked() -> None:
@@ -91,7 +92,7 @@ def test_inline_style_on_a_jsx_line_is_checked() -> None:
     head = {**base, "A.jsx": "export const A = () => (\n"
             "  <div style={{ paddingTop: '8px', width: '280px', borderRadius: 4 }} />\n);\n"}
     found = DesignTokenScanner().scan(diff_file_maps(base, head), DictSnapshot(head),
-                                      ON)
+                                      ON, DictSnapshot(base))
     assert [(f.file, f.line, f.title) for f in found] == [
         ("A.jsx", 2, "Use var(--sp-2) instead of 8px")]
 
@@ -154,3 +155,69 @@ def test_cli_reviewer_runs_the_design_token_scanner(tmp_path: Path, monkeypatch:
                               repo="o/r")
     reviewer = cli._reviewer(args, with_store=False)
     assert [type(s).__name__ for s in reviewer.scanners].count("DesignTokenScanner") == 1
+
+
+def _scan_maps(base: dict[str, str], head: dict[str, str]) -> list[tuple[str, int, str]]:
+    found = DesignTokenScanner().scan(diff_file_maps(base, head), DictSnapshot(head), ON,
+                                      DictSnapshot(base))
+    return [(f.file, f.line, f.title) for f in found]
+
+
+def test_tokens_come_from_the_base_so_the_pr_cannot_add_or_remove_them() -> None:
+    css = ".a {\n  color: red;\n}\n"
+    added = ".a {\n  color: red;\n  padding: 8px;\n}\n"
+    assert _scan_maps({"a.css": css}, {"a.css": added, "CLAUDE.md": "--sp-x: 8px\n"}) == []
+    assert _scan_maps({"a.css": css}, {"a.css": added, "t.css": ":root { --sp-x: 8px; }\n"}) == []
+    base = {"a.css": css, "CLAUDE.md": RULES, "t.css": ":root { --sp-y: 8px; }\n"}
+    want = [("a.css", 3, "Use var(--sp-2) instead of 8px")]
+    assert _scan_maps(base, {**base, "a.css": added, "CLAUDE.md": "nothing\n"}) == want
+    assert _scan_maps(base, {"a.css": added, "t.css": base["t.css"]}) == want
+    no_rules = {"a.css": css, "t.css": ":root { --sp-y: 8px; }\n"}
+    for head_tokens in ({"t.css": ":root { --sp-y: 9px; }\n"}, {}):
+        assert _scan_maps(no_rules, {"a.css": added, **head_tokens}) == [
+            ("a.css", 3, "Use var(--sp-y) instead of 8px")]
+
+
+def test_without_a_base_view_the_scanner_finds_nothing() -> None:
+    head = {"CLAUDE.md": RULES, "a.css": ".a {\n  padding: 8px;\n}\n"}
+    assert DesignTokenScanner().scan(diff_file_maps({}, head), DictSnapshot(head), ON) == []
+
+
+def test_non_ascii_token_names_are_ignored_not_a_crash() -> None:
+    styles = [("t.css", ":root {\n  --sp-ſ: 4px;\n  --ſp-1: 4px;\n  --sp-ok: 8px;\n}\n")]
+    assert load_tokens([("CLAUDE.md", "--sp-ſ: 6px\n")], styles) == {
+        ("spacing", "8px"): ["--sp-ok"]}
+
+
+def test_lines_inside_a_multi_line_comment_are_not_flagged() -> None:
+    found = scan("  /*\n  padding: 8px;\n  * { margin: 4px; }\n  */\n  * { margin: 4px; }\n")
+    assert [(f.line, f.title) for f in found] == [(7, "Use var(--sp-1) instead of 4px")]
+
+
+def test_style_blocks_in_vue_svelte_and_html_files_are_checked() -> None:
+    for path in ("A.vue", "A.svelte", "a.html"):
+        base = {"CLAUDE.md": RULES, path: "<template/>\n"}
+        head = {**base, path: "<template/>\n<style scoped>\n.a {\n  padding: 8px;\n}\n"
+                "/* gap: 4px; */\n</style>\n<style>.b { gap: 4px; }</style>\n<p>gap: 4px;</p>\n"}
+        assert _scan_maps(base, head) == [(path, 4, "Use var(--sp-2) instead of 8px"),
+                                          (path, 8, "Use var(--sp-1) instead of 4px")]
+
+
+def test_letter_and_word_spacing_custom_properties_are_not_spacing_tokens() -> None:
+    lines = "  --heading-letter-spacing: 4px;\n  --body-word-spacing: 4px;\n  --ds-spacing-x: 4px;\n"
+    assert [f.line for f in scan(lines)] == [5]
+
+
+def test_stacked_pr_leaves_the_token_check_off(tmp_path: Path) -> None:
+    css = "src/PortalTable.css"
+    base = {"CLAUDE.md": RULES, css: CSS_BASE, ".reviewhound.yml": "design_tokens: true\n"}
+    head = {**base, css: CSS_BASE.replace("  color: red;\n", "  color: red;\n  gap: 4px;\n")}
+    posted = []
+    for n, pr in enumerate((make_pr(head="h1"), make_pr(head="h1", base_ref="feat/parent"))):
+        vcs = MemoryVCS(pr, base, head)
+        reviewer = Reviewer(vcs, ProviderRegistry([FakeProvider([answer()])]),
+                            [DesignTokenScanner()], Store(tmp_path / f"{n}.db"))
+        decision = reviewer.review("acme/shop", 7, dry_run=True).decision
+        assert decision is not None
+        posted.append([f"{f.file}:{f.line}" for f in decision.post])
+    assert posted == [["src/PortalTable.css:3"], []]

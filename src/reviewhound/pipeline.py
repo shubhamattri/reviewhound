@@ -30,6 +30,7 @@ from reviewhound.scanners import Scanner
 from reviewhound.store import Blocker, ReviewRecord, ReviewStore
 from reviewhound.vcs.base import (
     VCS,
+    BaseView,
     PinnedPulls,
     PostedComment,
     PostedReview,
@@ -234,6 +235,10 @@ class Reviewer:
             else:
                 diff = self.vcs.get_diff(pr)
             cfg = load_config(self.vcs.read_file(repo, pr.base_sha, CONFIG_FILENAME))
+            if not pr.targets_default_branch:
+                log.info("base is not the default branch, so its rules files and the token check "
+                         "are not trusted", extra={"pr": number, "base_ref": pr.base_ref})
+                cfg = cfg.model_copy(update={"design_tokens": False})
         result.route = rt = route(diff, cfg)
         if rt.tier == "skip":
             result.outcome = "skipped"
@@ -251,7 +256,11 @@ class Reviewer:
                 log.info("files not reviewed", extra={"pr": number, "files": unseen})
         reviewable = [p for p in diff.changed_paths if not matches_any(p, cfg.ignore_paths)]
         with t.stage("context"):
-            rules = self._house_rules(repo, pr, head, reviewable)
+            read_base = self._base_reader(repo, pr)
+            base = BaseView(head, diff, read_base)
+            # Rules text comes from the base commit itself: a base symlink may point at a PR edit.
+            rules = (read_rules_files(reviewable, lambda p: base.read(p) is not None, read_base)
+                     if pr.targets_default_branch else [])
             touched = Counter({p: churn[p] for p in reviewable if churn.get(p)})
             churn_note = "\n".join(f"{p}: {n} recent commits" for p, n in touched.most_common(10))
             ctx = build_context(pr, diff, index, rt.context_bytes, reviewable, conv.summary(),
@@ -276,7 +285,7 @@ class Reviewer:
         with t.stage("scan"):
             scanned: list[Finding] = []
             for s in self.scanners:
-                scanned.extend(s.scan(diff, head, cfg))
+                scanned.extend(s.scan(diff, head, cfg, base))
             result.reviewers.extend(f"scanner:{s.name}" for s in self.scanners)
         known = self.store.known_state(repo, number) if self.store and not dry_run else {}
         decision = apply_policy(outcome.kept + scanned, cfg.policy, known)
@@ -315,18 +324,16 @@ class Reviewer:
             after_post(self.vcs, self.store, done, cfg.policy)
         return done
 
-    def _house_rules(self, repo: str, pr: PullRequest, head: Snapshot,
-                     reviewable: list[str]) -> list[tuple[str, str]]:
-        """Rules files as on the base branch, so a PR cannot rewrite the rules it is checked
-        against. Found via the head checkout; missing or unreadable files are skipped."""
+    def _base_reader(self, repo: str, pr: PullRequest) -> Callable[[str], str | None]:
+        """Reads a file at the base commit; a GitHub error reads as a missing file."""
         def read(path: str) -> str | None:
             try:
                 return self.vcs.read_file(repo, pr.base_sha, path)
             except GitHubError as exc:
-                log.warning("could not read rules file; reviewing without it",
+                log.warning("could not read a base file; reviewing without it",
                             extra={"pr": pr.number, "file": path, "error": type(exc).__name__})
                 return None
-        return read_rules_files(reviewable, lambda p: head.read(p) is not None, read)
+        return read
 
     def _record_landed(self, repo: str, number: int, head: str) -> tuple[str, str]:
         """Before any model call: record a post an earlier attempt landed but never recorded,

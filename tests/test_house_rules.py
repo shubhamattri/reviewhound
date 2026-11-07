@@ -93,3 +93,68 @@ def test_prompt_makes_a_broken_written_rule_a_defect_and_asks_about_derived_valu
     text = build_prompt("CTX", RepoConfig())
     assert "an added line that breaks a written house rule is a defect" in text
     assert "list everything computed from it" in text
+
+
+def test_rules_file_deleted_or_renamed_by_the_pr_still_applies(tmp_path: Path) -> None:
+    assert RULE in _review({"CLAUDE.md": RULE}, {}, tmp_path)
+    vcs = MemoryVCS(make_pr(head="h1"), {**BASE, "CLAUDE.md": RULE},
+                    {**HEAD, "OLD-RULES.md": RULE})
+    provider = FakeProvider([answer()])
+    Reviewer(vcs, ProviderRegistry([provider]), [BuiltinScanner()],
+             Store(tmp_path / "r.db")).review("acme/shop", 7, dry_run=True)
+    assert "## Repository rules: CLAUDE.md" in provider.prompts[0]
+
+
+def test_rules_never_push_out_a_diff_that_fits_the_budget_on_its_own() -> None:
+    base = {"a.css": ".a{}\n"}
+    head = {"a.css": ".a{}\n" + "".join(f".c{n} {{ color: red; }}\n" for n in range(650))}
+    diff = diff_file_maps(base, head)
+    rules = [("CLAUDE.md", "\n".join(f"rule {n} " + "x" * 70 for n in range(300)))]
+    alone = build_context(make_pr(), diff, CodeIndex([]), 20_000, ["a.css"])
+    assert "diff:a.css" in alone.included
+    ctx = build_context(make_pr(), diff, CodeIndex([]), 20_000, ["a.css"], house_rules=rules)
+    assert "diff:a.css" in ctx.included
+    assert ctx.size <= 20_000
+
+
+def test_rules_file_with_no_line_breaks_is_cut_not_dropped() -> None:
+    text, included, size = _context([("CLAUDE.md", RULE + " " + "y" * 30_000)])
+    assert "rules:CLAUDE.md" in included
+    assert RULE in text and "[rules file cut here" in text
+    assert size <= 60_000
+
+
+def test_stacked_pr_whose_base_is_not_the_default_branch_gets_no_rules(tmp_path: Path) -> None:
+    files = {"CLAUDE.md": RULE}
+    prs = (make_pr(head="h1", base_ref="feat/parent"),
+           make_pr(head="h1", base_ref="", default_branch=""))
+    for n, pr in enumerate(prs):
+        vcs = MemoryVCS(pr, {**BASE, **files}, {**HEAD, **files})
+        provider = FakeProvider([answer()])
+        Reviewer(vcs, ProviderRegistry([provider]), [BuiltinScanner()],
+                 Store(tmp_path / f"{n}.db")).review("acme/shop", 7, dry_run=True)
+        assert RULE not in provider.prompts[0]
+
+
+def test_github_pull_carries_base_ref_and_default_branch_and_paths_are_url_encoded(
+        tmp_path: Path) -> None:
+    import httpx
+
+    from reviewhound.vcs.github import GitHubVCS
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path.decode())
+        if "/pulls/" in request.url.path:
+            return httpx.Response(200, json={
+                "title": "t", "body": "", "head": {"sha": "h"}, "state": "open",
+                "base": {"sha": "b", "ref": "develop", "repo": {"default_branch": "main"}}})
+        return httpx.Response(404, json={})
+    client = httpx.Client(base_url="https://api.github.com",
+                          transport=httpx.MockTransport(handler))
+    vcs = GitHubVCS("t0ken", tmp_path, client=client)
+    pr = vcs.get_pull("o/r", 3)
+    assert (pr.base_ref, pr.default_branch) == ("develop", "main")
+    assert vcs.read_file("o/r", "b", "a#b/c?d e/CLAUDE.md") is None
+    assert seen[-1] == "/repos/o/r/contents/a%23b/c%3Fd%20e/CLAUDE.md?ref=b"

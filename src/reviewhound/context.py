@@ -82,7 +82,23 @@ def _cut_to(text: str, limit: int) -> str:
         return text
     room = limit - len(_CUT.encode("utf-8"))
     kept = text.encode("utf-8")[:max(room, 0)].decode("utf-8", errors="ignore")
-    return kept[:kept.rfind("\n") + 1].rstrip("\n") + _CUT if "\n" in kept else ""
+    if "\n" in kept:  # a file with no line break in reach is cut mid-line instead
+        kept = kept[:kept.rfind("\n")].rstrip("\n")
+    return kept + _CUT if kept else ""
+
+
+def _diff_block(fd: FileDiff) -> str:
+    return f"## Diff: {fd.path} ({fd.status})\n{render_hunks(fd)}"
+
+
+def _bytes_taken(blocks: list[str], room: int) -> int:
+    """Bytes `_Budget.add` would spend on `blocks`, in order, with `room` bytes left."""
+    used = 0
+    for block in blocks:
+        size = len(block.encode("utf-8")) + 2
+        if used + size <= room:
+            used += size
+    return used
 
 
 def changed_definitions(diff: Diff, index: CodeIndex) -> list[Definition]:
@@ -106,20 +122,20 @@ def build_context(pr: PullRequest, diff: Diff, index: CodeIndex, budget_bytes: i
     if conventions:
         b.add(f"## Repository conventions (learned)\n{conventions}")
 
-    rules_left = min(_MAX_RULES_BYTES, budget_bytes // _RULES_SHARE)
+    diff_blocks = [(path, _diff_block(diff.files[path])) for path in reviewable]
+    reserved = _bytes_taken([block for _, block in diff_blocks], b.free + 2)
+    rules_left = min(_MAX_RULES_BYTES, budget_bytes // _RULES_SHARE, b.free - reserved)
     for path, text in house_rules:
         title = f"## Repository rules: {path} (the team's own rules for this repo)\n"
         size = min(rules_left, b.free) - len(title.encode("utf-8"))
-        body = _cut_to(text.strip(), size) if size >= _MIN_RULES_BYTES else ""
-        if body and b.add(title + body):
-            rules_left -= len((title + body).encode("utf-8"))
+        rules_body = _cut_to(text.strip(), size) if size >= _MIN_RULES_BYTES else ""
+        if rules_body and b.add(title + rules_body):
+            rules_left -= len((title + rules_body).encode("utf-8")) + 2
             ctx.included.append(f"rules:{path}")
         else:
             ctx.omitted.append(f"rules:{path}")
 
-    for path in reviewable:
-        fd = diff.files[path]
-        block = f"## Diff: {path} ({fd.status})\n{render_hunks(fd)}"
+    for path, block in diff_blocks:
         if b.add(block):
             ctx.included.append(f"diff:{path}")
         else:

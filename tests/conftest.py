@@ -79,7 +79,8 @@ class Backend:
 def make_pr(head: str = "h1", base: str = "b1", **kw: Any) -> PullRequest:
     return PullRequest(repo=kw.pop("repo", "acme/shop"), number=kw.pop("number", 7),
                        title=kw.pop("title", "Add delete endpoint"), body=kw.pop("body", ""),
-                       base_sha=base, head_sha=head, **kw)
+                       base_sha=base, head_sha=head, base_ref=kw.pop("base_ref", "main"),
+                       default_branch=kw.pop("default_branch", "main"), **kw)
 
 
 def answer(*findings: dict[str, Any]) -> str:

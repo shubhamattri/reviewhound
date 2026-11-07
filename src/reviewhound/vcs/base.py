@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -21,6 +22,13 @@ class PullRequest:
     author: str = ""
     draft: bool = False
     state: str = "open"
+    base_ref: str = ""  # branch the PR merges into
+    default_branch: str = ""  # the repo's default branch; unknown when empty
+
+    @property
+    def targets_default_branch(self) -> bool:
+        """False for a stacked PR, whose base branch its own author may control."""
+        return bool(self.base_ref) and self.base_ref == self.default_branch
 
 
 @dataclass
@@ -79,6 +87,29 @@ class DictSnapshot:
 
     def paths(self) -> list[str]:
         return sorted(self._files)
+
+    def skip_reason(self, path: str) -> str | None:
+        return None
+
+
+class BaseView:
+    """The base tree read through the head checkout: a file the diff touches comes from
+    `read_base`, any other file from `head`, so nothing the PR changed is read."""
+
+    def __init__(self, head: Snapshot, diff: Diff,
+                 read_base: Callable[[str], str | None]) -> None:
+        self._head = head
+        self._read_base = read_base
+        self._new = {p for p, fd in diff.files.items() if fd.status in ("added", "renamed")}
+        self._gone = {p for p, fd in diff.files.items() if fd.status == "deleted"}
+        self._gone |= {fd.old_path for fd in diff.files.values() if fd.old_path}
+        self._touched = set(diff.files) | self._gone
+
+    def read(self, path: str) -> str | None:
+        return self._read_base(path) if path in self._touched else self._head.read(path)
+
+    def paths(self) -> list[str]:
+        return sorted((set(self._head.paths()) - self._new) | self._gone)
 
     def skip_reason(self, path: str) -> str | None:
         return None

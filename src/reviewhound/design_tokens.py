@@ -2,10 +2,16 @@
 
 Tokens come from CSS custom properties in the repo (`--sp-1: 4px;`) and from token tables in
 the repo's rules files (`--sp-1: 4px   --sp-2: 8px`), since canonical tokens often live in a
-package outside the repo. Only an exact value match in the same family is flagged."""
+package outside the repo. Both are read as on the base, so a PR cannot add or remove tokens.
+Only an exact value match in the same family is flagged.
+
+Checked: stylesheets, `<style>` blocks in .vue, .svelte and .html files, and a `style=`
+attribute written on one line. A style object spread over several lines, and CSS-in-JS
+template literals, are not checked."""
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 
@@ -16,8 +22,10 @@ from reviewhound.house_rules import read_rules_files
 from reviewhound.paths import matches_any
 from reviewhound.vcs.base import Snapshot
 
+log = logging.getLogger(__name__)
 STYLE_EXT = (".css", ".scss", ".sass", ".less")
-INLINE_EXT = (".jsx", ".tsx", ".js", ".ts", ".html", ".vue", ".svelte")
+STYLE_BLOCK_EXT = (".html", ".vue", ".svelte")  # files that can hold a <style> block
+INLINE_EXT = (".jsx", ".tsx", ".js", ".ts", *STYLE_BLOCK_EXT)  # one-line style= attributes
 MAX_STYLE_FILES = 3_000
 MAX_FINDINGS = 5  # so a new stylesheet cannot crowd out the model's findings
 SPACING, RADIUS = "spacing", "radius"
@@ -29,13 +37,17 @@ _TOKENISH = re.compile(r"^--(?:sp|space|spacing|r|radius)(?:-|$)")
 _NAME = r"--(?:sp|space|spacing|r|radius)-[A-Za-z0-9_-]+"
 _LEN = r"(\d*\.?\d+)(px|rem|em)"
 # CSS: one plain length per token. Rules file: several per line.
-_CSS_DEF = re.compile(rf"({_NAME})\s*:\s*{_LEN}\s*(?:!important\s*)?(?:;|\}}|$)", re.IGNORECASE)
-_RULES_DEF = re.compile(rf"({_NAME})`?\s*:\s*`?{_LEN}(?![\w.%(])", re.IGNORECASE)
+# ASCII: in Unicode mode IGNORECASE lets "ſ" match "s", a name no token family then accepts.
+_CSS_DEF = re.compile(rf"({_NAME})\s*:\s*{_LEN}\s*(?:!important\s*)?(?:;|\}}|$)",
+                      re.IGNORECASE | re.ASCII)
+_RULES_DEF = re.compile(rf"({_NAME})`?\s*:\s*`?{_LEN}(?![\w.%(])", re.IGNORECASE | re.ASCII)
 _DECL = re.compile(r"(?:^|(?<=[\s;{]))(--[A-Za-z][\w-]*|[a-z][a-z-]*)\s*:\s*([^;{}]+)")
 _INLINE = re.compile(r"""\b([a-zA-Z]+)\s*:\s*['"]([^'"]+)['"]""")
-_LITERAL = re.compile(rf"(?<![\w.#$@-]){_LEN}(?![\w%(])", re.IGNORECASE)
+_LITERAL = re.compile(rf"(?<![\w.#$@-]){_LEN}(?![\w%(])", re.IGNORECASE | re.ASCII)
 _PARENS = re.compile(r"\([^()]*\)")
-_COMMENT = re.compile(r"/\*.*?\*/")
+_BLOCK_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.DOTALL)
+_STYLE_BLOCK = re.compile(r"<style\b[^>]*>(.*?)(?:</style\s*>|\Z)", re.DOTALL | re.IGNORECASE)
+_SPACING_NAME = re.compile(r"padding|margin|gap|(?<!letter-)(?<!word-)spacing")
 _SPACING_PROPS = {"padding", "margin", "gap", "row-gap", "column-gap", "grid-gap", "grid-row-gap",
                   "grid-column-gap", "inset", "top", "left", "right", "bottom"}
 
@@ -51,7 +63,7 @@ def family_of(prop: str) -> str | None:
     if p.startswith("--"):
         if _TOKENISH.match(p):  # defines a token or alias, not a use of one
             return None
-        if re.search(r"padding|margin|gap|spacing", p):
+        if _SPACING_NAME.search(p):
             return SPACING
         return RADIUS if RADIUS in p else None
     if p.startswith("border") and p.endswith(RADIUS):
@@ -76,12 +88,33 @@ def load_tokens(rules: list[tuple[str, str]], styles: list[tuple[str, str]]) -> 
     return dict(found)
 
 
-def _declarations(path: str, text: str) -> list[tuple[str, str]]:
+def _blank_comments(css: str) -> str:
+    """`css` with each /* */ comment blanked, keeping every line where it was."""
+    return _BLOCK_COMMENT.sub(lambda m: " " + "\n" * m.group(0).count("\n"), css)
+
+
+def _css_lines(path: str, src: str) -> dict[int, str]:
+    """Line number -> its CSS, comments blanked: every line of a stylesheet, and the lines
+    of each <style> block in a file that can hold one."""
     if path.endswith(STYLE_EXT):
-        line = _COMMENT.sub("", text).strip()
-        if line.startswith(("//", "/*", "*")):
-            return []
-        return [(m.group(1), m.group(2)) for m in _DECL.finditer(line)]
+        return dict(enumerate(_blank_comments(src).split("\n"), 1))
+    out: dict[int, str] = {}
+    if path.endswith(STYLE_BLOCK_EXT):
+        for m in _STYLE_BLOCK.finditer(src):
+            first = src.count("\n", 0, m.start(1)) + 1
+            for offset, css in enumerate(_blank_comments(m.group(1)).split("\n")):
+                out[first + offset] = css
+    return out
+
+
+def _css_declarations(css: str) -> list[tuple[str, str]]:
+    line = css.strip()
+    if line.startswith("//"):
+        return []
+    return [(m.group(1), m.group(2)) for m in _DECL.finditer(line)]
+
+
+def _inline_declarations(text: str) -> list[tuple[str, str]]:
     if _STYLE_ATTR not in text:
         return []
     out = [(re.sub(r"[A-Z]", lambda c: "-" + c.group(0).lower(), m.group(1)), m.group(2))
@@ -113,15 +146,19 @@ def _replacements(decls: list[tuple[str, str]], tokens: Tokens) -> list[tuple[st
 class DesignTokenScanner:
     name = "design-tokens"
 
-    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig) -> list[Finding]:
+    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig,
+             base: Snapshot | None = None) -> list[Finding]:
         if not cfg.design_tokens:
+            return []
+        if base is None:
+            log.warning("design-token check skipped: no base tree to read tokens from")
             return []
         targets = [p for p, fd in diff.files.items()
                    if fd.status != _DELETED and p.endswith(STYLE_EXT + INLINE_EXT)
                    and not matches_any(p, cfg.ignore_paths)]
         if not targets:
             return []
-        tokens = self._tokens(head, targets, cfg)
+        tokens = self._tokens(base, targets, cfg)
         if not tokens:
             return []
         out: list[Finding] = []
@@ -130,10 +167,14 @@ class DesignTokenScanner:
             if src is None:
                 continue
             lines = src.splitlines()
+            css = _css_lines(path, src)
             for n in sorted(diff.files[path].added_lines):
                 if not 0 < n <= len(lines):
                     continue
-                swaps = _replacements(_declarations(path, lines[n - 1]), tokens)
+                decls = (_css_declarations(css[n]) if n in css
+                         else _inline_declarations(lines[n - 1]) if path.endswith(INLINE_EXT)
+                         else [])
+                swaps = _replacements(decls, tokens)
                 if swaps:
                     out.append(self._finding(path, n, lines[n - 1], swaps))
         if len(out) > MAX_FINDINGS:
@@ -142,14 +183,14 @@ class DesignTokenScanner:
             out[-1].body += f" {rest} more added lines in this PR have the same issue."
         return out
 
-    def _tokens(self, head: Snapshot, targets: list[str], cfg: RepoConfig) -> Tokens:
-        rules = read_rules_files(targets, lambda p: head.read(p) is not None, head.read)
+    def _tokens(self, base: Snapshot, targets: list[str], cfg: RepoConfig) -> Tokens:
+        rules = read_rules_files(targets, lambda p: base.read(p) is not None, base.read)
         styles: list[tuple[str, str]] = []
-        for path in head.paths():
+        for path in base.paths():
             if len(styles) >= MAX_STYLE_FILES:
                 break
             if path.endswith(STYLE_EXT) and not matches_any(path, cfg.ignore_paths):
-                text = head.read(path)
+                text = base.read(path)
                 if text is not None:
                     styles.append((path, text))
         return load_tokens(rules, styles)

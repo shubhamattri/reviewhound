@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -148,10 +149,13 @@ class GitHubVCS:
 
     def get_pull(self, repo: str, number: int) -> PullRequest:
         d = self._request("GET", f"/repos/{repo}/pulls/{number}").json()
+        base = d["base"]
         return PullRequest(repo=repo, number=number, title=d.get("title") or "",
-                           body=d.get("body") or "", base_sha=d["base"]["sha"],
+                           body=d.get("body") or "", base_sha=base["sha"],
                            head_sha=d["head"]["sha"], author=(d.get("user") or {}).get("login", ""),
-                           draft=bool(d.get("draft")), state=d.get("state", "open"))
+                           draft=bool(d.get("draft")), state=d.get("state", "open"),
+                           base_ref=base.get("ref") or "",
+                           default_branch=(base.get("repo") or {}).get("default_branch") or "")
 
     def get_diff(self, pr: PullRequest) -> Diff:
         diff = Diff()
@@ -240,7 +244,8 @@ class GitHubVCS:
 
     def read_file(self, repo: str, sha: str, path: str) -> str | None:
         try:
-            resp = self._request("GET", f"/repos/{repo}/contents/{path}", params={"ref": sha},
+            resp = self._request("GET", f"/repos/{repo}/contents/{quote(path, safe='/')}",
+                                 params={"ref": sha},
                                  headers_extra={"Accept": "application/vnd.github.raw+json"})
         except GitHubError as exc:
             if exc.status == 404:
