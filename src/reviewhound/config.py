@@ -106,6 +106,7 @@ class RepoConfig(_Strict):
     )
     ticket_pattern: str | None = None
     tone_examples: list[str] = Field(default_factory=list)
+    design_tokens: bool = False  # literal spacing/radius values where the repo has a token
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     proof: ProofConfig = Field(default_factory=ProofConfig)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from reviewhound.diff import Diff, FileDiff
@@ -11,6 +12,10 @@ from reviewhound.vcs.base import PullRequest
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _MAX_BODY_BYTES = 4_000
+_MAX_RULES_BYTES = 16_000
+_RULES_SHARE = 5  # rules get at most a fifth of the budget, ahead of the diff
+_MIN_RULES_BYTES = 1_000
+_CUT = "\n[rules file cut here to fit the review budget]"
 
 
 @dataclass
@@ -58,6 +63,10 @@ class _Budget:
         self.parts: list[str] = []
         self.used = 0
 
+    @property
+    def free(self) -> int:
+        return self.limit - self.used - 2
+
     def add(self, block: str) -> bool:
         size = len(block.encode("utf-8")) + 2
         if self.used + size > self.limit:
@@ -65,6 +74,15 @@ class _Budget:
         self.parts.append(block)
         self.used += size
         return True
+
+
+def _cut_to(text: str, limit: int) -> str:
+    """`text` within `limit` UTF-8 bytes, cut at a line end and marked when cut."""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    room = limit - len(_CUT.encode("utf-8"))
+    kept = text.encode("utf-8")[:max(room, 0)].decode("utf-8", errors="ignore")
+    return kept[:kept.rfind("\n") + 1].rstrip("\n") + _CUT if "\n" in kept else ""
 
 
 def changed_definitions(diff: Diff, index: CodeIndex) -> list[Definition]:
@@ -78,13 +96,26 @@ def changed_definitions(diff: Diff, index: CodeIndex) -> list[Definition]:
 
 
 def build_context(pr: PullRequest, diff: Diff, index: CodeIndex, budget_bytes: int,
-                  reviewable: list[str], conventions: str = "", churn_note: str = "") -> Context:
+                  reviewable: list[str], conventions: str = "", churn_note: str = "",
+                  house_rules: Sequence[tuple[str, str]] = ()) -> Context:
+    """`house_rules` is (path, text) of the repo's own rules files, root first."""
     ctx = Context(text="")
     b = _Budget(budget_bytes)
     body = pr.body[:_MAX_BODY_BYTES]
     b.add(f"## Pull request\nTitle: {pr.title}\n\n{body}".rstrip())
     if conventions:
         b.add(f"## Repository conventions (learned)\n{conventions}")
+
+    rules_left = min(_MAX_RULES_BYTES, budget_bytes // _RULES_SHARE)
+    for path, text in house_rules:
+        title = f"## Repository rules: {path} (the team's own rules for this repo)\n"
+        size = min(rules_left, b.free) - len(title.encode("utf-8"))
+        body = _cut_to(text.strip(), size) if size >= _MIN_RULES_BYTES else ""
+        if body and b.add(title + body):
+            rules_left -= len((title + body).encode("utf-8"))
+            ctx.included.append(f"rules:{path}")
+        else:
+            ctx.omitted.append(f"rules:{path}")
 
     for path in reviewable:
         fd = diff.files[path]

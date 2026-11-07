@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from reviewhound.backends import open_metrics, open_queue, open_store
+from reviewhound.design_tokens import DesignTokenScanner
 from reviewhound.evals import run_eval
 from reviewhound.heartbeat import DEFAULT_MAX_JOB_SECONDS
 from reviewhound.metrics import BacklogAlarm, collect, render_prometheus, render_stats
@@ -85,7 +86,7 @@ def _worker_reviewer_factory(args: argparse.Namespace,
     vcs = GitHubVCS(_github_token(args.gh_user), home / "checkouts")
     store = open_store(home, args.database_url)
     registry = _registry(args)
-    scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner()]
+    scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner(), DesignTokenScanner()]
 
     def build(job: Job) -> Reviewer:
         return Reviewer(vcs, registry, scanners, store,
@@ -100,7 +101,8 @@ def _reviewer(args: argparse.Namespace, with_store: bool) -> Reviewer:
     home.mkdir(parents=True, exist_ok=True)
     vcs = GitHubVCS(_github_token(args.gh_user), home / "checkouts")
     store = open_store(home, args.database_url) if with_store else None
-    return Reviewer(vcs, _registry(args), [BuiltinScanner(), SemgrepScanner()], store,
+    return Reviewer(vcs, _registry(args),
+                    [BuiltinScanner(), SemgrepScanner(), DesignTokenScanner()], store,
                     proof_runners=_proof_runners(args, args.repo))
 
 
@@ -158,7 +160,7 @@ def _app_reviewer_factory(args: argparse.Namespace, app: GitHubApp,
     home.mkdir(parents=True, exist_ok=True)
     store = open_store(home, args.database_url)
     registry = _registry(args)
-    scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner()]
+    scanners: list[Scanner] = [BuiltinScanner(), SemgrepScanner(), DesignTokenScanner()]
     client = httpx.Client(base_url=API, timeout=httpx.Timeout(30.0))
 
     def build(job: Job) -> Reviewer:

@@ -15,6 +15,7 @@ from reviewhound.context import build_context
 from reviewhound.diff import Diff
 from reviewhound.findings import Finding, FindingsParseError, ModelReview, parse_model_review
 from reviewhound.github_feedback import after_post
+from reviewhound.house_rules import read_rules_files
 from reviewhound.index.conventions import learn_conventions
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.paths import language_of, matches_any
@@ -250,10 +251,11 @@ class Reviewer:
                 log.info("files not reviewed", extra={"pr": number, "files": unseen})
         reviewable = [p for p in diff.changed_paths if not matches_any(p, cfg.ignore_paths)]
         with t.stage("context"):
+            rules = self._house_rules(repo, pr, head, reviewable)
             touched = Counter({p: churn[p] for p in reviewable if churn.get(p)})
             churn_note = "\n".join(f"{p}: {n} recent commits" for p, n in touched.most_common(10))
             ctx = build_context(pr, diff, index, rt.context_bytes, reviewable, conv.summary(),
-                                churn_note)
+                                churn_note, house_rules=rules)
             prompt = build_prompt(ctx.text, cfg)
         with t.stage("model"):
             answer = self._ask_model(prompt, rt, result)
@@ -312,6 +314,19 @@ class Reviewer:
         if done.outcome in ("posted", "recovered") and self.store is not None:
             after_post(self.vcs, self.store, done, cfg.policy)
         return done
+
+    def _house_rules(self, repo: str, pr: PullRequest, head: Snapshot,
+                     reviewable: list[str]) -> list[tuple[str, str]]:
+        """Rules files as on the base branch, so a PR cannot rewrite the rules it is checked
+        against. Found via the head checkout; missing or unreadable files are skipped."""
+        def read(path: str) -> str | None:
+            try:
+                return self.vcs.read_file(repo, pr.base_sha, path)
+            except GitHubError as exc:
+                log.warning("could not read rules file; reviewing without it",
+                            extra={"pr": pr.number, "file": path, "error": type(exc).__name__})
+                return None
+        return read_rules_files(reviewable, lambda p: head.read(p) is not None, read)
 
     def _record_landed(self, repo: str, number: int, head: str) -> tuple[str, str]:
         """Before any model call: record a post an earlier attempt landed but never recorded,

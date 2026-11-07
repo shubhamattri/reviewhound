@@ -10,6 +10,11 @@ from reviewhound.findings import findings_json_schema
 _INSTRUCTIONS = """You are reviewing a pull request. Report only real defects that the change
 introduces: wrong behaviour, crashes, security holes, data loss, broken contracts, missing
 checks. Do not report style, naming, or anything in lines this PR did not change.
+One exception: when the context shows the repository's own rules file ("Repository rules"),
+an added line that breaks a written house rule is a defect. Quote the added line, and in
+`body` quote the rule it breaks.
+For data the diff drops, filters or reshapes, list everything computed from it (flags,
+totals, columns, conditions that show or hide UI) and check what each one shows now.
 
 Every finding must be provable from the code shown:
 - `line` is a head-side line number from the diff (the number printed before `+`).
