@@ -11,10 +11,11 @@ from dataclasses import dataclass, field
 
 from reviewhound.checker import CheckOutcome, ClaimChecker
 from reviewhound.config import CONFIG_FILENAME, PolicyConfig, RepoConfig, Severity, load_config
-from reviewhound.context import build_context
+from reviewhound.context import build_context, header_safe
 from reviewhound.diff import Diff
 from reviewhound.findings import Finding, FindingsParseError, ModelReview, parse_model_review
 from reviewhound.github_feedback import after_post
+from reviewhound.house_rules import read_rules_files
 from reviewhound.index.conventions import learn_conventions
 from reviewhound.index.treesitter import CodeIndex
 from reviewhound.paths import language_of, matches_any
@@ -29,6 +30,7 @@ from reviewhound.scanners import Scanner
 from reviewhound.store import Blocker, ReviewRecord, ReviewStore
 from reviewhound.vcs.base import (
     VCS,
+    BaseView,
     PinnedPulls,
     PostedComment,
     PostedReview,
@@ -233,6 +235,10 @@ class Reviewer:
             else:
                 diff = self.vcs.get_diff(pr)
             cfg = load_config(self.vcs.read_file(repo, pr.base_sha, CONFIG_FILENAME))
+            if not pr.targets_default_branch:
+                log.info("base is not the default branch, so its rules files and the token check "
+                         "are not trusted", extra={"pr": number, "base_ref": pr.base_ref})
+                cfg = cfg.model_copy(update={"design_tokens": False})
         result.route = rt = route(diff, cfg)
         if rt.tier == "skip":
             result.outcome = "skipped"
@@ -250,11 +256,19 @@ class Reviewer:
                 log.info("files not reviewed", extra={"pr": number, "files": unseen})
         reviewable = [p for p in diff.changed_paths if not matches_any(p, cfg.ignore_paths)]
         with t.stage("context"):
+            read_base = self._base_reader(repo, pr)
+            base = BaseView(head, diff, read_base)
+            # Rules text comes from the base commit itself: a base symlink may point at a PR edit.
+            base_paths = set(base.paths())
+            rules = (read_rules_files(reviewable,
+                                      lambda p: diff.maybe_cut or p in base_paths, read_base)
+                     if pr.targets_default_branch else [])
             touched = Counter({p: churn[p] for p in reviewable if churn.get(p)})
-            churn_note = "\n".join(f"{p}: {n} recent commits" for p, n in touched.most_common(10))
+            churn_note = "\n".join(f"{header_safe(p)}: {n} recent commits"
+                                   for p, n in touched.most_common(10))
             ctx = build_context(pr, diff, index, rt.context_bytes, reviewable, conv.summary(),
-                                churn_note)
-            prompt = build_prompt(ctx.text, cfg)
+                                churn_note, house_rules=rules)
+            prompt = build_prompt(ctx.text, cfg, ctx.rules_marker)
         with t.stage("model"):
             answer = self._ask_model(prompt, rt, result)
         with t.stage("verify"):
@@ -274,7 +288,7 @@ class Reviewer:
         with t.stage("scan"):
             scanned: list[Finding] = []
             for s in self.scanners:
-                scanned.extend(s.scan(diff, head, cfg))
+                scanned.extend(s.scan(diff, head, cfg, base))
             result.reviewers.extend(f"scanner:{s.name}" for s in self.scanners)
         known = self.store.known_state(repo, number) if self.store and not dry_run else {}
         decision = apply_policy(outcome.kept + scanned, cfg.policy, known)
@@ -312,6 +326,17 @@ class Reviewer:
         if done.outcome in ("posted", "recovered") and self.store is not None:
             after_post(self.vcs, self.store, done, cfg.policy)
         return done
+
+    def _base_reader(self, repo: str, pr: PullRequest) -> Callable[[str], str | None]:
+        """Reads a file at the base commit; a GitHub error reads as a missing file."""
+        def read(path: str) -> str | None:
+            try:
+                return self.vcs.read_file(repo, pr.base_sha, path)
+            except GitHubError as exc:
+                log.warning("could not read a base file; reviewing without it",
+                            extra={"pr": pr.number, "file": path, "error": type(exc).__name__})
+                return None
+        return read
 
     def _record_landed(self, repo: str, number: int, head: str) -> tuple[str, str]:
         """Before any model call: record a post an earlier attempt landed but never recorded,

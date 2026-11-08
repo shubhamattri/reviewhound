@@ -24,7 +24,10 @@ log = logging.getLogger(__name__)
 class Scanner(Protocol):
     name: str
 
-    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig) -> list[Finding]: ...
+    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig,
+             base: Snapshot | None = None) -> list[Finding]:
+        """`base` is the base tree for checks that must not trust the PR's own files."""
+        ...
 
 
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -57,6 +60,16 @@ def secret_identities(text: str) -> set[str]:
             for m in pat.finditer(line)}
 
 
+def redact_secrets(text: str) -> str:
+    """`text` with each real-looking secret cut to its first four characters."""
+    for _label, pat in _SECRET_PATTERNS:
+        for m in pat.finditer(text):
+            value = m.groupdict().get("value") or m.group(0)
+            if not _PLACEHOLDER.search(value):
+                text = text.replace(value, value[:4] + "[redacted]")
+    return text
+
+
 def builds_sql(text: str) -> bool:
     for pat in _INTERPOLATED:
         for m in pat.finditer(text):
@@ -74,7 +87,8 @@ _PLACEHOLDER = re.compile(
 class BuiltinScanner:
     name = "builtin"
 
-    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig) -> list[Finding]:
+    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig,
+             base: Snapshot | None = None) -> list[Finding]:
         out: list[Finding] = []
         pii = [t.lower() for t in cfg.personal_data_terms]
         for path, fd in diff.files.items():
@@ -100,13 +114,12 @@ class BuiltinScanner:
                 continue
             value = m.groupdict().get("value") or m.group(0)
             if not _PLACEHOLDER.search(value):
-                redacted = quote.replace(value, value[:4] + "[redacted]")
                 found.append(Finding(
                     file=path, line=n, severity=Severity.BLOCKER, category="secret",
                     title=f"Possible {label} committed",
                     body="This looks like a real credential in source. Move it to the "
                          "environment or a secret store and rotate it.",
-                    evidence_quote=redacted, source="scanner:builtin", verified=True,
+                    evidence_quote=redact_secrets(quote), source="scanner:builtin", verified=True,
                     identity=secret_identity(value)))
                 break
         if builds_sql(text):
@@ -139,7 +152,8 @@ class SemgrepScanner:
         self.timeout_s = timeout_s
         self.binary = shutil.which("semgrep")
 
-    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig) -> list[Finding]:
+    def scan(self, diff: Diff, head: Snapshot, cfg: RepoConfig,
+             base: Snapshot | None = None) -> list[Finding]:
         if self.binary is None:
             log.info("semgrep not installed; skipping")
             return []

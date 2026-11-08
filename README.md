@@ -165,6 +165,7 @@ auth:
   guard_functions: [require_role]
 personal_data_terms: [email, phone, dob]
 tone_examples: ["Short and direct. Say what breaks and for whom."]
+design_tokens: false      # flag literal spacing/radius values that have a design token
 policy:
   min_severity_to_post: minor
   max_comments: 10
@@ -182,6 +183,28 @@ proof:                    # runs PR code: read "Proof by failing test" first
 ```
 
 Unknown keys or bad values fail the review loudly instead of being guessed.
+
+## Repository rules files and design tokens
+
+The review prompt carries the repo's own `CLAUDE.md` and `AGENTS.md`: the root ones and those in
+each folder the PR changes, as they are on the base branch, so a PR cannot add, edit or delete
+the rules it is checked against. They get at most a fifth of the context budget and never push
+out a diff that would fit without them. An added line that breaks a written rule is a defect.
+They sit inside a block named by a random marker made for each review, and the prompt says only
+text inside that block is a rule, so a PR description or file name that copies the rules header
+is not treated as one. Rules files are looked for at most 10 folders deep and in at most 200
+folders per review.
+
+With `design_tokens: true`, a deterministic check flags an added spacing or radius length (`8px`)
+that exactly matches a design token, read from CSS custom properties (`--sp-2: 8px;`) and from
+token tables in the rules files, both as on the base. It reads stylesheets, `<style>` blocks in
+`.vue`, `.svelte` and `.html` files, and `style=` attributes written on one line; a style object
+spread over several lines and CSS-in-JS template literals are not checked, nor is an added line
+over 2,000 characters. At most five comments per review. When GitHub lists 3,000 changed files
+(its cap, so the list may be cut short) the check is skipped.
+
+For a stacked PR, whose base is not the repository's default branch, the base branch may be the
+author's own, so the rules files are left out and the token check stays off.
 
 ## Proof by failing test (opt-in, runs PR code)
 

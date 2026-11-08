@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -74,6 +75,7 @@ def _install(tmp: Path, dest: Path) -> Path:
 
 _COMPARE_FILE_CAP = 300  # the compare API lists no more files than this
 _PULL_COMMIT_CAP = 250  # nor the pull commits API more commits than this
+_PULL_FILES_CAP = 3_000  # nor the pull files API more files than this
 
 
 def _add_files(diff: Diff, files: list[dict[str, Any]]) -> None:
@@ -148,10 +150,13 @@ class GitHubVCS:
 
     def get_pull(self, repo: str, number: int) -> PullRequest:
         d = self._request("GET", f"/repos/{repo}/pulls/{number}").json()
+        base = d["base"]
         return PullRequest(repo=repo, number=number, title=d.get("title") or "",
-                           body=d.get("body") or "", base_sha=d["base"]["sha"],
+                           body=d.get("body") or "", base_sha=base["sha"],
                            head_sha=d["head"]["sha"], author=(d.get("user") or {}).get("login", ""),
-                           draft=bool(d.get("draft")), state=d.get("state", "open"))
+                           draft=bool(d.get("draft")), state=d.get("state", "open"),
+                           base_ref=base.get("ref") or "",
+                           default_branch=(base.get("repo") or {}).get("default_branch") or "")
 
     def get_diff(self, pr: PullRequest) -> Diff:
         diff = Diff()
@@ -161,6 +166,7 @@ class GitHubVCS:
                                   params={"per_page": 100, "page": page}).json()
             _add_files(diff, files)
             if len(files) < 100:
+                diff.maybe_cut = len(diff.files) >= _PULL_FILES_CAP
                 return diff
             page += 1
 
@@ -240,7 +246,8 @@ class GitHubVCS:
 
     def read_file(self, repo: str, sha: str, path: str) -> str | None:
         try:
-            resp = self._request("GET", f"/repos/{repo}/contents/{path}", params={"ref": sha},
+            resp = self._request("GET", f"/repos/{repo}/contents/{quote(path, safe='/')}",
+                                 params={"ref": sha},
                                  headers_extra={"Accept": "application/vnd.github.raw+json"})
         except GitHubError as exc:
             if exc.status == 404:
